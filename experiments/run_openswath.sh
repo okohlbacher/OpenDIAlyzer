@@ -81,3 +81,14 @@ echo "threads=$THREADS outer=$OUTER  mz=${MZ_WIN}ppm ms1=${MZ_WIN_MS1}ppm rt_win
 
 echo "features: $OUT/features.osw"
 grep -E "Elapsed \(wall|User time|Percent of CPU|Maximum resident" "$OUT/openswath.log" || true
+
+# OpenSwathWorkflow emits features with scores but no q-values. Without this
+# step there is nothing to compare against DIA-NN's 1% FDR output -- raw feature
+# counts are not identifications.
+if command -v pyprophet >/dev/null 2>&1; then
+  echo "--- pyprophet ---"
+  pyprophet score --in "$OUT/features.osw" --level ms2 2>&1 | tail -5
+else
+  echo "WARNING: pyprophet not on PATH; $OUT/features.osw has no q-values yet."
+  echo "         Run: micromamba run -n odia pyprophet score --in $OUT/features.osw --level ms2"
+fi
