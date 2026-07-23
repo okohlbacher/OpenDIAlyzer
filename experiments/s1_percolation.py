@@ -92,9 +92,11 @@ def main():
 
     subsets = [int(x) for x in (sys.argv[2].split(",") if len(sys.argv) > 2
                                 else ["200", "1000", "5000", "20594"])]
+    ks = [int(x) for x in (sys.argv[3].split(",") if len(sys.argv) > 3
+                           else ["3", "4", "5", "6", "7", "8"])]
     print(f"{'k':>3} {'proteins':>9} {'peptides':>12} {'components':>12} "
           f"{'largest comp':>13}  verdict")
-    for k in (3, 4, 5, 6, 7, 8):
+    for k in ks:
         for n in subsets:
             npep, ncomp, frac = percolate(seqs[:n], k)
             verdict = ("PERCOLATED" if frac > 0.5 else
