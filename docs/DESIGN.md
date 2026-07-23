@@ -112,12 +112,40 @@ Not "more identifications than DIA-NN" — with a search space this large and a
 compromised decoy model, more identifications is the expected symptom of broken
 FDR.
 
-Split by path, because review showed a single criterion conflates two problems:
+But a second review round established that we cannot presently claim
+**calibrated** FDR either: entrapment is biased in both directions, decoys are
+the very thing a new null model exists to fix (circular), and synthetic ground
+truth at 10⁸ scale with realistic nested-family interference does not exist.
+Until that is resolved, any claim here is **comparative and dataset-scoped**,
+not a calibration guarantee.
 
-- **Library path** — FDR calibration *measured* by allotype entrapment, reported
-  together with the known biases of that instrument, and never tuned against
-  (tuning until a benchmark reads 1% is overfitting the benchmark).
-- **FASTA / non-specific path** — entrapment over a ~10⁴-peptide library says
-  nothing about calibration in a ~10⁸-candidate space. This needs a separate
-  null model. **Unsolved, and tracked as the project's central research
-  question.** No calibration claim will be made here until it is solved.
+Two further constraints, both from review:
+- **The error unit must be declared** — per precursor, peptidoform, sequence,
+  nested family, allele, run, patient or reported antigen. A q-value without a
+  stated discovery unit is not statistics.
+- **Selectivity claims require sensitivity curves**, stratified by abundance,
+  charge, length, modification and allele. A prefilter that rejects 3 800× is
+  worthless if it deletes the low-abundance singly-charged ligands that are the
+  point of the exercise.
+
+## Sequencing: statistics first, engine second
+
+Two independent reviews concluded that another DIA engine is not justified on
+its own — DIA-NN owns throughput (it searches the whole non-specific human space
+in ~45 s on 64 CPU cores), and OpenSWATH is open and validated. The response is
+not to abandon the engine but to make it earn its place:
+
+| Stage | Purpose | Kill condition |
+|---|---|---|
+| **S0** | Measure what DIA-NN's documented 1.5–2× q-value deviation actually costs in IDs and entrapment FP | Deviation changes nothing measurable |
+| **S1** | Test whether the fragment-sharing graph over non-specific human peptides percolates | One giant component ⇒ family-level FDR *is* proteome-level FDR |
+| **S2** | Declare the error unit and handle hypothesis dependence | — |
+| **S3** | Build the null model as a **post-processor** over DIA-NN and OpenSWATH score outputs | Cannot validate across independent entrapment designs |
+| **S4** | Build extraction, only where existing engines cannot emit what the method needs | — |
+
+S0 and S1 are cheap, need almost no new code, and either can end the project.
+That is why they come first.
+
+The architecture above is the design for S4. It stands — review found the
+*engine design* sound and the *market justification* absent. This sequencing
+supplies the missing justification, or disproves it early.
