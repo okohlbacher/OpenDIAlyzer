@@ -27,5 +27,14 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(odia-info PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
+# Streaming indexer. Uses std::thread directly rather than OpenMP: the work is
+# partitioned by isolation window so no two threads share a cell, and OpenMP's
+# default spin-waiting measurably hurt on this hardware (224 threads were 2x
+# slower than 1 for mzML ingest).
+find_package(Threads REQUIRED)
+add_executable(odia-index src/odia_index.cpp)
+target_link_libraries(odia-index PRIVATE OpenMS Threads::Threads)
+
 enable_testing()
-add_test(NAME odia-info-runs COMMAND odia-info --selftest)
+add_test(NAME odia-info-selftest COMMAND odia-info --selftest)
+add_test(NAME odia-index-selftest COMMAND odia-index --selftest)
