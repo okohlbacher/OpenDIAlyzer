@@ -134,9 +134,15 @@ public:
       workers_[i] = std::thread([this, i] { run_(i); });
   }
 
+  void set_parse_only(bool b) { parse_only_ = b; }
+
   void consumeSpectrum(OpenMS::MSSpectrum& s) override
   {
     if (s.getMSLevel() != 2 || s.empty() || s.getPrecursors().empty()) return;
+    // parse_only isolates the XML decode cost so indexing can be attributed
+    // separately -- without it, flat thread scaling is ambiguous between
+    // "indexing is free" and "indexing does not parallelise".
+    if (parse_only_) { ++spectra_; peaks_ += s.size(); return; }
 
     Compact c;
     const double pmz = s.getPrecursors().front().getMZ();
@@ -207,6 +213,7 @@ private:
     }
   }
 
+  bool parse_only_ = false;
   double inv_, rt_block_;
   std::map<long, int> win_index_;
   std::vector<Queue> queues_;
@@ -279,6 +286,8 @@ int main(int argc, char** argv)
   }
   int nthreads = 8;
   double ppm = 20.0, rt_block = 30.0;
+  bool parse_only = false;
+  for (int i = 2; i < argc; ++i) if (std::string(argv[i]) == "--parse-only") parse_only = true;
   for (int i = 2; i + 1 < argc; i += 2)
   {
     const std::string k = argv[i];
@@ -290,6 +299,7 @@ int main(int argc, char** argv)
 
   const auto t0 = std::chrono::steady_clock::now();
   Indexer idx(nthreads, ppm, rt_block);
+  idx.set_parse_only(parse_only);
   try
   {
     OpenMS::MzMLFile().transform(argv[1], &idx, true, true);
@@ -311,6 +321,6 @@ int main(int argc, char** argv)
   std::printf("cells         %zu\n", idx.cells());
   std::printf("index size    %.1f MB\n", idx.index_bytes() / 1048576.0);
   std::printf("peak RSS      %.1f MB\n", peak_rss_kb() / 1024.0);
-  std::printf("wall          %.2f s\n", wall);
+  std::printf("wall          %.2f s%s\n", wall, parse_only ? "   (PARSE ONLY)" : "");
   return 0;
 }
