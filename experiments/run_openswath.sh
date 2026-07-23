@@ -37,17 +37,25 @@ OUTER=${OUTER:-25}          # = number of isolation windows in this acquisition
 export OMP_WAIT_POLICY=PASSIVE
 export OMP_PROC_BIND=close
 
-# --- Tolerances, matched to DIA-NN's calibration on this run -----------------
-# DIA-NN log: "Calibrating with mass accuracies 22 (MS1), 25 (MS2)".
-# Use exactly those so neither tool gets a tolerance advantage. DIA-NN later
-# reported "Recommended MS1 mass accuracy setting: 4.6 ppm" -- tightening BOTH
-# tools to that is a legitimate follow-up, but it must be done to both.
-MZ_WIN=${MZ_WIN:-25}         # MS2, ppm
-MZ_WIN_MS1=${MZ_WIN_MS1:-22} # MS1, ppm
+# --- Tolerances, matched to DIA-NN's OPTIMISED values on this run ------------
+# Mind the factor of 2. OpenSWATH's -mz_extraction_window is a FULL width:
+#     left  = mz - mz * mz_extraction_window / 2.0 * 1e-6
+#     right = mz + mz * mz_extraction_window / 2.0 * 1e-6
+# (ChromatogramExtractorAlgorithm.cpp:40-41). DIA-NN's "mass accuracy N ppm" is
+# a +/- tolerance. So OpenSWATH needs 2N to see the same window as DIA-NN.
+#
+# Use the values DIA-NN OPTIMISED to, not the ones it started calibration with:
+#   "[69:39] Optimised mass accuracy: 7 ppm"            -> MS2 +/-7  -> 14
+#   "[10:43] Recommended MS1 mass accuracy setting: 4.6" -> MS1 +/-4.6 -> 9.2
+# Its initial 22/25 were just the starting point for optimisation; matching
+# those would hand OpenSWATH a ~3.5x looser tolerance and inflate its false
+# positives, which would flatter neither tool honestly.
+MZ_WIN=${MZ_WIN:-14}          # MS2, ppm FULL width  = 2 x DIA-NN's +/-7
+MZ_WIN_MS1=${MZ_WIN_MS1:-9.2} # MS1, ppm FULL width  = 2 x DIA-NN's +/-4.6
 
-# RT window. DIA-NN reports RT in MINUTES, so its "RT window set to 17.2117" is
-# +/-17.2 min for a PREDICTED library. OpenSWATH's -rt_extraction_window is a
-# FULL width in SECONDS, so the equivalent is 2 * 17.2 * 60 = 2064 s.
+# RT window, same full-width convention ("a value of 600 means +/- 300 s").
+# DIA-NN reports RT in MINUTES, so its "RT window set to 17.2117" is +/-17.2 min
+# for a PREDICTED library => full width 2 * 17.2 * 60 = 2064 s.
 # For an EMPIRICAL library (RT already in this run's own scale) the window
 # collapses to tens of seconds -- pass RT_WIN explicitly to match whatever
 # DIA-NN's log reports for that run. Getting this wrong by 60x is easy; it is
