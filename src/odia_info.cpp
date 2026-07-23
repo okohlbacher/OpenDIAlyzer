@@ -43,23 +43,43 @@ inline long mz_bin(double mz, double mz0, double inv_log1p_tol)
   return static_cast<long>(std::log(mz / mz0) * inv_log1p_tol);
 }
 
+#define CHECK(cond)                                                                                \
+  if (!(cond))                                                                                     \
+  {                                                                                                \
+    std::fprintf(stderr, "selftest FAILED at line %d: %s\n", __LINE__, #cond);                     \
+    return 1;                                                                                      \
+  }
+
 int selftest()
 {
   // ponytail: one runnable check on the only non-trivial logic here.
-  if (median({}) != 0.0) return 1;
-  if (median({5.0}) != 5.0) return 1;
-  if (median({3.0, 1.0, 2.0}) != 2.0) return 1;
+  CHECK(median({}) == 0.0);
+  CHECK(median({5.0}) == 5.0);
+  CHECK(median({3.0, 1.0, 2.0}) == 2.0);
   Window a{100.0, 110.0}, b{100.0, 120.0}, c{200.0, 210.0};
-  if (!(a < b) || !(b < c) || (c < a)) return 1;
+  CHECK(a < b); CHECK(b < c); CHECK(!(c < a));
 
-  // Binning: same bin within tolerance, different bin beyond it.
   const double tol = 20e-6, mz0 = 200.0, inv = 1.0 / std::log1p(tol);
-  if (mz_bin(500.0, mz0, inv) != mz_bin(500.0 * (1 + tol / 2), mz0, inv)) return 1;
-  if (mz_bin(500.0, mz0, inv) == mz_bin(500.0 * (1 + 3 * tol), mz0, inv)) return 1;
-  if (mz_bin(mz0, mz0, inv) != 0) return 1;
+  CHECK(mz_bin(mz0, mz0, inv) == 0);
+
+  // Binning is NOT tolerance-exact: two m/z within tolerance may straddle a bin
+  // boundary and land in ADJACENT bins. The guaranteed invariant is only
+  // "same or adjacent" — which is why the prefilter must probe neighbours.
+  // An earlier version of this test asserted "same bin" and failed; the test
+  // was wrong, and the design consequence is real (see MZ_BIN_NEIGHBOURS).
+  for (double mz : {250.0, 500.0, 1234.5, 1999.0})
+  {
+    CHECK(std::abs(mz_bin(mz, mz0, inv) - mz_bin(mz * (1 + tol / 2), mz0, inv)) <= 1);
+    CHECK(std::abs(mz_bin(mz, mz0, inv) - mz_bin(mz * (1 - tol / 2), mz0, inv)) <= 1);
+  }
+  // Well beyond tolerance must land strictly further away than a neighbour.
+  CHECK(std::abs(mz_bin(500.0, mz0, inv) - mz_bin(500.0 * (1 + 10 * tol), mz0, inv)) > 1);
+  CHECK(mz_bin(500.0, mz0, inv) < mz_bin(501.0, mz0, inv));
+
   std::puts("selftest OK");
   return 0;
 }
+#undef CHECK
 
 // Measure how selective an occupancy-bitmap prefilter would be.
 //
@@ -98,7 +118,12 @@ int occupancy(const OpenMS::MSExperiment& exp, double ppm)
 
   if (occ_frac.empty()) { std::fprintf(stderr, "no MS2 spectra\n"); return 1; }
 
-  const double p = median(occ_frac);              // P(a random fragment hits an occupied bin)
+  // A probe must check the bin and both neighbours (see selftest): values
+  // within tolerance can straddle a boundary. That triples the chance a random
+  // fragment registers a hit, so the honest selectivity uses 3p, not p.
+  constexpr int MZ_BIN_NEIGHBOURS = 3;
+  const double p_raw = median(occ_frac);
+  const double p = std::min(1.0, MZ_BIN_NEIGHBOURS * p_raw);
   const double med_peaks = median(npeaks);
   const long total_bins = mz_bin(hi, mz0, inv) - mz_bin(lo, mz0, inv) + 1;
 
@@ -106,7 +131,8 @@ int occupancy(const OpenMS::MSExperiment& exp, double ppm)
   std::printf("MS2 spectra      %zu\n", occ_frac.size());
   std::printf("fragment m/z     %.1f - %.1f Th  (%ld bins)\n", lo, hi, total_bins);
   std::printf("distinct bins    %.0f per spectrum (median)\n", med_peaks);
-  std::printf("occupancy        %.5f  (%.3f%% of bins in span)\n", p, 100 * p);
+  std::printf("occupancy        %.5f  (%.3f%% of bins in span)\n", p_raw, 100 * p_raw);
+  std::printf("hit prob (x%d nb) %.5f\n", MZ_BIN_NEIGHBOURS, p);
   std::puts("\nP(random candidate passes prefilter), F=6 fragments:");
   std::puts("  need k of 6    probability      rejection factor");
 
