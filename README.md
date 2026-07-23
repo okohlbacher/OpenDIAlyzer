@@ -17,9 +17,9 @@ tryptic one. Worse, they come in **nested families** (`SLYNTVATL`,
 `SLYNTVATLY`, `LYNTVATL`) that share most of their fragment ions — which
 undermines the decoy model that target–decoy FDR depends on.
 
-The consequences are measurable. In a published four-tool DIA immunopeptidomics
-benchmark ([Pandey et al., MCP 2023](https://doi.org/10.1016/j.mcpro.2023.100515)),
-**every tool's real false-discovery rate exceeded its nominal 1%**:
+A published four-tool DIA immunopeptidomics benchmark
+([Pandey et al., MCP 2023](https://doi.org/10.1016/j.mcpro.2023.100515))
+reported that **every tool's real false-discovery rate exceeded its nominal 1%**:
 
 | Tool | Nominal | Measured (HLA-B\*57:01) | Measured (HLA-A\*02:01) |
 |---|---|---|---|
@@ -30,6 +30,20 @@ benchmark ([Pandey et al., MCP 2023](https://doi.org/10.1016/j.mcpro.2023.100515
 
 Only 33–34% of peptides were found by all four tools, and the authors
 recommended running at least two pipelines and intersecting them.
+
+> **Treat these numbers with caution — we do.** That study used **DIA-NN 1.8.0**,
+> five major versions before the 2.0 rewrite that added tunable decoys and
+> non-specific digest support aimed explicitly at immunopeptidomics. It computed
+> FDR by counting cross-allotype identifications as false positives, but the
+> methods do not state whether isoleucine/leucine ambiguity was controlled — and
+> DIA-NN's own documentation calls I/L equivalence *"essential when benchmarking
+> using entrapment databases"*. Nor do they address peptides that genuinely bind
+> both allotypes, which would be counted as false positives while being correct.
+> Both effects inflate the apparent FDR.
+>
+> So this table motivates the question; it does not settle it. Re-measuring it
+> on a current DIA-NN with those confounds controlled is the project's first
+> piece of work, and it may well shrink the gap.
 
 Separately, DIA-NN's own documentation states that InfinDIA — the mode you must
 use for non-specific search — produces q-values that "may deviate from
