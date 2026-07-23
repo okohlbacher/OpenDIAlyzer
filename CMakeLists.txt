@@ -35,6 +35,12 @@ find_package(Threads REQUIRED)
 add_executable(odia-index src/odia_index.cpp)
 target_link_libraries(odia-index PRIVATE OpenMS Threads::Threads)
 
+# Scoring kernel (header-only) + its oracle test. No OpenMS link: the kernel is
+# self-contained C++ so the same source can later compile for CUDA. Correctness
+# is defined by OpenSWATH's reference values, asserted in the test.
+add_executable(odia-score-test src/odia_score_test.cpp)
+
 enable_testing()
 add_test(NAME odia-info-selftest COMMAND odia-info --selftest)
 add_test(NAME odia-index-selftest COMMAND odia-index --selftest)
+add_test(NAME odia-score-oracle COMMAND odia-score-test)
