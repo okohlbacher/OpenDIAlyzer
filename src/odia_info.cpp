@@ -35,6 +35,14 @@ double median(std::vector<double> v)
   return v[mid];
 }
 
+// Logarithmic m/z binning gives constant relative (ppm) width, so one integer
+// index addresses a tolerance-sized bin anywhere in the spectrum. This is the
+// addressing scheme the prefilter depends on.
+inline long mz_bin(double mz, double mz0, double inv_log1p_tol)
+{
+  return static_cast<long>(std::log(mz / mz0) * inv_log1p_tol);
+}
+
 int selftest()
 {
   // ponytail: one runnable check on the only non-trivial logic here.
@@ -43,7 +51,78 @@ int selftest()
   if (median({3.0, 1.0, 2.0}) != 2.0) return 1;
   Window a{100.0, 110.0}, b{100.0, 120.0}, c{200.0, 210.0};
   if (!(a < b) || !(b < c) || (c < a)) return 1;
+
+  // Binning: same bin within tolerance, different bin beyond it.
+  const double tol = 20e-6, mz0 = 200.0, inv = 1.0 / std::log1p(tol);
+  if (mz_bin(500.0, mz0, inv) != mz_bin(500.0 * (1 + tol / 2), mz0, inv)) return 1;
+  if (mz_bin(500.0, mz0, inv) == mz_bin(500.0 * (1 + 3 * tol), mz0, inv)) return 1;
+  if (mz_bin(mz0, mz0, inv) != 0) return 1;
   std::puts("selftest OK");
+  return 0;
+}
+
+// Measure how selective an occupancy-bitmap prefilter would be.
+//
+// The whole architecture rests on rejecting candidates by testing their
+// fragment m/z values against a bitmap of occupied bins, before doing any
+// gather. If observed spectra are dense enough that most random fragment sets
+// pass, the prefilter is worthless and the design is wrong. This measures it
+// rather than assuming it.
+int occupancy(const OpenMS::MSExperiment& exp, double ppm)
+{
+  const double tol = ppm * 1e-6;
+  const double inv = 1.0 / std::log1p(tol);
+  const double mz0 = 100.0;
+
+  std::vector<double> occ_frac, npeaks;
+  double lo = 1e12, hi = 0.0;
+  std::vector<long> bins;
+
+  for (const auto& s : exp.getSpectra())
+  {
+    if (s.getMSLevel() != 2 || s.size() < 2) continue;
+    bins.clear();
+    bins.reserve(s.size());
+    for (const auto& p : s)
+    {
+      bins.push_back(mz_bin(p.getMZ(), mz0, inv));
+      lo = std::min(lo, p.getMZ());
+      hi = std::max(hi, p.getMZ());
+    }
+    std::sort(bins.begin(), bins.end());
+    const size_t distinct = std::unique(bins.begin(), bins.end()) - bins.begin();
+    const long span = bins.back() - bins.front() + 1;
+    if (span > 0) occ_frac.push_back(double(distinct) / double(span));
+    npeaks.push_back(double(distinct));
+  }
+
+  if (occ_frac.empty()) { std::fprintf(stderr, "no MS2 spectra\n"); return 1; }
+
+  const double p = median(occ_frac);              // P(a random fragment hits an occupied bin)
+  const double med_peaks = median(npeaks);
+  const long total_bins = mz_bin(hi, mz0, inv) - mz_bin(lo, mz0, inv) + 1;
+
+  std::printf("tolerance        %.0f ppm\n", ppm);
+  std::printf("MS2 spectra      %zu\n", occ_frac.size());
+  std::printf("fragment m/z     %.1f - %.1f Th  (%ld bins)\n", lo, hi, total_bins);
+  std::printf("distinct bins    %.0f per spectrum (median)\n", med_peaks);
+  std::printf("occupancy        %.5f  (%.3f%% of bins in span)\n", p, 100 * p);
+  std::puts("\nP(random candidate passes prefilter), F=6 fragments:");
+  std::puts("  need k of 6    probability      rejection factor");
+
+  // Binomial tail: P(>= k hits of F) for independent random fragments.
+  const int F = 6;
+  for (int k = 6; k >= 2; --k)
+  {
+    double tail = 0.0;
+    for (int i = k; i <= F; ++i)
+    {
+      double c = 1.0;
+      for (int j = 0; j < i; ++j) c = c * (F - j) / (j + 1);
+      tail += c * std::pow(p, i) * std::pow(1 - p, F - i);
+    }
+    std::printf("  %d            %12.3e     %12.3e x\n", k, tail, tail > 0 ? 1.0 / tail : 0.0);
+  }
   return 0;
 }
 } // namespace
@@ -51,11 +130,15 @@ int selftest()
 int main(int argc, char** argv)
 {
   if (argc == 2 && std::string(argv[1]) == "--selftest") return selftest();
-  if (argc != 2)
+  if (argc < 2)
   {
-    std::fprintf(stderr, "usage: odia-info <file.mzML> | --selftest\n");
+    std::fprintf(stderr,
+                 "usage: odia-info <file.mzML> [--occupancy <ppm>]\n"
+                 "       odia-info --selftest\n");
     return 2;
   }
+  double occ_ppm = 0.0;
+  if (argc == 4 && std::string(argv[2]) == "--occupancy") occ_ppm = std::atof(argv[3]);
 
   OpenMS::MSExperiment exp;
   try
@@ -67,6 +150,8 @@ int main(int argc, char** argv)
     std::fprintf(stderr, "error: cannot read %s: %s\n", argv[1], e.what());
     return 1;
   }
+
+  if (occ_ppm > 0.0) return occupancy(exp, occ_ppm);
 
   std::map<Window, size_t> windows;
   std::vector<double> ms1_rts;
