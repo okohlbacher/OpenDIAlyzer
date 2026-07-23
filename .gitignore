@@ -16,3 +16,6 @@ data/
 *.d/
 
 .DS_Store
+
+# Recovered CC BY 4.0 DIA-NN 1.7.x source - documentation only, never copied
+ext/diann-cc-by/
