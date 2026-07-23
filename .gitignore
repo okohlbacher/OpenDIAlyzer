@@ -1,0 +1,18 @@
+# Research vault — local only, by decision (contains competitor critique)
+vault/
+
+# External clones — never ours, never pushed
+ext/
+
+# Local dev helpers referencing internal infrastructure hostnames
+tools/
+
+# Build + data
+build/
+data/
+*.mzML
+*.mzpeak
+*.raw
+*.d/
+
+.DS_Store
