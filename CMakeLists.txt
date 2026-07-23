@@ -40,7 +40,22 @@ target_link_libraries(odia-index PRIVATE OpenMS Threads::Threads)
 # is defined by OpenSWATH's reference values, asserted in the test.
 add_executable(odia-score-test src/odia_score_test.cpp)
 
+# Stage-1 library generator: peptide list -> PeptDeep-predicted RT/MS2 ->
+# OpenSWATH transition TSV. Requires the ONNX-enabled OpenMS build
+# (-DOpenMS_DIR=.../openms-onnx/lib/cmake/OpenMS). The PeptDeep ONNX models
+# are not installed; OpenMS's CMake downloads them into its build tree under
+# share/OpenMS/models, so the selftest needs that directory. The default below
+# assumes OpenMS_DIR points into that build tree; override with
+# -DOPENDIALIBGEN_MODEL_DIR=... if the layout differs.
+add_executable(OpenDIALibGen src/opendialibgen.cpp)
+target_link_libraries(OpenDIALibGen PRIVATE OpenMS)
+
+set(OPENDIALIBGEN_MODEL_DIR "${OpenMS_DIR}/../../../share/OpenMS/models"
+    CACHE PATH "Directory containing peptdeep_*_dynamic.onnx (used by the OpenDIALibGen selftest)")
+
 enable_testing()
 add_test(NAME odia-info-selftest COMMAND odia-info --selftest)
 add_test(NAME odia-index-selftest COMMAND odia-index --selftest)
 add_test(NAME odia-score-oracle COMMAND odia-score-test)
+add_test(NAME OpenDIALibGen-selftest
+         COMMAND OpenDIALibGen --selftest -model_dir "${OPENDIALIBGEN_MODEL_DIR}")
