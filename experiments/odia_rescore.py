@@ -46,38 +46,37 @@ def competitive_features(df, rt_tol=15.0):
     about the chromatographic peak half-width, so that genuinely co-eluting
     candidates compete and unrelated ones do not.
     """
-    out = df.copy()
+    out = df.reset_index(drop=True).copy()
     out["_win"] = np.floor(out["mz"] / SWATH_WIDTH).astype(int)
 
+    # Indexed by ROW POSITION IN `out`, not position within a group. Writing at
+    # within-group positions makes every window overwrite the same low indices
+    # and silently zeroes most of the output -- a single-window test cannot see
+    # this, because there the two indexings coincide.
     best = np.zeros(len(out))
     total = np.zeros(len(out))
     rank = np.zeros(len(out))
     ncomp = np.zeros(len(out))
 
     for _, g in out.groupby("_win", sort=False):
-        rt = g["rt"].to_numpy()
-        sc = g["score"].to_numpy()
-        order = np.argsort(rt)
-        rt_s, sc_s, idx_s = rt[order], sc[order], g.index.to_numpy()[order]
+        order = np.argsort(g["rt"].to_numpy())
+        rt_s = g["rt"].to_numpy()[order]
+        sc_s = g["score"].to_numpy()[order]
+        row_s = g.index.to_numpy()[order]          # positions in `out`
         lo = np.searchsorted(rt_s, rt_s - rt_tol, side="left")
         hi = np.searchsorted(rt_s, rt_s + rt_tol, side="right")
-        pos = {ix: i for i, ix in enumerate(idx_s)}
-        for i, ix in enumerate(idx_s):
+        for i, row in enumerate(row_s):
             s, e = lo[i], hi[i]
             window = sc_s[s:e]
             n = len(window) - 1                       # exclude self
             own = sc_s[i]
-            tot = window.sum()
-            # best RIVAL: drop one instance of self, not all ties
             if n > 0:
+                # best RIVAL: drop one instance of self, not all ties
                 rival = np.delete(window, i - s)
-                best[pos[ix]] = own - rival.max()
-                rank[pos[ix]] = (window > own).sum() / n
-            else:
-                best[pos[ix]] = 0.0
-                rank[pos[ix]] = 0.0
-            total[pos[ix]] = np.log((abs(own) + 1e-6) / (abs(tot) + 1e-6))
-            ncomp[pos[ix]] = n
+                best[row] = own - rival.max()
+                rank[row] = (window > own).sum() / n
+            total[row] = np.log((abs(own) + 1e-6) / (abs(window.sum()) + 1e-6))
+            ncomp[row] = n
 
     out["VAR_ODIA_BEST_DELTA"] = best
     out["VAR_ODIA_TOT_RATIO"] = total
@@ -87,15 +86,25 @@ def competitive_features(df, rt_tol=15.0):
 
 
 def selftest():
-    # Three candidates in one window co-eluting, one far away in RT.
+    # Candidates 1-4 in one isolation window; 5-7 in a DIFFERENT window.
+    # The second window is essential: with only one window, a bug that indexes
+    # by within-group position instead of global row position is invisible.
     df = pd.DataFrame({
-        "feature_id": [1, 2, 3, 4],
-        "mz": [500.0, 500.0, 500.0, 500.0],
-        "rt": [100.0, 105.0, 110.0, 5000.0],
-        "score": [0.9, 0.5, 0.3, 0.4],
-        "decoy": [0, 0, 1, 0],
+        "feature_id": [1, 2, 3, 4, 5, 6, 7],
+        "mz": [500.0, 500.0, 500.0, 500.0, 900.0, 900.0, 900.0],
+        "rt": [100.0, 105.0, 110.0, 5000.0, 200.0, 205.0, 9000.0],
+        "score": [0.9, 0.5, 0.3, 0.4, 0.7, 0.2, 0.6],
+        "decoy": [0, 0, 1, 0, 0, 1, 0],
     })
     r = competitive_features(df, rt_tol=15.0).set_index("feature_id")
+
+    # Second window must be computed independently and NOT overwritten.
+    assert abs(r.loc[5, "VAR_ODIA_BEST_DELTA"] - 0.5) < 1e-9, r.loc[5]
+    assert abs(r.loc[6, "VAR_ODIA_BEST_DELTA"] - (-0.5)) < 1e-9, r.loc[6]
+    assert r.loc[7, "VAR_ODIA_N_COMPET"] == 0.0      # isolated in RT
+    assert r.loc[5, "VAR_ODIA_N_COMPET"] > 0
+    # a peptide in window A must never compete with one in window B
+    assert r.loc[1, "VAR_ODIA_N_COMPET"] == np.log1p(2)
     # best candidate beats its best rival by 0.9-0.5
     assert abs(r.loc[1, "VAR_ODIA_BEST_DELTA"] - 0.4) < 1e-9, r.loc[1]
     # second-best is behind the leader
