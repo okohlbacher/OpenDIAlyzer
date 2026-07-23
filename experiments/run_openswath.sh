@@ -62,6 +62,13 @@ MZ_WIN_MS1=${MZ_WIN_MS1:-9.2} # MS1, ppm FULL width  = 2 x DIA-NN's +/-4.6
 # the parameter that most affects both specificity and runtime.
 RT_WIN=${RT_WIN:-2064}
 
+# -force below is required because this acquisition's isolation windows abut
+# with a ~0.011 Th gap (375.43-399.43, then 399.44-423.44 -- visible in
+# odia-info output). OpenSWATH aborts on ANY gap in the extraction windows.
+# Here it is a rounding artefact of the method definition, ~0.05% of a 24 Th
+# window, and ignoring it is correct. Do NOT keep -force for a run with
+# genuinely discontinuous windows: it would silently skip real m/z ranges.
+
 echo "threads=$THREADS outer=$OUTER  mz=${MZ_WIN}ppm ms1=${MZ_WIN_MS1}ppm rt_window=${RT_WIN}s"
 
 /usr/bin/time -v $OPENMS/bin/OpenSwathWorkflow \
@@ -76,6 +83,7 @@ echo "threads=$THREADS outer=$OUTER  mz=${MZ_WIN}ppm ms1=${MZ_WIN_MS1}ppm rt_win
   -mz_extraction_window_ms1_unit ppm \
   -rt_extraction_window "$RT_WIN" \
   -ion_mobility_window -1 \
+  -force \
   -tempDirectory "$OUT/tmp" \
   2>&1 | tee "$OUT/openswath.log"
 
