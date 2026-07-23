@@ -62,6 +62,13 @@ MZ_WIN_MS1=${MZ_WIN_MS1:-9.2} # MS1, ppm FULL width  = 2 x DIA-NN's +/-4.6
 # the parameter that most affects both specificity and runtime.
 RT_WIN=${RT_WIN:-2064}
 
+# Ion mobility. -1 means "no IM / extract over the whole range" and is correct
+# for non-IM data such as PXD034539. For diaPASEF it must be set, or the IM
+# dimension -- the main reason diaPASEF separates interference at all -- is
+# thrown away. Use the width DIA-NN measured on the same runs (it logs
+# "IM window set to ..." in 1/K0); 0.047 for the agxt S08/S23/S30 set.
+IM_WIN=${IM_WIN:--1}
+
 # -force below is required because this acquisition's isolation windows abut
 # with a ~0.011 Th gap (375.43-399.43, then 399.44-423.44 -- visible in
 # odia-info output). OpenSWATH aborts on ANY gap in the extraction windows.
@@ -82,7 +89,7 @@ echo "threads=$THREADS outer=$OUTER  mz=${MZ_WIN}ppm ms1=${MZ_WIN_MS1}ppm rt_win
   -mz_extraction_window_ms1 "$MZ_WIN_MS1" \
   -mz_extraction_window_ms1_unit ppm \
   -rt_extraction_window "$RT_WIN" \
-  -ion_mobility_window -1 \
+  -ion_mobility_window "$IM_WIN" \
   -force \
   -tempDirectory "$OUT/tmp" \
   2>&1 | tee "$OUT/openswath.log"
