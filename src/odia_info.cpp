@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -151,6 +152,95 @@ int occupancy(const OpenMS::MSExperiment& exp, double ppm)
   }
   return 0;
 }
+
+// Probability that a random F-fragment candidate passes a "k of F" popcount.
+double pass_prob(double p, int F, int k)
+{
+  double tail = 0.0;
+  for (int i = k; i <= F; ++i)
+  {
+    double c = 1.0;
+    for (int j = 0; j < i; ++j) c = c * (F - j) / (j + 1);
+    tail += c * std::pow(p, i) * std::pow(1 - p, F - i);
+  }
+  return tail;
+}
+
+// The honest version of the occupancy measurement.
+//
+// A candidate is not tested against ONE spectrum. It is tested against the
+// (isolation window x RT-cell) it routes to, whose bitmap is the UNION of every
+// scan in that cell. Cell width is set by retention-time prediction error --
+// which for non-tryptic HLA peptides is out-of-distribution and wide. So
+// selectivity must be measured as a function of RT window, not per spectrum.
+// Sweeping it is the only way to see where the filter dies.
+int occupancy_rt(const OpenMS::MSExperiment& exp, double ppm, int ncand)
+{
+  const double inv = 1.0 / std::log1p(ppm * 1e-6);
+  const double mz0 = 100.0;
+
+  // Group MS2 scans by isolation window, keeping (RT, bins).
+  std::map<double, std::vector<std::pair<double, std::vector<long>>>> by_window;
+  long gmin = std::numeric_limits<long>::max(), gmax = std::numeric_limits<long>::min();
+
+  for (const auto& s : exp.getSpectra())
+  {
+    if (s.getMSLevel() != 2 || s.empty() || s.getPrecursors().empty()) continue;
+    std::vector<long> b;
+    b.reserve(s.size());
+    for (const auto& pk : s)
+    {
+      const long i = mz_bin(pk.getMZ(), mz0, inv);
+      b.push_back(i);
+      gmin = std::min(gmin, i);
+      gmax = std::max(gmax, i);
+    }
+    std::sort(b.begin(), b.end());
+    b.erase(std::unique(b.begin(), b.end()), b.end());
+    by_window[s.getPrecursors().front().getMZ()].emplace_back(s.getRT(), std::move(b));
+  }
+  if (by_window.empty()) { std::fprintf(stderr, "no MS2 spectra\n"); return 1; }
+
+  const double span = double(gmax - gmin + 1);
+  std::printf("tolerance %.0f ppm | %zu windows | %.0f bins in fragment range\n",
+              ppm, by_window.size(), span);
+  std::printf("candidates assumed %d, F=6 fragments, k=3 required, x3 neighbour probe\n\n", ncand);
+  std::puts("  RT cell   scans/  occupancy   hit prob   P(pass)      survivors");
+  std::puts("  (+/- s)    cell                (x3 nb)                of candidates");
+
+  for (double half : {5.0, 10.0, 30.0, 60.0, 150.0, 300.0, 600.0})
+  {
+    const double W = 2 * half;
+    std::vector<double> occs, cellscans;
+
+    for (auto& [mz, scans] : by_window)
+    {
+      std::sort(scans.begin(), scans.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+      const double t0 = scans.front().first, t1 = scans.back().first;
+      for (double c = t0; c < t1; c += W)
+      {
+        std::vector<long> u;
+        size_t n = 0;
+        for (const auto& [rt, bins] : scans)
+          if (rt >= c && rt < c + W) { u.insert(u.end(), bins.begin(), bins.end()); ++n; }
+        if (n == 0) continue;
+        std::sort(u.begin(), u.end());
+        const size_t distinct = std::unique(u.begin(), u.end()) - u.begin();
+        occs.push_back(double(distinct) / span);
+        cellscans.push_back(double(n));
+      }
+    }
+    const double p_raw = median(occs);
+    const double p = std::min(1.0, 3.0 * p_raw);
+    const double pp = pass_prob(p, 6, 3);
+    std::printf("  %7.0f  %6.0f   %9.5f  %9.5f  %10.3e  %12.3e\n",
+                half, median(cellscans), p_raw, p, pp, pp * ncand);
+  }
+  std::puts("\nRT cell width is set by RT-prediction error. For non-tryptic HLA");
+  std::puts("peptides that error is out-of-distribution -- read the wide rows.");
+  return 0;
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -163,8 +253,9 @@ int main(int argc, char** argv)
                  "       odia-info --selftest\n");
     return 2;
   }
-  double occ_ppm = 0.0;
+  double occ_ppm = 0.0, occ_rt_ppm = 0.0;
   if (argc == 4 && std::string(argv[2]) == "--occupancy") occ_ppm = std::atof(argv[3]);
+  if (argc == 4 && std::string(argv[2]) == "--occupancy-rt") occ_rt_ppm = std::atof(argv[3]);
 
   OpenMS::MSExperiment exp;
   try
@@ -178,6 +269,7 @@ int main(int argc, char** argv)
   }
 
   if (occ_ppm > 0.0) return occupancy(exp, occ_ppm);
+  if (occ_rt_ppm > 0.0) return occupancy_rt(exp, occ_rt_ppm, 150000000);
 
   std::map<Window, size_t> windows;
   std::vector<double> ms1_rts;
