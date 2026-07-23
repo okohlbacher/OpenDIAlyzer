@@ -79,16 +79,24 @@ int main()
   }
 
   // --- SpectralAngle (Scoring_test.cpp:198-212) ---
+  // NOTE: the first reference pair in Scoring_test.cpp (expected 0.76994534) is
+  // internally inconsistent with the other two. Verified with numpy: the raw
+  // acos(dot/(|x||y|)) formula -- which is exactly what the LIBRARY's
+  // Scoring::SpectralAngle computes (Scoring.cpp:44) -- reproduces pairs 2 and 3
+  // to 1e-15 but gives 1.0597 for pair 1, not 0.7699. The 0.7699 value matches
+  // no self-consistent convention over these inputs and appears to be a stale
+  // expected value in the OpenMS test. We assert against the library's actual
+  // behaviour (pairs 2, 3), which is the correctness contract that matters.
   {
-    near("spectral_angle 1",
-         spectral_angle({0.03174064, 0.11582065, 0.63258941},
-                        {0.71882213, 0.00087569, 0.36516896}), 0.7699453419277419);
     near("spectral_angle 2",
          spectral_angle({0.6608937, 0.0726909, 0.40912141},
                         {0.52081914, 0.71088, 0.0175557}), 0.9449782659258582);
     near("spectral_angle 3",
          spectral_angle({0.58858475, 0.08963515, 0.08578046},
                         {0.76180969, 0.72763536, 0.50090751}), 0.6547156284689354);
+    // Orthogonal and identical unit vectors pin the two ends of the range.
+    near("spectral_angle orthogonal", spectral_angle({1, 0, 0}, {0, 1, 0}), 1.57079632679);
+    near("spectral_angle identical", spectral_angle({1, 0, 0}, {1, 0, 0}), 0.0);
   }
 
   // --- all-pairs consistency: diagonal is autocorrelation, peak at delay 0 ---

@@ -85,17 +85,19 @@ inline XCorrPeak xcorr_max(const std::vector<double>& xc, int maxdelay)
   return best;
 }
 
-// Normalised Manhattan distance (mQuest delta_ratio_sum): each vector scaled to
-// unit mean, mean absolute difference. Matches NormalizedManhattanDist.
+// Normalised Manhattan distance (mQuest delta_ratio_sum). OpenSWATH's
+// normalize_sum divides each vector by its SUM (not its mean), then takes the
+// mean absolute difference. Dividing by the mean instead is an n-fold error.
 inline double normalized_manhattan(std::vector<double> x, std::vector<double> y)
 {
   const size_t n = x.size();
   if (n == 0) return 0.0;
-  double mx = 0.0, my = 0.0;
-  for (size_t i = 0; i < n; ++i) { mx += x[i]; my += y[i]; }
-  mx /= n; my /= n;
+  double sx = 0.0, sy = 0.0;
+  for (size_t i = 0; i < n; ++i) { sx += x[i]; sy += y[i]; }
+  if (sx != 0.0) for (double& v : x) v /= sx;
+  if (sy != 0.0) for (double& v : y) v /= sy;
   double s = 0.0;
-  for (size_t i = 0; i < n; ++i) s += std::abs(x[i] / mx - y[i] / my);
+  for (size_t i = 0; i < n; ++i) s += std::abs(x[i] - y[i]);
   return s / n;
 }
 
