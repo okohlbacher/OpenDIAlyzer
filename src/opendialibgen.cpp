@@ -44,6 +44,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -393,7 +394,7 @@ int digest_fasta(const char* path, const DigestOpts& d, const ModPolicy& mp,
   dig.setEnzyme("Trypsin");
   dig.setMissedCleavages(d.missed);           // specificity defaults to full-tryptic
 
-  std::vector<std::pair<std::string, int>> seen; // dedup on (modseq, charge)
+  std::unordered_set<std::string> seen; // dedup on (modseq, charge); O(1) whole-proteome
   for (const auto& e : entries)
   {
     std::vector<OpenMS::AASequence> peps;
@@ -405,16 +406,8 @@ int digest_fasta(const char* path, const DigestOpts& d, const ModPolicy& mp,
       // One precursor per (peptidoform x charge). Fixed Cam(C) + variable mods.
       for (const std::string& form : peptidoforms(s, mp))
         for (int z = d.min_charge; z <= d.max_charge; ++z)
-        {
-          const std::pair<std::string, int> key{form, z};
-          // ponytail: O(n^2) dedup, fine for Stage-2 test proteomes; swap for an
-          // unordered_set if this ever runs whole-proteome.
-          bool dup = false;
-          for (const auto& k : seen) if (k == key) { dup = true; break; }
-          if (dup) continue;
-          seen.push_back(key);
-          out.push_back({s, z, e.identifier, form});
-        }
+          if (seen.insert(form + '\t' + std::to_string(z)).second) // first sighting only
+            out.push_back({s, z, e.identifier, form});
     }
   }
   return 0;
