@@ -56,6 +56,9 @@ target_link_libraries(OpenDIALibGen PRIVATE OpenMS)
 add_executable(odia-modx-test src/odia_modx_test.cpp)
 target_link_libraries(odia-modx-test PRIVATE OpenMS)
 
+add_executable(odia-modpredict-test src/odia_modpredict_test.cpp)
+target_link_libraries(odia-modpredict-test PRIVATE OpenMS)
+
 set(OPENDIALIBGEN_MODEL_DIR "${OpenMS_DIR}/../../../share/OpenMS/models"
     CACHE PATH "Directory containing peptdeep_*_dynamic.onnx (used by the OpenDIALibGen selftest)")
 
@@ -66,3 +69,4 @@ add_test(NAME odia-score-oracle COMMAND odia-score-test)
 add_test(NAME OpenDIALibGen-selftest
          COMMAND OpenDIALibGen --selftest -model_dir "${OPENDIALIBGEN_MODEL_DIR}")
 add_test(NAME odia-modx-p2 COMMAND odia-modx-test)
+add_test(NAME odia-modpredict-p2 COMMAND odia-modpredict-test "${OPENDIALIBGEN_MODEL_DIR}")
