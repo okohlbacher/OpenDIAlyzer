@@ -20,6 +20,16 @@
 #include <OpenMS/KERNEL/StandardTypes.h>
 #include <OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h>
 #include <OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h>
+// Stage 2: FASTA digest + in-process assay refinement + decoy generation,
+// folding in what OpenSwathAssayGenerator / OpenSwathDecoyGenerator do via the
+// same library classes (MRMAssay / MRMDecoy).
+#include <OpenMS/ANALYSIS/OPENSWATH/MRMAssay.h>
+#include <OpenMS/ANALYSIS/OPENSWATH/MRMDecoy.h>
+#include <OpenMS/ANALYSIS/OPENSWATH/TransitionTSVFile.h>
+#include <OpenMS/CHEMISTRY/ProteaseDigestion.h>
+#include <OpenMS/FORMAT/FASTAFile.h>
+#include <OpenMS/FORMAT/FileTypes.h>
+#include <OpenMS/ANALYSIS/TARGETED/TargetedExperiment.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -79,6 +89,7 @@ struct Precursor
 {
   std::string sequence; // unmodified, uppercase
   int charge;
+  std::string protein = "UNKNOWN"; // FASTA identifier in Stage 2; UNKNOWN for bare peptide lists
 };
 
 // Stage 1 accepts only what the pinned unmodified checkpoint was validated
@@ -200,9 +211,10 @@ std::string generate(const std::vector<Precursor>& precursors,
       const Row& r = rows[t];
       const std::string tid = tg + "_" + std::to_string(t);
       std::snprintf(line, sizeof(line),
-                    "%.6f\t%.6f\t%d\t%d\t%.6f\t%.4f\t%s\t%s\tUNKNOWN\t%c\t%d\t%s\t%s\t0\t1\t0\t1\n",
+                    "%.6f\t%.6f\t%d\t%d\t%.6f\t%.4f\t%s\t%s\t%s\t%c\t%d\t%s\t%s\t0\t1\t0\t1\n",
                     prec_mz, r.mz, z, r.fz, static_cast<double>(r.intensity),
                     static_cast<double>(rts[i]), seq.c_str(), seq.c_str(),
+                    precursors[i].protein.c_str(),
                     r.type, r.series, tg.c_str(), tid.c_str());
       out += line;
     }
@@ -295,6 +307,50 @@ int read_precursors(const char* path, std::vector<Precursor>& out)
     return 1;                                                                                      \
   }
 
+// Stage 2 digest options; defaults match a standard tryptic search.
+struct DigestOpts
+{
+  int missed = 1, min_len = 7, max_len = 30, min_charge = 2, max_charge = 3;
+};
+
+// FASTA -> tryptic peptides -> Precursors (one per peptide x charge), keeping
+// the source protein identifier. Deduplicated on (sequence, charge); the first
+// protein seen wins, so output is order-deterministic in FASTA order.
+int digest_fasta(const char* path, const DigestOpts& d, std::vector<Precursor>& out)
+{
+  std::vector<OpenMS::FASTAFile::FASTAEntry> entries;
+  try { OpenMS::FASTAFile().load(path, entries); }
+  catch (const std::exception& e) { std::fprintf(stderr, "error: FASTA %s: %s\n", path, e.what()); return 1; }
+
+  OpenMS::ProteaseDigestion dig;
+  dig.setEnzyme("Trypsin");
+  dig.setMissedCleavages(d.missed);           // specificity defaults to full-tryptic
+
+  std::vector<std::pair<std::string, int>> seen; // insertion-ordered dedup key
+  for (const auto& e : entries)
+  {
+    std::vector<OpenMS::AASequence> peps;
+    dig.digest(OpenMS::AASequence::fromString(e.sequence), peps, d.min_len, d.max_len);
+    for (const auto& pep : peps)
+    {
+      const std::string s = pep.toUnmodifiedString();
+      if (!valid_precursor({s, d.min_charge})) continue; // canonical AAs only (drops X/B/Z/U)
+      for (int z = d.min_charge; z <= d.max_charge; ++z)
+      {
+        const std::pair<std::string, int> key{s, z};
+        // ponytail: O(n^2) dedup, fine for Stage-2 test proteomes; swap for an
+        // unordered_set if this ever runs whole-proteome.
+        bool dup = false;
+        for (const auto& k : seen) if (k == key) { dup = true; break; }
+        if (dup) continue;
+        seen.push_back(key);
+        out.push_back({s, z, e.identifier});
+      }
+    }
+  }
+  return 0;
+}
+
 int selftest(const std::string& model_dir, int threads)
 {
   // ponytail: shape/sanity only. Parity vs AlphaPeptDeep Python is OpenMS's
@@ -371,6 +427,42 @@ int selftest(const std::string& model_dir, int threads)
   }
   CHECK(tsv == again);
 
+  // Stage 2: FASTA digest branch. A temp FASTA exercises the real FASTAFile +
+  // ProteaseDigestion path. Sequence is proline-free so the K/R-before-P
+  // exception doesn't complicate the expectation. ELVISK|LIVESR|NOWK.
+  {
+    const char* fasta = ">TESTPROT test\nELVISKLIVESRNOWK\n";
+    const std::string ftmp = "/tmp/odialibgen_selftest.fasta";
+    auto write_fasta = [&] { std::ofstream o(ftmp); o << fasta; };
+    DigestOpts d;
+    d.missed = 0; d.min_len = 4; d.max_len = 30; d.min_charge = 2; d.max_charge = 2;
+    write_fasta();
+    std::vector<Precursor> dp;
+    CHECK(digest_fasta(ftmp.c_str(), d, dp) == 0);
+    // Fully-tryptic peptides, each at charge 2, protein set. Assertions are
+    // chemically robust (exact count depends on OpenMS terminus handling):
+    // within length bounds, internal peptides end in K/R.
+    CHECK(dp.size() >= 2);
+    size_t kr_terminal = 0;
+    for (const auto& p : dp)
+    {
+      CHECK(p.charge == 2);
+      CHECK(p.protein == "TESTPROT");
+      CHECK(p.sequence.size() >= 4 && p.sequence.size() <= 30);
+      const char last = p.sequence.back();
+      if (last == 'K' || last == 'R') ++kr_terminal;
+    }
+    CHECK(kr_terminal >= 2); // at least the two internal peptides end in K/R
+    // Determinism: identical FASTA -> identical precursor list.
+    write_fasta();
+    std::vector<Precursor> dp2;
+    CHECK(digest_fasta(ftmp.c_str(), d, dp2) == 0);
+    std::remove(ftmp.c_str());
+    CHECK(dp2.size() == dp.size());
+    for (size_t k = 0; k < dp.size(); ++k)
+      CHECK(dp[k].sequence == dp2[k].sequence && dp[k].charge == dp2[k].charge);
+  }
+
   std::puts("selftest OK");
   return 0;
 }
@@ -378,20 +470,84 @@ int selftest(const std::string& model_dir, int threads)
 
 } // namespace
 
+// Load the raw target TSV into a TargetedExperiment, run the OpenSwathAssayGenerator
+// refinement (reannotate -> restrict -> select detecting), optionally append
+// OpenSwathDecoyGenerator shuffle decoys, and write the final TSV. Parameter
+// values are copied verbatim from the two TOPP tools so output matches them;
+// the equivalence gate checks this empirically. Uses temp files because the
+// TransitionTSVFile / MRM* APIs are file- and TargetedExperiment-based.
+//
+// NOTE (vendored patch P3): MRMDecoy shuffle seeds with time(nullptr) in a
+// release build, so the DECOY rows are NOT reproducible -- identical to the
+// standalone OpenSwathDecoyGenerator. The target library is deterministic.
+int refine_and_decoy(const std::string& raw_tsv, const std::string& out_path, bool decoys)
+{
+  using namespace OpenMS;
+  const std::string tmp_raw = out_path + ".raw.tmp.tsv";
+  { std::ofstream o(tmp_raw, std::ios::binary); if (!o) { std::fprintf(stderr, "error: temp %s\n", tmp_raw.c_str()); return 1; } o << raw_tsv; }
+
+  const std::vector<std::string> frag_types{"b", "y"};
+  const std::vector<size_t> frag_charges{1, 2, 3, 4};        // AssayGenerator default
+  const std::vector<std::pair<double, double>> no_swathes;   // no SWATH restriction
+  try
+  {
+    TargetedExperiment exp;
+    TransitionTSVFile().convertTSVToTargetedExperiment(tmp_raw.c_str(), FileTypes::TSV, exp);
+
+    // Values copied verbatim from OpenSwathAssayGenerator's registered defaults
+    // (product m/z limits 350-2000 Th are the ones that actually change the
+    // transition set; using 0/inf kept small fragments the tool drops).
+    MRMAssay assay;
+    assay.reannotateTransitions(exp, 0.025, 0.025, frag_types, frag_charges, false, false);
+    assay.restrictTransitions(exp, 350.0, 2000.0, no_swathes);
+    assay.detectingTransitions(exp, 6, 6);                   // min=max=6
+
+    if (decoys)
+    {
+      TargetedExperiment dec;
+      MRMDecoy().generateDecoys(exp, dec, "shuffle", 1.0, /*switchKR*/ true, "DECOY_",
+                                /*max_attempts*/ 10, /*identity_threshold*/ 0.7,
+                                /*precursor_mz_shift*/ 0.0, /*product_mz_shift*/ 20.0,
+                                /*product_mz_threshold*/ 0.025, frag_types, frag_charges,
+                                false, false);
+      exp += dec; // TargetedExperiment::operator+= merges proteins/peptides/transitions
+    }
+
+    TransitionTSVFile().convertTargetedExperimentToTSV(out_path.c_str(), exp);
+  }
+  catch (const std::exception& e)
+  {
+    std::fprintf(stderr, "error: refine/decoy: %s\n", e.what());
+    std::remove(tmp_raw.c_str());
+    return 1;
+  }
+  std::remove(tmp_raw.c_str());
+  return 0;
+}
+
 int main(int argc, char** argv)
 {
-  std::string in_path, out_path, model_dir;
+  std::string in_path, fasta_path, out_path, model_dir;
   int threads = 1; // explicit, never omp_get_max_threads(); 1 = deterministic default
-  bool do_selftest = false;
+  bool do_selftest = false, raw = false, decoys = true;
+  DigestOpts dig;
 
   for (int i = 1; i < argc; ++i)
   {
     const std::string a = argv[i];
     if (a == "--selftest") do_selftest = true;
     else if (a == "-in" && i + 1 < argc) in_path = argv[++i];
+    else if (a == "-fasta" && i + 1 < argc) fasta_path = argv[++i];
     else if (a == "-out" && i + 1 < argc) out_path = argv[++i];
     else if (a == "-model_dir" && i + 1 < argc) model_dir = argv[++i];
     else if (a == "-threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+    else if (a == "-missed_cleavages" && i + 1 < argc) dig.missed = std::atoi(argv[++i]);
+    else if (a == "-min_len" && i + 1 < argc) dig.min_len = std::atoi(argv[++i]);
+    else if (a == "-max_len" && i + 1 < argc) dig.max_len = std::atoi(argv[++i]);
+    else if (a == "-min_charge" && i + 1 < argc) dig.min_charge = std::atoi(argv[++i]);
+    else if (a == "-max_charge" && i + 1 < argc) dig.max_charge = std::atoi(argv[++i]);
+    else if (a == "-no_decoys") decoys = false;
+    else if (a == "-raw") raw = true; // emit pre-refinement, pre-decoy transitions
     else
     {
       std::fprintf(stderr, "error: unknown or incomplete argument '%s'\n", a.c_str());
@@ -399,38 +555,48 @@ int main(int argc, char** argv)
     }
   }
 
-  if (threads < 1 || model_dir.empty() || (!do_selftest && (in_path.empty() || out_path.empty())))
+  const bool have_input = !in_path.empty() ^ !fasta_path.empty(); // exactly one
+  if (threads < 1 || model_dir.empty() || (!do_selftest && (!have_input || out_path.empty())))
   {
     std::fprintf(stderr,
-                 "usage: OpenDIALibGen -in peptides.tsv -out library.tsv -model_dir <dir> [-threads N]\n"
-                 "       OpenDIALibGen --selftest -model_dir <dir> [-threads N]\n"
-                 "model_dir must contain peptdeep_rt_dynamic.onnx and peptdeep_ms2_dynamic.onnx\n"
-                 "(OpenMS build tree: share/OpenMS/models/)\n");
+                 "usage (Stage 1): OpenDIALibGen -in peptides.tsv -out lib.tsv -model_dir <dir> [-threads N] [-raw]\n"
+                 "usage (Stage 2): OpenDIALibGen -fasta db.fasta -out lib.tsv -model_dir <dir>\n"
+                 "                   [-missed_cleavages 1] [-min_len 7] [-max_len 30]\n"
+                 "                   [-min_charge 2] [-max_charge 3] [-no_decoys] [-raw] [-threads N]\n"
+                 "         selftest: OpenDIALibGen --selftest -model_dir <dir> [-threads N]\n"
+                 "model_dir must contain peptdeep_rt_dynamic.onnx and peptdeep_ms2_dynamic.onnx\n");
     return 2;
   }
 
   if (do_selftest) return selftest(model_dir, threads);
 
   std::vector<Precursor> precursors;
-  if (read_precursors(in_path.c_str(), precursors) != 0) return 1;
+  if (!fasta_path.empty())
+  {
+    if (digest_fasta(fasta_path.c_str(), dig, precursors) != 0) return 1;
+  }
+  else if (read_precursors(in_path.c_str(), precursors) != 0) return 1;
 
   std::string tsv;
-  try
+  try { tsv = generate(precursors, model_dir, threads); }
+  catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
+
+  if (raw || fasta_path.empty())
   {
-    tsv = generate(precursors, model_dir, threads);
-  }
-  catch (const std::exception& e)
-  {
-    std::fprintf(stderr, "error: %s\n", e.what());
-    return 1;
+    // Stage 1 semantics, or -raw: write the raw target transitions as-is.
+    std::ofstream out(out_path, std::ios::binary);
+    if (!out) { std::fprintf(stderr, "error: cannot write %s\n", out_path.c_str()); return 1; }
+    out << tsv;
+    out.close();
+    std::printf("%zu precursors -> %s\n", precursors.size(), out_path.c_str());
+    std::puts(raw ? "raw target transitions (pre-refine, pre-decoy)"
+                  : "targets only - generate decoys with OpenSwathDecoyGenerator");
+    return 0;
   }
 
-  std::ofstream out(out_path, std::ios::binary);
-  if (!out) { std::fprintf(stderr, "error: cannot write %s\n", out_path.c_str()); return 1; }
-  out << tsv;
-  out.close();
-
-  std::printf("%zu precursors -> %s\n", precursors.size(), out_path.c_str());
-  std::puts("targets only - generate decoys with OpenSwathDecoyGenerator");
+  // Stage 2: fold in assay refinement + decoys in-process.
+  if (refine_and_decoy(tsv, out_path, decoys) != 0) return 1;
+  std::printf("%zu precursors digested+refined%s -> %s\n", precursors.size(),
+              decoys ? "+decoyed" : "", out_path.c_str());
   return 0;
 }
