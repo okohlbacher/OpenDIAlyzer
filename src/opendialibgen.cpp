@@ -87,9 +87,10 @@ const char* kHeader =
 
 struct Precursor
 {
-  std::string sequence; // unmodified, uppercase
+  std::string sequence; // unmodified base, uppercase (PeptideSequence column)
   int charge;
   std::string protein = "UNKNOWN"; // FASTA identifier in Stage 2; UNKNOWN for bare peptide lists
+  std::string modseq;   // OpenMS/UniMod modified sequence; empty => unmodified (== sequence)
 };
 
 // Stage 1 accepts only what the pinned unmodified checkpoint was validated
@@ -101,18 +102,69 @@ bool valid_precursor(const Precursor& p)
   return p.sequence.find_first_not_of("ACDEFGHIKLMNPQRSTVWY") == std::string::npos;
 }
 
+// Stage 3 modification policy. Defaults match a standard tryptic search:
+// Carbamidomethyl(C) fixed, Oxidation(M) and protein-N-term Acetyl variable.
+struct ModPolicy
+{
+  bool cam_c = true, ox_m = true, acetyl_nterm = true;
+  int max_var = 2; // max simultaneous VARIABLE mods per peptide (DIA-NN uses 1-3)
+};
+
+// Enumerate peptidoforms of a base peptide as UniMod modified-sequence strings.
+// Fixed mods (Cam@C) are applied to every eligible site; variable mods
+// (Ox@M, N-term Acetyl) are enumerated in every subset up to max_var. The base
+// (fixed-only) form is always included. Deterministic (sorted, de-duplicated).
+std::vector<std::string> peptidoforms(const std::string& base, const ModPolicy& mp)
+{
+  OpenMS::AASequence fixed = OpenMS::AASequence::fromString(base);
+  if (mp.cam_c)
+    for (OpenMS::Size i = 0; i < fixed.size(); ++i)
+      if (fixed[i].getOneLetterCode() == "C") fixed.setModification(i, "Carbamidomethyl");
+
+  // Variable sites: M residues (Oxidation) plus an optional N-terminal slot (-1).
+  std::vector<int> slots;
+  if (mp.ox_m)
+    for (OpenMS::Size i = 0; i < fixed.size(); ++i)
+      if (fixed[i].getOneLetterCode() == "M") slots.push_back(static_cast<int>(i));
+  if (mp.acetyl_nterm) slots.push_back(-1);
+
+  // ponytail: 2^slots subset scan, filtered by popcount<=max_var. Fine because
+  // real peptides have few M; a pathological run is capped here rather than
+  // generating combinations lazily.
+  const int n = std::min(static_cast<int>(slots.size()), 20);
+  std::vector<std::string> forms;
+  for (int mask = 0; mask < (1 << n); ++mask)
+  {
+    if (__builtin_popcount(static_cast<unsigned>(mask)) > mp.max_var) continue;
+    OpenMS::AASequence a = fixed;
+    for (int b = 0; b < n; ++b)
+      if (mask & (1 << b))
+      {
+        if (slots[b] == -1) a.setNTerminalModification("Acetyl (Protein N-term)");
+        else a.setModification(static_cast<OpenMS::Size>(slots[b]), "Oxidation");
+      }
+    forms.push_back(a.toUniModString());
+  }
+  std::sort(forms.begin(), forms.end());
+  forms.erase(std::unique(forms.begin(), forms.end()), forms.end());
+  return forms;
+}
+
 // The whole pipeline, into a string so --selftest can diff two runs for the
 // byte-identical-output requirement without touching the filesystem.
 std::string generate(const std::vector<Precursor>& precursors,
                      const std::string& model_dir, int threads)
 {
-  std::vector<std::string> peptides;
+  // Predict from the (possibly modified) AASequences. mod_x is populated by the
+  // vendored P2 patch, so predictions reflect the modifications. An unmodified
+  // precursor (empty modseq) yields a zero mod_x == the Stage 1 behaviour.
+  std::vector<OpenMS::AASequence> aaseqs;
   std::vector<float> charges, nces;
   std::vector<int64_t> instruments;
-  peptides.reserve(precursors.size());
+  aaseqs.reserve(precursors.size());
   for (const auto& p : precursors)
   {
-    peptides.push_back(p.sequence);
+    aaseqs.push_back(OpenMS::AASequence::fromString(p.modseq.empty() ? p.sequence : p.modseq));
     charges.push_back(static_cast<float>(p.charge));
     nces.push_back(kNCE);
     instruments.push_back(kInstrument);
@@ -120,9 +172,9 @@ std::string generate(const std::vector<Precursor>& precursors,
 
   OpenMS::PeptDeepRTInference rt_model(model_dir + "/peptdeep_rt_dynamic.onnx", threads);
   OpenMS::PeptDeepMS2Inference ms2_model(model_dir + "/peptdeep_ms2_dynamic.onnx", threads);
-  const std::vector<float> rts = rt_model.predictRT(peptides);
+  const std::vector<float> rts = rt_model.predictRT(aaseqs);
   const std::vector<std::vector<float>> ms2 =
-      ms2_model.predictMS2(peptides, charges, nces, instruments);
+      ms2_model.predictMS2(aaseqs, charges, nces, instruments);
 
   // Defaults already give plain b/y ions only (no losses, isotopes, precursor
   // or immonium peaks). Two overrides: add_metainfo is what makes the
@@ -138,14 +190,16 @@ std::string generate(const std::vector<Precursor>& precursors,
 
   std::string out = kHeader;
   out += '\n';
-  char line[512];
+  char line[1024]; // UniMod-annotated modseq can be long
 
   for (size_t i = 0; i < precursors.size(); ++i)
   {
-    const std::string& seq = precursors[i].sequence;
+    const std::string& seq = precursors[i].sequence;   // unmodified base (PeptideSequence)
     const int z = precursors[i].charge;
     const int nAA = static_cast<int>(seq.size());
-    const OpenMS::AASequence aaseq = OpenMS::AASequence::fromString(seq);
+    const OpenMS::AASequence& aaseq = aaseqs[i];        // modified form drives m/z + fragments
+    // ModifiedPeptideSequence in UniMod form; == base sequence when unmodified.
+    const std::string modseq = precursors[i].modseq.empty() ? seq : aaseq.toUniModString();
     const double prec_mz = aaseq.getMonoWeight(OpenMS::Residue::Full, z) / z;
 
     // PeptDeep predicts z1/z2 channels only; a fragment charge above the
@@ -161,7 +215,9 @@ std::string generate(const std::vector<Precursor>& precursors,
     }
     const auto& names = spec.getStringDataArrays()[0];
 
-    const std::string tg = seq + "_" + std::to_string(z);
+    // Peptidoforms of the same base + charge must not collide: key on the
+    // modified sequence so each peptidoform is its own transition group.
+    const std::string tg = modseq + "_" + std::to_string(z);
 
     // Collect (ProductMz, intensity, ion) rows, then emit sorted by ProductMz
     // — fixed formatting + fixed order is what makes the output byte-stable.
@@ -213,7 +269,7 @@ std::string generate(const std::vector<Precursor>& precursors,
       std::snprintf(line, sizeof(line),
                     "%.6f\t%.6f\t%d\t%d\t%.6f\t%.4f\t%s\t%s\t%s\t%c\t%d\t%s\t%s\t0\t1\t0\t1\n",
                     prec_mz, r.mz, z, r.fz, static_cast<double>(r.intensity),
-                    static_cast<double>(rts[i]), seq.c_str(), seq.c_str(),
+                    static_cast<double>(rts[i]), seq.c_str(), modseq.c_str(),
                     precursors[i].protein.c_str(),
                     r.type, r.series, tg.c_str(), tid.c_str());
       out += line;
@@ -316,7 +372,8 @@ struct DigestOpts
 // FASTA -> tryptic peptides -> Precursors (one per peptide x charge), keeping
 // the source protein identifier. Deduplicated on (sequence, charge); the first
 // protein seen wins, so output is order-deterministic in FASTA order.
-int digest_fasta(const char* path, const DigestOpts& d, std::vector<Precursor>& out)
+int digest_fasta(const char* path, const DigestOpts& d, const ModPolicy& mp,
+                 std::vector<Precursor>& out)
 {
   std::vector<OpenMS::FASTAFile::FASTAEntry> entries;
   try { OpenMS::FASTAFile().load(path, entries); }
@@ -326,7 +383,7 @@ int digest_fasta(const char* path, const DigestOpts& d, std::vector<Precursor>& 
   dig.setEnzyme("Trypsin");
   dig.setMissedCleavages(d.missed);           // specificity defaults to full-tryptic
 
-  std::vector<std::pair<std::string, int>> seen; // insertion-ordered dedup key
+  std::vector<std::pair<std::string, int>> seen; // dedup on (modseq, charge)
   for (const auto& e : entries)
   {
     std::vector<OpenMS::AASequence> peps;
@@ -335,17 +392,19 @@ int digest_fasta(const char* path, const DigestOpts& d, std::vector<Precursor>& 
     {
       const std::string s = pep.toUnmodifiedString();
       if (!valid_precursor({s, d.min_charge})) continue; // canonical AAs only (drops X/B/Z/U)
-      for (int z = d.min_charge; z <= d.max_charge; ++z)
-      {
-        const std::pair<std::string, int> key{s, z};
-        // ponytail: O(n^2) dedup, fine for Stage-2 test proteomes; swap for an
-        // unordered_set if this ever runs whole-proteome.
-        bool dup = false;
-        for (const auto& k : seen) if (k == key) { dup = true; break; }
-        if (dup) continue;
-        seen.push_back(key);
-        out.push_back({s, z, e.identifier});
-      }
+      // One precursor per (peptidoform x charge). Fixed Cam(C) + variable mods.
+      for (const std::string& form : peptidoforms(s, mp))
+        for (int z = d.min_charge; z <= d.max_charge; ++z)
+        {
+          const std::pair<std::string, int> key{form, z};
+          // ponytail: O(n^2) dedup, fine for Stage-2 test proteomes; swap for an
+          // unordered_set if this ever runs whole-proteome.
+          bool dup = false;
+          for (const auto& k : seen) if (k == key) { dup = true; break; }
+          if (dup) continue;
+          seen.push_back(key);
+          out.push_back({s, z, e.identifier, form});
+        }
     }
   }
   return 0;
@@ -436,9 +495,10 @@ int selftest(const std::string& model_dir, int threads)
     auto write_fasta = [&] { std::ofstream o(ftmp); o << fasta; };
     DigestOpts d;
     d.missed = 0; d.min_len = 4; d.max_len = 30; d.min_charge = 2; d.max_charge = 2;
+    ModPolicy nomods; nomods.cam_c = nomods.ox_m = nomods.acetyl_nterm = false;
     write_fasta();
     std::vector<Precursor> dp;
-    CHECK(digest_fasta(ftmp.c_str(), d, dp) == 0);
+    CHECK(digest_fasta(ftmp.c_str(), d, nomods, dp) == 0);
     // Fully-tryptic peptides, each at charge 2, protein set. Assertions are
     // chemically robust (exact count depends on OpenMS terminus handling):
     // within length bounds, internal peptides end in K/R.
@@ -456,11 +516,34 @@ int selftest(const std::string& model_dir, int threads)
     // Determinism: identical FASTA -> identical precursor list.
     write_fasta();
     std::vector<Precursor> dp2;
-    CHECK(digest_fasta(ftmp.c_str(), d, dp2) == 0);
+    CHECK(digest_fasta(ftmp.c_str(), d, nomods, dp2) == 0);
     std::remove(ftmp.c_str());
     CHECK(dp2.size() == dp.size());
     for (size_t k = 0; k < dp.size(); ++k)
       CHECK(dp[k].sequence == dp2[k].sequence && dp[k].charge == dp2[k].charge);
+  }
+
+  // Stage 3: peptidoform enumeration. AMCK has one C (fixed Cam), one M (var Ox),
+  // plus the variable N-term Acetyl -> with max_var 2: base(Cam only) + {Ox},
+  // {Ac}, {Ox,Ac} = 4 forms. Every form must carry the fixed Cam on C.
+  {
+    ModPolicy mp; mp.max_var = 2;
+    const auto forms = peptidoforms("AMCK", mp);
+    CHECK(forms.size() == 4);
+    for (const std::string& f : forms)
+      CHECK(f.find("UniMod:4") != std::string::npos); // Carbamidomethyl on C, always
+    size_t with_ox = 0, with_ac = 0;
+    for (const std::string& f : forms)
+    {
+      if (f.find("UniMod:35") != std::string::npos) ++with_ox; // Oxidation
+      if (f.find("UniMod:1") != std::string::npos) ++with_ac;  // Acetyl
+    }
+    CHECK(with_ox == 2); CHECK(with_ac == 2);
+    // max_var 0 -> only the fixed-Cam base form.
+    ModPolicy zero; zero.max_var = 0;
+    CHECK(peptidoforms("AMCK", zero).size() == 1);
+    // Deterministic order.
+    CHECK(peptidoforms("AMCK", mp) == forms);
   }
 
   std::puts("selftest OK");
@@ -531,6 +614,7 @@ int main(int argc, char** argv)
   int threads = 1; // explicit, never omp_get_max_threads(); 1 = deterministic default
   bool do_selftest = false, raw = false, decoys = true;
   DigestOpts dig;
+  ModPolicy mods;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -547,6 +631,8 @@ int main(int argc, char** argv)
     else if (a == "-min_charge" && i + 1 < argc) dig.min_charge = std::atoi(argv[++i]);
     else if (a == "-max_charge" && i + 1 < argc) dig.max_charge = std::atoi(argv[++i]);
     else if (a == "-no_decoys") decoys = false;
+    else if (a == "-max_var_mods" && i + 1 < argc) mods.max_var = std::atoi(argv[++i]);
+    else if (a == "-no_mods") { mods.cam_c = mods.ox_m = mods.acetyl_nterm = false; }
     else if (a == "-raw") raw = true; // emit pre-refinement, pre-decoy transitions
     else
     {
@@ -573,7 +659,7 @@ int main(int argc, char** argv)
   std::vector<Precursor> precursors;
   if (!fasta_path.empty())
   {
-    if (digest_fasta(fasta_path.c_str(), dig, precursors) != 0) return 1;
+    if (digest_fasta(fasta_path.c_str(), dig, mods, precursors) != 0) return 1;
   }
   else if (read_precursors(in_path.c_str(), precursors) != 0) return 1;
 
