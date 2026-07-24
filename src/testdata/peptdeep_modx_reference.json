@@ -1,0 +1,232 @@
+{
+ "mod_elements": [
+  "C",
+  "H",
+  "N",
+  "O",
+  "P",
+  "S",
+  "B",
+  "F",
+  "I",
+  "K",
+  "U",
+  "V",
+  "W",
+  "X",
+  "Y",
+  "Ac",
+  "Ag",
+  "Al",
+  "Am",
+  "Ar",
+  "As",
+  "At",
+  "Au",
+  "Ba",
+  "Be",
+  "Bi",
+  "Bk",
+  "Br",
+  "Ca",
+  "Cd",
+  "Ce",
+  "Cf",
+  "Cl",
+  "Cm",
+  "Co",
+  "Cr",
+  "Cs",
+  "Cu",
+  "Dy",
+  "Er",
+  "Es",
+  "Eu",
+  "Fe",
+  "Fm",
+  "Fr",
+  "Ga",
+  "Gd",
+  "Ge",
+  "He",
+  "Hf",
+  "Hg",
+  "Ho",
+  "In",
+  "Ir",
+  "Kr",
+  "La",
+  "Li",
+  "Lr",
+  "Lu",
+  "Md",
+  "Mg",
+  "Mn",
+  "Mo",
+  "Na",
+  "Nb",
+  "Nd",
+  "Ne",
+  "Ni",
+  "No",
+  "Np",
+  "Os",
+  "Pa",
+  "Pb",
+  "Pd",
+  "Pm",
+  "Po",
+  "Pr",
+  "Pt",
+  "Pu",
+  "Ra",
+  "Rb",
+  "Re",
+  "Rh",
+  "Rn",
+  "Ru",
+  "Sb",
+  "Sc",
+  "Se",
+  "Si",
+  "Sm",
+  "Sn",
+  "Sr",
+  "Ta",
+  "Tb",
+  "Tc",
+  "Te",
+  "Th",
+  "Ti",
+  "Tl",
+  "Tm",
+  "Xe",
+  "Yb",
+  "Zn",
+  "Zr",
+  "2H",
+  "13C",
+  "15N",
+  "18O",
+  "?"
+ ],
+ "cases": [
+  {
+   "sequence": "AMKMR",
+   "mods": "Oxidation@M",
+   "mod_sites": "2",
+   "nAA": 5,
+   "shape": [
+    7,
+    109
+   ],
+   "nonzero": {
+    "2": {
+     "O": 1.0
+    }
+   }
+  },
+  {
+   "sequence": "MPEPTIDE",
+   "mods": "Oxidation@M",
+   "mod_sites": "1",
+   "nAA": 8,
+   "shape": [
+    10,
+    109
+   ],
+   "nonzero": {
+    "1": {
+     "O": 1.0
+    }
+   }
+  },
+  {
+   "sequence": "PEPTIDEC",
+   "mods": "Carbamidomethyl@C",
+   "mod_sites": "8",
+   "nAA": 8,
+   "shape": [
+    10,
+    109
+   ],
+   "nonzero": {
+    "8": {
+     "C": 2.0,
+     "H": 3.0,
+     "N": 1.0,
+     "O": 1.0
+    }
+   }
+  },
+  {
+   "sequence": "ACEPTIDE",
+   "mods": "Acetyl@Protein_N-term",
+   "mod_sites": "0",
+   "nAA": 8,
+   "shape": [
+    10,
+    109
+   ],
+   "nonzero": {
+    "0": {
+     "C": 2.0,
+     "H": 2.0,
+     "O": 1.0
+    }
+   }
+  },
+  {
+   "sequence": "PEPTIDEK",
+   "mods": "Acetyl@K",
+   "mod_sites": "8",
+   "nAA": 8,
+   "shape": [
+    10,
+    109
+   ],
+   "nonzero": {
+    "8": {
+     "C": 2.0,
+     "H": 2.0,
+     "O": 1.0
+    }
+   }
+  },
+  {
+   "sequence": "SMTMYK",
+   "mods": "Oxidation@M;Oxidation@M",
+   "mod_sites": "2;4",
+   "nAA": 6,
+   "shape": [
+    8,
+    109
+   ],
+   "nonzero": {
+    "2": {
+     "O": 1.0
+    },
+    "4": {
+     "O": 1.0
+    }
+   }
+  },
+  {
+   "sequence": "SPYTK",
+   "mods": "Phospho@S",
+   "mod_sites": "1",
+   "nAA": 5,
+   "shape": [
+    7,
+    109
+   ],
+   "nonzero": {
+    "1": {
+     "H": 1.0,
+     "O": 3.0,
+     "P": 1.0
+    }
+   }
+  }
+ ]
+}
