@@ -18,8 +18,10 @@
 #include <OpenMS/DATASTRUCTURES/Param.h>
 #include <OpenMS/KERNEL/MSSpectrum.h>
 #include <OpenMS/KERNEL/StandardTypes.h>
+#include <OpenMS/ML/PEPTDEEP/PeptDeepCCSInference.h>
 #include <OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h>
 #include <OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h>
+#include <OpenMS/IONMOBILITY/IMTypes.h> // CCS (Angstrom^2) -> 1/K0 for diaPASEF libraries
 // Stage 2: FASTA digest + in-process assay refinement + decoy generation,
 // folding in what OpenSwathAssayGenerator / OpenSwathDecoyGenerator do via the
 // same library classes (MRMAssay / MRMDecoy).
@@ -83,7 +85,7 @@ const char* kHeader =
     "PrecursorMz\tProductMz\tPrecursorCharge\tProductCharge\tLibraryIntensity\t"
     "NormalizedRetentionTime\tPeptideSequence\tModifiedPeptideSequence\tProteinId\t"
     "FragmentType\tFragmentSeriesNumber\tTransitionGroupId\tTransitionId\tDecoy\t"
-    "DetectingTransition\tIdentifyingTransition\tQuantifyingTransition";
+    "DetectingTransition\tIdentifyingTransition\tQuantifyingTransition\tPrecursorIonMobility";
 
 struct Precursor
 {
@@ -172,9 +174,13 @@ std::string generate(const std::vector<Precursor>& precursors,
 
   OpenMS::PeptDeepRTInference rt_model(model_dir + "/peptdeep_rt_dynamic.onnx", threads);
   OpenMS::PeptDeepMS2Inference ms2_model(model_dir + "/peptdeep_ms2_dynamic.onnx", threads);
+  OpenMS::PeptDeepCCSInference ccs_model(model_dir + "/peptdeep_ccs_dynamic.onnx", threads);
   const std::vector<float> rts = rt_model.predictRT(aaseqs);
   const std::vector<std::vector<float>> ms2 =
       ms2_model.predictMS2(aaseqs, charges, nces, instruments);
+  // CCS in Angstrom^2; converted per-precursor to 1/K0 (the timsTOF library unit)
+  // in the emit loop, which needs each precursor's m/z and charge.
+  const std::vector<float> ccs = ccs_model.predictCCS(aaseqs, charges);
 
   // Defaults already give plain b/y ions only (no losses, isotopes, precursor
   // or immonium peaks). Two overrides: add_metainfo is what makes the
@@ -201,6 +207,10 @@ std::string generate(const std::vector<Precursor>& precursors,
     // ModifiedPeptideSequence in UniMod form; == base sequence when unmodified.
     const std::string modseq = precursors[i].modseq.empty() ? seq : aaseq.toUniModString();
     const double prec_mz = aaseq.getMonoWeight(OpenMS::Residue::Full, z) / z;
+    // Predicted CCS (Angstrom^2) -> 1/K0 (V*s/cm^2) via Mason-Schamp (N2 gas).
+    // Same value for every transition of this precursor. -1 if CCS is degenerate.
+    const double one_over_k0 =
+        ccs[i] > 0.0f ? OpenMS::IMTypes::ccsToOneOverK0(ccs[i], prec_mz, z) : -1.0;
 
     // PeptDeep predicts z1/z2 channels only; a fragment charge above the
     // precursor charge is physically implausible (AlphaPeptDeep's library
@@ -267,11 +277,11 @@ std::string generate(const std::vector<Precursor>& precursors,
       const Row& r = rows[t];
       const std::string tid = tg + "_" + std::to_string(t);
       std::snprintf(line, sizeof(line),
-                    "%.6f\t%.6f\t%d\t%d\t%.6f\t%.4f\t%s\t%s\t%s\t%c\t%d\t%s\t%s\t0\t1\t0\t1\n",
+                    "%.6f\t%.6f\t%d\t%d\t%.6f\t%.4f\t%s\t%s\t%s\t%c\t%d\t%s\t%s\t0\t1\t0\t1\t%.6f\n",
                     prec_mz, r.mz, z, r.fz, static_cast<double>(r.intensity),
                     static_cast<double>(rts[i]), seq.c_str(), modseq.c_str(),
                     precursors[i].protein.c_str(),
-                    r.type, r.series, tg.c_str(), tid.c_str());
+                    r.type, r.series, tg.c_str(), tid.c_str(), one_over_k0);
       out += line;
     }
   }
