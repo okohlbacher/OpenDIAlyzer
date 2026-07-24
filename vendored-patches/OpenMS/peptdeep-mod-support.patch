@@ -1,0 +1,382 @@
+diff --git a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepCCSInference.h b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepCCSInference.h
+index 3ffb5c0..54e6025 100644
+--- a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepCCSInference.h
++++ b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepCCSInference.h
+@@ -11,6 +11,8 @@
+ #include <OpenMS/config.h>
+ #include <OpenMS/ML/ONNX/ONNXPredictorBase.h>
+ 
++namespace OpenMS { class AASequence; }
++
+ #include <string>
+ #include <vector>
+ 
+@@ -38,6 +40,11 @@ namespace OpenMS
+       const std::vector<std::string>& peptides,
+       const std::vector<float>& charges);
+ 
++    /// (Possibly modified) peptides. Vendored patch P2: mod_x populated from mods.
++    std::vector<float> predictCCS(
++      const std::vector<AASequence>& peptides,
++      const std::vector<float>& charges);
++
+   private:
+     ONNXPredictorBase model_;
+     size_t batch_size_;
+diff --git a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepInput.h b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepInput.h
+index 4676950..78d215a 100644
+--- a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepInput.h
++++ b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepInput.h
+@@ -14,6 +14,8 @@
+ #include <string>
+ #include <vector>
+ 
++namespace OpenMS { class AASequence; }
++
+ namespace OpenMS
+ {
+   namespace ML
+@@ -85,6 +87,29 @@ namespace OpenMS
+         const std::vector<float>& nces,
+         const std::vector<int64_t>& instrument_indices,
+         const PeptDeepInputConfig& config = PeptDeepInputConfig());
++
++      /// @name Modified-peptide variants (vendored patch P2)
++      /// Identical to the buildUnmodified* methods for aa_indices (computed from
++      /// each peptide's unmodified base sequence), but populate mod_x from the
++      /// AASequence's modifications via PeptDeepModX.h. An unmodified AASequence
++      /// yields a zero mod_x, so these are drop-in supersets of the string path.
++      //@{
++      static PeptDeepInputBatch buildModifiedPeptideBatch(
++        const std::vector<AASequence>& peptides,
++        const PeptDeepInputConfig& config = PeptDeepInputConfig());
++
++      static PeptDeepInputBatch buildModifiedChargedBatch(
++        const std::vector<AASequence>& peptides,
++        const std::vector<float>& charges,
++        const PeptDeepInputConfig& config = PeptDeepInputConfig());
++
++      static PeptDeepInputBatch buildModifiedInstrumentBatch(
++        const std::vector<AASequence>& peptides,
++        const std::vector<float>& charges,
++        const std::vector<float>& nces,
++        const std::vector<int64_t>& instrument_indices,
++        const PeptDeepInputConfig& config = PeptDeepInputConfig());
++      //@}
+     };
+   } // namespace ML
+ } // namespace OpenMS
+diff --git a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h
+index 2ecf30b..1becf81 100644
+--- a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h
++++ b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h
+@@ -14,6 +14,8 @@
+ #include <OpenMS/config.h>
+ #include <OpenMS/ML/ONNX/ONNXPredictorBase.h>
+ 
++namespace OpenMS { class AASequence; }
++
+ namespace OpenMS {
+ 
+ /// @brief Inference engine for PeptDeep MS2 Fragment Intensity prediction.
+@@ -46,6 +48,13 @@ public:
+         const std::vector<float>& nces,
+         const std::vector<int64_t>& instrument_indices);
+ 
++    /// (Possibly modified) peptides. Vendored patch P2: mod_x populated from mods.
++    std::vector<std::vector<float>> predictMS2(
++        const std::vector<AASequence>& peptides,
++        const std::vector<float>& charges,
++        const std::vector<float>& nces,
++        const std::vector<int64_t>& instrument_indices);
++
+ private:
+     ONNXPredictorBase model_;
+     size_t batch_size_;
+diff --git a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h
+index 30ec5c1..0c17afe 100644
+--- a/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h
++++ b/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h
+@@ -13,6 +13,8 @@
+ #include <string>
+ #include <vector>
+ 
++namespace OpenMS { class AASequence; }
++
+ namespace OpenMS
+ {
+     class OPENMS_DLLAPI PeptDeepRTInference
+@@ -37,8 +39,13 @@ namespace OpenMS
+          * @return A vector of predicted RT values corresponding to the input peptides
+          * @throws Exception::IllegalArgument if peptides is empty or contains an invalid/modified sequence.
+          */
++        /// Predict iRT for unmodified peptides (delegates to the AASequence overload).
+         std::vector<float> predictRT(const std::vector<std::string>& peptides);
+ 
++        /// Predict iRT for (possibly modified) peptides. Vendored patch P2: mod_x
++        /// is populated from each AASequence's modifications.
++        std::vector<float> predictRT(const std::vector<AASequence>& peptides);
++
+     private:
+         ONNXPredictorBase model_;
+         size_t batch_size_;
+diff --git a/src/openms/source/ML/PEPTDEEP/PeptDeepCCSInference.cpp b/src/openms/source/ML/PEPTDEEP/PeptDeepCCSInference.cpp
+index e44e122..a1868e8 100644
+--- a/src/openms/source/ML/PEPTDEEP/PeptDeepCCSInference.cpp
++++ b/src/openms/source/ML/PEPTDEEP/PeptDeepCCSInference.cpp
+@@ -7,6 +7,7 @@
+ // --------------------------------------------------------------------------
+ 
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepCCSInference.h>
++#include <OpenMS/CHEMISTRY/AASequence.h>
+ #include <OpenMS/CONCEPT/Exception.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepInput.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepUtils.h>
+@@ -28,7 +29,18 @@ namespace OpenMS
+   std::vector<float> PeptDeepCCSInference::predictCCS(
+     const std::vector<std::string>& peptides,
+     const std::vector<float>& charges)
+-  {
++  
++    {
++        std::vector<AASequence> seqs;
++        seqs.reserve(peptides.size());
++        for (const std::string& p : peptides) seqs.push_back(AASequence::fromString(p));
++        return predictCCS(seqs, charges);
++    }
++
++    std::vector<float> PeptDeepCCSInference::predictCCS(
++      const std::vector<AASequence>& peptides,
++      const std::vector<float>& charges)
++    {
+     if (peptides.empty())
+     {
+       throw Exception::IllegalArgument(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION, "Peptide batch cannot be empty.");
+@@ -87,19 +99,19 @@ namespace OpenMS
+       {
+         size_t current_chunk_size = std::min(batch_size_, group_indices.size() - chunk_start);
+ 
+-        std::vector<std::string> chunk_peptides;
++        std::vector<AASequence> chunk_seqs;
+         std::vector<float> chunk_charges;
+-        chunk_peptides.reserve(current_chunk_size);
++        chunk_seqs.reserve(current_chunk_size);
+         chunk_charges.reserve(current_chunk_size);
+ 
+         for (size_t j = 0; j < current_chunk_size; ++j)
+         {
+           size_t original_idx = group_indices[chunk_start + j];
+-          chunk_peptides.push_back(peptides[original_idx]);
++          chunk_seqs.push_back(peptides[original_idx]);
+           chunk_charges.push_back(charges[original_idx]);
+         }
+ 
+-        ML::PeptDeepInputBatch batch = ML::PeptDeepInputBuilder::buildUnmodifiedChargedBatch(chunk_peptides, chunk_charges, input_config);
++        ML::PeptDeepInputBatch batch = ML::PeptDeepInputBuilder::buildModifiedChargedBatch(chunk_seqs, chunk_charges, input_config);
+         const int64_t batch_size_cast = static_cast<int64_t>(batch.batch_size);
+         const int64_t sequence_length = static_cast<int64_t>(batch.sequence_length);
+ 
+diff --git a/src/openms/source/ML/PEPTDEEP/PeptDeepInput.cpp b/src/openms/source/ML/PEPTDEEP/PeptDeepInput.cpp
+index 364771b..d778c1e 100644
+--- a/src/openms/source/ML/PEPTDEEP/PeptDeepInput.cpp
++++ b/src/openms/source/ML/PEPTDEEP/PeptDeepInput.cpp
+@@ -8,6 +8,8 @@
+ 
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepInput.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepUtils.h>
++#include <OpenMS/ML/PEPTDEEP/PeptDeepModX.h>   // vendored patch P2: mod_x featurization
++#include <OpenMS/CHEMISTRY/AASequence.h>
+ #include <OpenMS/CONCEPT/Exception.h>
+ 
+ #include <algorithm>
+@@ -149,5 +151,73 @@ namespace OpenMS
+ 
+       return batch;
+     }
++
++    // --- Modified-peptide variants (vendored patch P2) ---------------------------
++    // aa_indices come from the unmodified base sequences (so the existing
++    // validation/padding logic is reused unchanged); mod_x is then filled from
++    // each AASequence's modifications by fillPeptideModX (bit-parity validated
++    // against AlphaPeptDeep in odia-modx-test).
++
++    PeptDeepInputBatch PeptDeepInputBuilder::buildModifiedPeptideBatch(
++      const std::vector<AASequence>& peptides,
++      const PeptDeepInputConfig& config)
++    {
++      if (peptides.empty())
++      {
++        throw Exception::IllegalArgument(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION, "Peptide batch cannot be empty.");
++      }
++      std::vector<std::string> base;
++      base.reserve(peptides.size());
++      for (const AASequence& seq : peptides) base.push_back(seq.toUnmodifiedString());
++
++      PeptDeepInputBatch batch = buildUnmodifiedPeptideBatch(base, config); // aa_indices + zero mod_x
++
++      const size_t E = static_cast<size_t>(PEPTDEEP_MOD_ELEMENTS);
++      for (size_t i = 0; i < peptides.size(); ++i)
++      {
++        float* slice = batch.mod_x.data() + i * batch.sequence_length * E;
++        fillPeptideModX(peptides[i], config.add_terminal_tokens, batch.sequence_length, slice);
++      }
++      return batch;
++    }
++
++    PeptDeepInputBatch PeptDeepInputBuilder::buildModifiedChargedBatch(
++      const std::vector<AASequence>& peptides,
++      const std::vector<float>& charges,
++      const PeptDeepInputConfig& config)
++    {
++      if (charges.size() != peptides.size())
++      {
++        throw Exception::IllegalArgument(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
++          "Peptide and charge input vectors must have the same size.");
++      }
++      PeptDeepInputBatch batch = buildModifiedPeptideBatch(peptides, config);
++      batch.charges.reserve(peptides.size());
++      for (float c : charges) batch.charges.push_back(c * CHARGE_SCALE);
++      return batch;
++    }
++
++    PeptDeepInputBatch PeptDeepInputBuilder::buildModifiedInstrumentBatch(
++      const std::vector<AASequence>& peptides,
++      const std::vector<float>& charges,
++      const std::vector<float>& nces,
++      const std::vector<int64_t>& instrument_indices,
++      const PeptDeepInputConfig& config)
++    {
++      if (charges.size() != peptides.size() || nces.size() != peptides.size() || instrument_indices.size() != peptides.size())
++      {
++        throw Exception::IllegalArgument(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
++          "Peptide, charge, NCE, and instrument input vectors must have the same size.");
++      }
++      PeptDeepInputBatch batch = buildModifiedChargedBatch(peptides, charges, config);
++      batch.nces.reserve(peptides.size());
++      batch.instrument_indices.reserve(peptides.size());
++      for (size_t i = 0; i < peptides.size(); ++i)
++      {
++        batch.nces.push_back(nces[i] * NCE_SCALE);
++        batch.instrument_indices.push_back(instrument_indices[i]);
++      }
++      return batch;
++    }
+   } // namespace ML
+ } // namespace OpenMS
+diff --git a/src/openms/source/ML/PEPTDEEP/PeptDeepMS2Inference.cpp b/src/openms/source/ML/PEPTDEEP/PeptDeepMS2Inference.cpp
+index eb50613..f2a08fe 100644
+--- a/src/openms/source/ML/PEPTDEEP/PeptDeepMS2Inference.cpp
++++ b/src/openms/source/ML/PEPTDEEP/PeptDeepMS2Inference.cpp
+@@ -7,6 +7,7 @@
+ // --------------------------------------------------------------------------
+ 
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepMS2Inference.h>
++#include <OpenMS/CHEMISTRY/AASequence.h>
+ #include <OpenMS/CONCEPT/Exception.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepInput.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepUtils.h>
+@@ -29,6 +30,18 @@ std::vector<std::vector<float>> PeptDeepMS2Inference::predictMS2(
+     const std::vector<float>& charges,
+     const std::vector<float>& nces,
+     const std::vector<int64_t>& instrument_indices)
++{
++    std::vector<AASequence> seqs;
++    seqs.reserve(peptides.size());
++    for (const std::string& p : peptides) seqs.push_back(AASequence::fromString(p));
++    return predictMS2(seqs, charges, nces, instrument_indices);
++}
++
++std::vector<std::vector<float>> PeptDeepMS2Inference::predictMS2(
++    const std::vector<AASequence>& peptides,
++    const std::vector<float>& charges,
++    const std::vector<float>& nces,
++    const std::vector<int64_t>& instrument_indices)
+ {
+     if (peptides.empty()) {
+         throw Exception::IllegalArgument(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION, "Peptide batch cannot be empty.");
+@@ -82,25 +95,25 @@ std::vector<std::vector<float>> PeptDeepMS2Inference::predictMS2(
+         {
+             size_t current_chunk_size = std::min(batch_size_, group_indices.size() - chunk_start);
+ 
+-            std::vector<std::string> chunk_peptides;
++            std::vector<AASequence> chunk_seqs;
+             std::vector<float> chunk_charges, chunk_nces;
+             std::vector<int64_t> chunk_instruments;
+ 
+-            chunk_peptides.reserve(current_chunk_size);
++            chunk_seqs.reserve(current_chunk_size);
+             chunk_charges.reserve(current_chunk_size);
+             chunk_nces.reserve(current_chunk_size);
+             chunk_instruments.reserve(current_chunk_size);
+ 
+             for (size_t j = 0; j < current_chunk_size; ++j) {
+                 size_t original_idx = group_indices[chunk_start + j];
+-                chunk_peptides.push_back(peptides[original_idx]);
++                chunk_seqs.push_back(peptides[original_idx]);
+                 chunk_charges.push_back(charges[original_idx]);
+                 chunk_nces.push_back(nces[original_idx]);
+                 chunk_instruments.push_back(instrument_indices[original_idx]);
+             }
+ 
+-            ML::PeptDeepInputBatch batch = ML::PeptDeepInputBuilder::buildUnmodifiedInstrumentBatch(
+-                chunk_peptides, chunk_charges, chunk_nces, chunk_instruments, input_config);
++            ML::PeptDeepInputBatch batch = ML::PeptDeepInputBuilder::buildModifiedInstrumentBatch(
++                chunk_seqs, chunk_charges, chunk_nces, chunk_instruments, input_config);
+ 
+             const int64_t batch_size_cast = static_cast<int64_t>(batch.batch_size);
+             const int64_t sequence_length = static_cast<int64_t>(batch.sequence_length);
+@@ -154,7 +167,7 @@ std::vector<std::vector<float>> PeptDeepMS2Inference::predictMS2(
+             int64_t elements_per_batch = actual_rows * num_ions;
+ 
+             for (size_t j = 0; j < current_chunk_size; ++j) {
+-                const std::string& current_peptide = chunk_peptides[j];
++                const AASequence& current_peptide = chunk_seqs[j];
+                 int64_t valid_fragments = current_peptide.size() - 1;
+                 int64_t start_row = (actual_rows > valid_fragments) ? (actual_rows - valid_fragments) / 2 : 0;
+ 
+diff --git a/src/openms/source/ML/PEPTDEEP/PeptDeepRTInference.cpp b/src/openms/source/ML/PEPTDEEP/PeptDeepRTInference.cpp
+index c2d15ce..44b023b 100644
+--- a/src/openms/source/ML/PEPTDEEP/PeptDeepRTInference.cpp
++++ b/src/openms/source/ML/PEPTDEEP/PeptDeepRTInference.cpp
+@@ -7,6 +7,7 @@
+ // --------------------------------------------------------------------------
+ 
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepRTInference.h>
++#include <OpenMS/CHEMISTRY/AASequence.h>
+ #include <OpenMS/CONCEPT/Exception.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepInput.h>
+ #include <OpenMS/ML/PEPTDEEP/PeptDeepUtils.h>
+@@ -25,6 +26,14 @@ namespace OpenMS
+     PeptDeepRTInference::~PeptDeepRTInference() = default;
+ 
+     std::vector<float> PeptDeepRTInference::predictRT(const std::vector<std::string>& peptides)
++    {
++        std::vector<AASequence> seqs;
++        seqs.reserve(peptides.size());
++        for (const std::string& p : peptides) seqs.push_back(AASequence::fromString(p));
++        return predictRT(seqs);
++    }
++
++    std::vector<float> PeptDeepRTInference::predictRT(const std::vector<AASequence>& peptides)
+     {
+         if (peptides.empty())
+         {
+@@ -84,14 +93,14 @@ namespace OpenMS
+             {
+                 size_t current_chunk_size = std::min(batch_size_, group_indices.size() - chunk_start);
+ 
+-                std::vector<std::string> chunk_peptides;
+-                chunk_peptides.reserve(current_chunk_size);
++                std::vector<AASequence> chunk_seqs;
++                chunk_seqs.reserve(current_chunk_size);
+                 for (size_t j = 0; j < current_chunk_size; ++j)
+                 {
+-                    chunk_peptides.push_back(peptides[group_indices[chunk_start + j]]);
++                    chunk_seqs.push_back(peptides[group_indices[chunk_start + j]]);
+                 }
+ 
+-                ML::PeptDeepInputBatch batch = ML::PeptDeepInputBuilder::buildUnmodifiedPeptideBatch(chunk_peptides, input_config);
++                ML::PeptDeepInputBatch batch = ML::PeptDeepInputBuilder::buildModifiedPeptideBatch(chunk_seqs, input_config);
+                 const int64_t batch_size_cast = static_cast<int64_t>(batch.batch_size);
+                 const int64_t sequence_length = static_cast<int64_t>(batch.sequence_length);
+ 
