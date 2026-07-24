@@ -50,6 +50,12 @@ add_executable(odia-score-test src/odia_score_test.cpp)
 add_executable(OpenDIALibGen src/opendialibgen.cpp)
 target_link_libraries(OpenDIALibGen PRIVATE OpenMS)
 
+# P2 mod_x featurization validation. Links libOpenMS for AASequence/EmpiricalFormula;
+# the featurization itself is a header-only vendored patch (PeptDeepModX.h), so
+# this needs no OpenMS rebuild. Validated against AlphaPeptDeep's reference fixture.
+add_executable(odia-modx-test src/odia_modx_test.cpp)
+target_link_libraries(odia-modx-test PRIVATE OpenMS)
+
 set(OPENDIALIBGEN_MODEL_DIR "${OpenMS_DIR}/../../../share/OpenMS/models"
     CACHE PATH "Directory containing peptdeep_*_dynamic.onnx (used by the OpenDIALibGen selftest)")
 
@@ -59,3 +65,4 @@ add_test(NAME odia-index-selftest COMMAND odia-index --selftest)
 add_test(NAME odia-score-oracle COMMAND odia-score-test)
 add_test(NAME OpenDIALibGen-selftest
          COMMAND OpenDIALibGen --selftest -model_dir "${OPENDIALIBGEN_MODEL_DIR}")
+add_test(NAME odia-modx-p2 COMMAND odia-modx-test)
