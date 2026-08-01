@@ -184,3 +184,85 @@ churn.
 Everything that tried to add parallelism or capacity to existing work regressed or gained nothing:
 20 ppm screening, `MALLOC_ARENA_MAX`, `cacheWorkingInMemory`, three parallel-reader attempts, and
 `reserve()` (predicted 24 GB, measured 0).
+
+---
+
+## 2026-08-01: determinism, the un-phased 27%, and what the allocator is not
+
+### The ID "noise floor" was a bug, not noise
+
+Three runs on byte-identical input: **6487 / 6565 / 6433**. This had been treated as a +/-1% noise
+floor and used to size A/B tests. It was neither classifier -- GBT does no subsampling and LDA is
+seeded. A precursor group's index is its FIRST-OCCURRENCE POSITION in row order, and row order is
+whatever the parallel extraction produced, so a seeded shuffle of *indices* still assigned the same
+precursor to a different fold on every run.
+
+Fixed by sorting the group lists by precursor id before the shuffle (`odia_lda.h`). Fold sizes stay
+exactly balanced. `odia_lda_test` now permutes the rows and requires identical per-row d-scores:
+**8.290e-01** max delta without the fix, **1.954e-14** with it.
+
+Consequence: every A/B measured before this was compared against a band that was partly
+self-inflicted, and several "no effect" verdicts sit inside it.
+
+### 27% of the run was outside every phase
+
+| | wall | CPU-s |
+|---|---:|---:|
+| sum of all phases | 1449 s | 43857 |
+| actual run | 1987 s | 60409 |
+| **un-phased** | **537 s (27%)** | **16552 (27%)** |
+
+The global RSS peak lands in that gap. MemProbe sampled the phase stack at 5 Hz and discarded it; it
+now charges un-phased wall time to the phase it follows, so gaps have names.
+
+One occupant found: the `mem/component` walk ran unguarded on every run -- serial, a `vector<string>`
+per subordinate and a keyed lookup per meta value across 2.07M features and 113.9M meta values,
+~150M allocations against a fragmented 180 GB heap. Timed live at **>=41 s** (joined mid-walk, so a
+lower bound). Now behind `-mem_components`, default off.
+
+### The instrumentation that measured nothing
+
+Extraction-region instrumentation was "published and verified" three times and benchmarked for ~75
+minutes while `strings(libOpenMS.so)` contained none of it, on the run node and on Ceph. The publish
+target builds ODIA only, so an edit under `src/OpenMS` is compiled by nothing and the stale `.so`
+ships as if fresh. `VERIFY_SYMBOL` passed throughout because the symbol given to it already existed.
+
+A missing log line reads exactly like a region that cost nothing. `build_and_publish.sh` now refuses
+when OpenMS sources are newer than the installed library, and names the file. The OpenMS-side
+instrumentation was reverted: it cannot deploy under a deliberately read-only install, and the
+question is answerable ODIA-side.
+
+### Allocator contention is NOT what caps extraction
+
+`LD_PRELOAD` tcmalloc, byte-identical run otherwise:
+
+| phase | glibc | tcmalloc |
+|---|---:|---:|
+| `library_load` | 106.5 s | 86.5 s |
+| `dia_run_load` | 130.6 s | 106.1 s |
+| `prefilter` | 240.6 s | 173.5 s |
+| `extract_pass1_wide` | 570.8 s / **41.9 cores** | 922.3 s / **40.8 cores** |
+| `extract_pass2_narrow` | 266.5 s | 482.4 s |
+| RSS after extraction | 186.01 GB | **80.15 GB** |
+
+Extraction occupancy is **unchanged** (41.9 vs 40.8), so malloc is not the limiter. (A 30 s
+steady-state sample showed 123/224 and was not representative; the phase average supersedes it.)
+`MALLOC_ARENA_MAX=4` being >2x slower was a real effect read as evidence for the wrong cause.
+
+tcmalloc's actual effect is memory: less than half the RSS through extraction, at ~68% more
+extraction wall time. Candidate as a documented option for memory-constrained nodes, not a default.
+
+### The live candidate: batch granularity
+
+Per-batch compound counts from the extraction log, 224 threads:
+
+| batches | min | p50 | p90 | max | mean | max/mean |
+|---:|---:|---:|---:|---:|---:|---:|
+| 324 | 130 | 1416 | 10730 | 13418 | 3398 | **3.95x** |
+
+324 units for 224 threads, and the largest is ~2.7x a perfectly-balanced share -- the makespan is
+capped before anything else applies. `calculateInnerBatchSize` sizes batches as 5% of available RAM
+/ 2 KB per compound, clamped to [2000, 10000], and **never consults the thread count**, so a bigger
+machine gets coarser work units. On a 2.2 TB node it pins at the 10000 ceiling.
+
+`-innerBatchSize` is already an ODIA option, so this is testable with no code change.
