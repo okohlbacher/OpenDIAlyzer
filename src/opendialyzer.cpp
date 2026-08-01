@@ -1324,8 +1324,9 @@ protected:
     // columns were never shown to hurt; they were blamed for a deficit another bug caused.
     //
     // MEASURED 2026-08-01, controlled A/B on the Astral benchmark, both arms on one node:
-    //     MS2 scope   (24 features)  6,437 IDs
-    //     MS1+MS2     (36 features)  6,506 IDs      +69, against a noise floor of +/-83
+    //     MS2 scope   (24 features)  6,506 IDs   5,699 peptides   583 proteins
+    //     MS1+MS2     (36 features)  6,574 IDs   5,709 peptides   628 proteins
+    //   +68 precursors against a measured noise floor of +/-83
     // i.e. NO MEASURABLE EFFECT. The MS1 sub-scores neither help nor hurt. Default stays 'false'
     // because 12 more features cost compute for nothing -- which is the right conclusion for a
     // reason the original comment got wrong.

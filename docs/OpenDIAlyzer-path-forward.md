@@ -142,8 +142,8 @@ Not to be attempted before Phase 0.3 exists: any before/after on a shared node m
 
 | # | change | IDs | verdict |
 |---|---|---:|---|
-| — | baseline (loader fix only) | 6,437 | control |
-| **1.2** | `-ms1_scores` (24 -> 36 features) | **6,506** | **+69: inside the noise. No effect.** |
+| — | baseline (loader fix only, MS2 scope) | 6,506 | control |
+| **1.2** | `-ms1_scores` (24 -> 36 features) | **6,574** | **+68: inside the noise. No effect.** |
 | 1.1 | mass-cal RT direction fixed, window applied | 6,468 | -154 vs 6,622: outside noise, a LOSS |
 | — | 20 ppm prefilter screen | 6,195 | -327: measured dead |
 
@@ -154,8 +154,13 @@ The exclusion of the 12 MS1 sub-scores was justified in code by: *"sqlite (29 su
 features"*, concluding they were sparse noise the fit wasted capacity on.
 
 That 4,913 was the `library_rt`-defective path. With that fixed the same path reaches 6,522 **with no
-MS1 scores at all**, and a controlled A/B now shows the MS1 features are worth **+69 IDs against a
-+/-83 noise floor** -- i.e. nothing. They never caused the deficit and they do not fix it.
+MS1 scores at all**, and a controlled A/B now shows the MS1 features are worth **+68 IDs against a
++/-83 noise floor** -- i.e. nothing.
+
+(Correction: these were first reported as 6,437 vs 6,506. That compared the baseline's PASS-1
+number against the treatment's final -- a two-pass run emits one `in-process LDA FDR` line per
+pass. The corrected pair is 6,506 vs 6,574. The conclusion is unchanged, but it was reached by
+comparing the wrong two numbers.) They never caused the deficit and they do not fix it.
 
 Default stays `false`: 12 more features cost compute for no return. Right conclusion, wrong reason,
 now corrected in the source comment.
