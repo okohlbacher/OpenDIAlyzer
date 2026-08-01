@@ -3387,6 +3387,76 @@ protected:
   }
 
 
+
+  /// Materialise a LightTargetedExperiment from the compact library, using SHORT synthetic ids.
+  ///
+  /// This is the point of the whole exercise. LightTransition owns two std::strings and
+  /// LightCompound four; the library's real ids ("DECOY_PEPTIDEK_2_y7_1") exceed libstdc++'s
+  /// 15-character SSO buffer, so 78.6M transitions cost ~471M heap allocations and leave the arena
+  /// fragmented -- measured at 83-88% of a 186 GB peak. Synthetic ids
+  /// ("p1z141z3" / "DECOY_p1z141z3", base-36, <=14 chars) stay INSIDE the SSO buffer, so the
+  /// materialised experiment allocates nothing per row.
+  ///
+  /// The "DECOY_" prefix is preserved deliberately: prefilterLibrary_ pairs decoys to targets by
+  /// exactly that convention, so the pairing logic needs no change. The real ids live on in the
+  /// compact library and are restored for output.
+  void materializeFromCompact_(const odia::CompactLibrary& clib,
+                               OpenSwath::LightTargetedExperiment& exp) const
+  {
+    using CL = odia::CompactLibrary;
+    exp.compounds.reserve(clib.peptideCount());
+    exp.transitions.reserve(clib.transitionCount());
+
+    std::unordered_map<std::string, std::size_t> prot_seen;
+    for (std::size_t i = 0; i < clib.peptideCount(); ++i)
+    {
+      const auto p = CL::Peptide(std::uint32_t(i));
+      OpenSwath::LightCompound c;
+      c.id = CL::syntheticId(std::uint32_t(i), clib.isDecoy(p));      // SSO: no allocation
+      c.sequence = std::string(clib.sequence(p));                     // real sequence: scoring needs it
+      c.charge = clib.charge(p);
+      c.rt = clib.rt(p);
+      c.drift_time = clib.driftTime(p);
+      const auto parent = clib.parent(p);
+      if (parent != CL::no_protein)
+      {
+        std::string acc(clib.accession(parent));
+        if (!acc.empty()) { c.protein_refs.push_back(std::move(acc)); }
+      }
+      exp.compounds.push_back(std::move(c));
+    }
+    for (std::size_t i = 0; i < clib.transitionCount(); ++i)
+    {
+      const auto t = CL::Transition(std::uint32_t(i));
+      const auto pep = clib.peptideOf(t);
+      const std::uint32_t pi = static_cast<std::uint32_t>(pep);
+      const std::uint8_t fl = clib.transitionFlags(t);
+      OpenSwath::LightTransition tr;
+      // "t" + base-36 index: <= 8 chars, always SSO.
+      tr.transition_name = "t" + CL::syntheticId(std::uint32_t(i), false).substr(1);
+      tr.peptide_ref = CL::syntheticId(pi, clib.isDecoy(pep));
+      tr.precursor_mz = clib.precursorMz(pep);
+      tr.product_mz = clib.productMz(t);
+      tr.library_intensity = clib.intensity(t);
+      tr.precursor_im = clib.driftTime(pep);
+      tr.fragment_charge = clib.fragmentCharge(t);
+      tr.setDecoy((fl & CL::Decoy) != 0);
+      tr.setDetectingTransition((fl & CL::Detecting) != 0);
+      tr.setIdentifyingTransition((fl & CL::Identifying) != 0);
+      tr.setQuantifyingTransition((fl & CL::Quantifying) != 0);
+      const auto ann = clib.annotation(t);
+      if (!ann.empty()) { tr.setFragmentType(std::string(ann)); }
+      exp.transitions.push_back(std::move(tr));
+    }
+    // Proteins: one entry per distinct accession actually referenced.
+    for (std::size_t i = 0; i < clib.proteinCount(); ++i)
+    {
+      OpenSwath::LightProtein pr;
+      pr.id = std::string(clib.accession(CL::Protein(std::uint32_t(i))));
+      exp.proteins.push_back(std::move(pr));
+    }
+  }
+
   /// Load the library into CompactLibrary and report what it costs. A PROBE, not the production
   /// path: it exists so the compact representation can be compared against the measured 38.79 GB
   /// of the LightTargetedExperiment path on the same file and the same machine, before anything is
@@ -3422,9 +3492,15 @@ protected:
           if (bar2 != std::string::npos) { prot_by_acc[e.identifier.substr(bar1 + 1, bar2 - bar1 - 1)] = h; }
         }
       }
+      // INDEX THE PROTEOME ONCE, before any peptide is added. Every peptide is then looked up in
+      // the whole FASTA rather than in whichever protein its accession names -- accessions go
+      // missing, get renamed or versioned, and peptides are shared between proteins, and in each
+      // of those cases an accession-keyed lookup stores characters for a sequence that is right
+      // there in the file.
+      clib.indexProteins();
       OPENMS_LOG_INFO << "OpenDIAlyzer[compact] FASTA: " << entries.size() << " proteins, "
-                      << std::fixed << std::setprecision(2) << chars / 1048576.0 << " MB of sequence"
-                      << std::endl;
+                      << std::fixed << std::setprecision(2) << chars / 1048576.0
+                      << " MB of sequence, k-mer indexed" << std::endl;
     }
 
     std::unique_ptr<File::TempDir> temp_dir;
@@ -3479,17 +3555,39 @@ protected:
         parents[r] = parent;
         charges[r] = int(ParquetFile::getInt64(ch_c, r, 0, true));
         ids[r] = ParquetFile::getInt64(id_c, r, 0, false);
-        const auto sp = clib.locateOrNull(parent, seq);
+        const auto sp = clib.locateOrNull(seq);        // proteome-wide, not accession-keyed
         if (sp.valid()) { spans[r] = sp; } else { misses[r] = seq; }
       }
       // PASS 2, SERIAL and only for the misses -- on this library that is the decoys, which are
       // shuffled and occur in no protein.
+      // Serial pass for the misses -- interning MUTATES the store. Decoys are folded INTO the
+      // index in batches as they are stored, so a decoy that shares a subsequence with one already
+      // seen resolves to a span instead of paying for its own characters. Batched because each
+      // indexInterned() sorts the new tail and merges: per-peptide would be quadratic.
+      constexpr long long kIndexEvery = 200000;
+      long long since_index = 0, late_hits = 0;
       for (long long r = 0; r < n; ++r)
       {
-        if (!spans[r].valid()) { spans[r] = clib.internPeptideSequence(misses[r]); }
-        clib.setPeptide(std::size_t(r), parents[r], spans[r], charges[r], misses[r].empty());
+        bool derived = misses[r].empty();
+        if (!derived)
+        {
+          // Retry against everything indexed since this peptide was first looked up.
+          const auto retry = clib.locateOrNull(misses[r]);
+          if (retry.valid()) { spans[r] = retry; derived = true; ++late_hits; }
+          else
+          {
+            spans[r] = clib.internPeptideSequence(misses[r]);
+            if (++since_index >= kIndexEvery) { clib.indexInterned(); since_index = 0; }
+          }
+        }
+        clib.setPeptide(std::size_t(r), parents[r], spans[r], charges[r], derived);
         pep_by_id[ids[r]] = odia::CompactLibrary::Peptide(std::uint32_t(r));
       }
+      clib.indexInterned();
+      OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << late_hits
+                      << " peptides resolved against previously-interned sequences (decoys included "
+                      << "in the index); index " << std::fixed << std::setprecision(2)
+                      << clib.indexBytes() / 1073741824.0 << " GB" << std::endl;
     }
     {
       PhaseTimer pt("compact_probe/transitions");

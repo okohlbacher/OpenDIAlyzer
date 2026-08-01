@@ -32,6 +32,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <limits>
 
 namespace odia
 {
@@ -63,18 +64,41 @@ public:
     return Protein(std::uint32_t(proteins_.size() - 1));
   }
 
-  /// Add a peptide belonging to `parent`. Whether it ends up as a substring reference or as its own
-  /// stored sequence is decided here and never surfaces to the caller.
+  /// Call once after all proteins are added and before any peptide. Indexes every position of
+  /// every protein sequence so a peptide can be located in the PROTEOME rather than in whichever
+  /// protein its accession happens to name.
+  void indexProteins(std::size_t k = 5) { store_.buildIndex(k); }
+
+  /// Fold everything interned since the last index call INTO the index -- decoys above all.
+  ///
+  /// Decoys are shuffled, so none is a substring of a protein and each is interned on first sight.
+  /// But they are not unrelated to each other: OpenSWATH shuffles within a peptide, so decoys of
+  /// homologous or repeated targets share subsequences, and a decoy seen once can host later ones.
+  /// Leaving them out of the index guarantees every one of the ~3.5M pays for its own characters.
+  ///
+  /// Call periodically during a read, not per peptide: each call sorts the new tail and merges it,
+  /// so the cost amortises over a batch instead of being paid per insertion.
+  void indexInterned() { store_.indexAppended(); }
+
+  std::size_t indexBytes() const { return store_.indexBytes(); }
+
+  /// Add a peptide. Resolution order, and the order matters:
+  ///   1. look the sequence up in the indexed proteome -- if it occurs anywhere, it costs
+  ///      (protein, offset, length) and NO characters;
+  ///   2. only if it occurs nowhere, intern it in the hashed unique-string set.
+  ///
+  /// Searching the proteome rather than the accession's protein is the point. An accession can be
+  /// absent, renamed, versioned differently, or the peptide can be shared between proteins -- in
+  /// every one of those cases an accession-keyed lookup fails and stores characters for a sequence
+  /// that is right there in the FASTA. `parent` is retained for protein rollup, not for lookup.
   Peptide addPeptide(Protein parent, std::string_view sequence, int charge = 0)
   {
     PeptideRec r;
     r.parent = parent;
     r.charge = std::int16_t(charge);
-    const SequenceStore::Id parent_seq =
-      (parent == no_protein) ? SequenceStore::npos : proteins_[idx(parent)].sequence;
-    bool derived = false;
-    r.span = store_.spanOfOrIntern(parent_seq, sequence, &derived);
-    derived_ += derived ? 1 : 0;
+    r.span = store_.findAnywhere(sequence);              // 1. the proteome
+    if (r.span.valid()) { ++derived_; }
+    else { r.span = store_.internAsSpan(sequence); }     // 2. hashed unique set, deduplicated
     peptides_.push_back(r);
     return Peptide(std::uint32_t(peptides_.size() - 1));
   }
@@ -139,15 +163,9 @@ public:
     if (derived) { ++derived_; }
   }
 
-  /// Substring lookup only -- no mutation, safe to call from many threads at once.
-  /// Returns an invalid span when the sequence does not occur in the protein.
-  SequenceStore::Span locateOrNull(Protein parent, std::string_view seq) const
-  {
-    if (parent == no_protein) { return {}; }
-    const auto pseq = proteins_[idx(parent)].sequence;
-    if (pseq == SequenceStore::npos) { return {}; }
-    return store_.locate(pseq, seq);
-  }
+  /// Proteome-wide lookup, read-only and therefore safe from many threads at once. Returns an
+  /// invalid span when the sequence occurs in no protein -- which the caller then interns.
+  SequenceStore::Span locateOrNull(std::string_view seq) const { return store_.findAnywhere(seq); }
 
   /// Mutating: store a sequence that is not a substring. Call from ONE thread (or serially after
   /// a parallel locate pass has identified the misses).
@@ -194,6 +212,62 @@ public:
   std::size_t peptideCount() const { return peptides_.size(); }
   std::size_t transitionCount() const { return transitions_.size(); }
 
+
+
+  // ---- fields the materialised LightTargetedExperiment needs --------------------------------
+  void setPrecursor(Peptide p, double mz, double rt, double drift)
+  {
+    auto& r = peptides_[idx(p)];
+    r.precursor_mz = mz;
+    r.rt = float(rt);
+    r.drift_time = float(drift);
+  }
+  double precursorMz(Peptide p) const { return peptides_[idx(p)].precursor_mz; }
+  double rt(Peptide p) const { return peptides_[idx(p)].rt; }
+  double driftTime(Peptide p) const { return peptides_[idx(p)].drift_time; }
+
+  enum Flag : std::uint8_t { Decoy = 1, Detecting = 2, Identifying = 4, Quantifying = 8 };
+  void setTransitionFlags(std::size_t i, std::int8_t frag_charge, std::uint8_t flags)
+  {
+    transitions_[i].fragment_charge = frag_charge;
+    transitions_[i].flags = flags;
+  }
+  std::int8_t fragmentCharge(Transition t) const { return transitions_[idx(t)].fragment_charge; }
+  std::uint8_t transitionFlags(Transition t) const { return transitions_[idx(t)].flags; }
+
+  // ---- original identifiers -----------------------------------------------------------------
+  // The library's own ids ("DECOY_PEPTIDEK_2") are 16+ characters and therefore heap-allocated:
+  // 78.6M of them is where the fragmentation comes from. Materialising a LightTargetedExperiment
+  // with SHORT synthetic ids keeps every string inside libstdc++'s 15-char SSO buffer, so the
+  // materialised library allocates nothing per row -- but the original id must survive for output
+  // and for anything that pairs on it. It is stored here, once, interned.
+  void setOriginalId(Peptide p, std::string_view id) { peptides_[idx(p)].original_id = store_.intern(id); }
+  std::string_view originalId(Peptide p) const
+  {
+    const auto id = peptides_[idx(p)].original_id;
+    return id == SequenceStore::npos ? std::string_view{} : store_.view(id);
+  }
+  void setDecoy(Peptide p, bool d) { peptides_[idx(p)].decoy = d; }
+  bool isDecoy(Peptide p) const { return peptides_[idx(p)].decoy; }
+
+  /// Synthetic id for the materialised view: "p<n>" for targets, "DECOY_p<n>" for decoys.
+  /// Both stay within the SSO buffer (max "DECOY_p4294967295" is 17 -- so the index is emitted in
+  /// base-36, bounding it at "DECOY_p1z141z3" = 14 characters for any uint32).
+  static std::string syntheticId(std::uint32_t index, bool decoy)
+  {
+    static const char* D = "0123456789abcdefghijklmnopqrstuvwxyz";
+    char buf[8];
+    int n = 0;
+    std::uint32_t v = index;
+    do { buf[n++] = D[v % 36]; v /= 36; } while (v && n < 7);
+    std::string out;
+    out.reserve(15);
+    if (decoy) { out += "DECOY_"; }
+    out += 'p';
+    while (n) { out += buf[--n]; }
+    return out;                                  // <= 6+1+7 = 14 chars: always SSO
+  }
+
   // ---- measurement ------------------------------------------------------------------------
   struct Stats
   {
@@ -232,8 +306,28 @@ public:
 
 private:
   struct ProteinRec { SequenceStore::Id accession, sequence; };
-  struct PeptideRec { SequenceStore::Span span; Protein parent; std::int16_t charge; };
-  struct TransitionRec { double product_mz; float intensity; Peptide peptide; SequenceStore::Id annotation; };
+  // 48 B. Everything a LightCompound needs EXCEPT the strings, which are a span and two handles.
+  struct PeptideRec
+  {
+    SequenceStore::Span span;                              // sequence, as a slice of its protein
+    double precursor_mz = 0.0;
+    float rt = std::numeric_limits<float>::quiet_NaN();    // library RT
+    float drift_time = -1.0f;
+    Protein parent = no_protein;
+    SequenceStore::Id original_id = SequenceStore::npos;
+    std::int16_t charge = 0;
+    bool decoy = false;
+  };
+  // 24 B. The flags are the four booleans LightTransition carries.
+  struct TransitionRec
+  {
+    double product_mz = 0.0;
+    float intensity = 0.0f;
+    Peptide peptide = Peptide(0);
+    SequenceStore::Id annotation = SequenceStore::npos;
+    std::int8_t fragment_charge = 0;
+    std::uint8_t flags = 0;      // bit0 decoy, bit1 detecting, bit2 identifying, bit3 quantifying
+  };
 
   static std::size_t idx(Protein p) { return std::size_t(static_cast<std::uint32_t>(p)); }
   static std::size_t idx(Peptide p) { return std::size_t(static_cast<std::uint32_t>(p)); }

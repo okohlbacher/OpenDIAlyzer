@@ -39,6 +39,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <algorithm>
 #include <unordered_map>
 #include <vector>
 
@@ -159,6 +160,102 @@ public:
     return Span{seq, std::uint32_t(at), std::uint32_t(needle.size())};
   }
 
+
+  /// Index every k-mer position of every stored sequence, so a peptide can be located anywhere in
+  /// the stored set without knowing which sequence it came from.
+  ///
+  /// STRUCTURE, and why not a hash map. The first version used
+  /// `unordered_multimap<uint64_t, Pos>`, which makes ONE NODE ALLOCATION PER RESIDUE -- ~11.4M for
+  /// the human proteome -- and turns every probe into a pointer chase. That is the exact pathology
+  /// this class exists to remove, reproduced inside it. This is a single sorted vector: one
+  /// allocation, binary search, and the candidates for a key land in contiguous memory.
+  ///
+  /// k = 5 is below the length of essentially every tryptic peptide, so the short-needle fallback
+  /// is a safety net rather than a code path. With 20 residues that is 3.2M possible keys over
+  /// ~11.4M positions, about 3-4 candidates per probe, each rejected or confirmed by one memcmp.
+  ///
+  /// Call it again after adding more sequences (e.g. interned decoys) -- it rebuilds from scratch,
+  /// and `indexAppended()` below extends it incrementally instead.
+  void buildIndex(std::size_t k = 5)
+  {
+    k_ = k;
+    kmers_.clear();
+    indexed_upto_ = 0;
+    indexAppended();
+  }
+
+  /// Index sequences added since the last call. Lets decoys -- which are only discovered as the
+  /// library is read -- become searchable without rebuilding the whole index.
+  void indexAppended()
+  {
+    if (k_ == 0) { k_ = 5; }
+    std::size_t add = 0;
+    for (Id id = Id(indexed_upto_); id < Id(entries_.size()); ++id)
+    {
+      const std::size_t n = entries_[id].length;
+      add += n >= k_ ? n - k_ + 1 : 0;
+    }
+    if (add == 0 && indexed_upto_ == entries_.size()) { return; }
+    kmers_.reserve(kmers_.size() + add);
+    const std::size_t first_new = kmers_.size();
+    for (Id id = Id(indexed_upto_); id < Id(entries_.size()); ++id)
+    {
+      const std::string_view sv = view(id);
+      if (sv.size() < k_) { continue; }
+      for (std::size_t off = 0; off + k_ <= sv.size(); ++off)
+      {
+        kmers_.push_back(KMer{kmerHash_(sv.substr(off, k_)), id, std::uint32_t(off)});
+      }
+    }
+    // Sort only the new tail, then merge -- rebuilding from scratch on every incremental call
+    // would be quadratic across a library read.
+    std::sort(kmers_.begin() + std::ptrdiff_t(first_new), kmers_.end(),
+              [](const KMer& a, const KMer& b) { return a.key < b.key; });
+    if (first_new > 0)
+    {
+      std::inplace_merge(kmers_.begin(), kmers_.begin() + std::ptrdiff_t(first_new), kmers_.end(),
+                         [](const KMer& a, const KMer& b) { return a.key < b.key; });
+    }
+    indexed_upto_ = entries_.size();
+  }
+
+  bool indexed() const { return !kmers_.empty(); }
+  std::size_t indexBytes() const { return kmers_.capacity() * sizeof(KMer); }
+
+  /// Find `needle` anywhere in the indexed sequences, or an invalid span.
+  /// Candidates are verified by full comparison, so a hash collision costs a failed memcmp and
+  /// never a wrong answer.
+  Span findAnywhere(std::string_view needle) const
+  {
+    if (needle.empty() || kmers_.empty()) { return {}; }
+    if (needle.size() < k_)
+    {
+      // Safety net only: with k=5 this is essentially unreachable for tryptic peptides. Returning
+      // "not found" here instead would be a SILENT false negative -- measured, an earlier k=8 sent
+      // 127,853 real peptides to standalone storage purely for being short.
+      for (Id id = 0; id < Id(entries_.size()); ++id)
+      {
+        const std::string_view hay = view(id);
+        const std::size_t at = hay.find(needle);
+        if (at != std::string_view::npos) { return Span{id, std::uint32_t(at), std::uint32_t(needle.size())}; }
+      }
+      return {};
+    }
+    const std::uint64_t key = kmerHash_(needle.substr(0, k_));
+    auto lo = std::lower_bound(kmers_.begin(), kmers_.end(), key,
+                               [](const KMer& a, std::uint64_t v) { return a.key < v; });
+    for (; lo != kmers_.end() && lo->key == key; ++lo)
+    {
+      const std::string_view hay = view(lo->seq);
+      if (std::size_t(lo->offset) + needle.size() > hay.size()) { continue; }
+      if (hay.compare(lo->offset, needle.size(), needle) == 0)
+      {
+        return Span{lo->seq, lo->offset, std::uint32_t(needle.size())};
+      }
+    }
+    return {};
+  }
+
   /// Store `s` in its own right and return a span covering it. For sequences that are not a
   /// substring of anything already stored.
   Span internAsSpan(std::string_view s)
@@ -210,6 +307,14 @@ public:
   bool frozen() const { return index_.empty() && !entries_.empty(); }
 
 private:
+  struct KMer { std::uint64_t key; Id seq; std::uint32_t offset; };   // 16 B, contiguous
+  static std::uint64_t kmerHash_(std::string_view s)
+  {
+    std::uint64_t h = 1469598103934665603ull;                  // FNV-1a
+    for (char c : s) { h = (h ^ std::uint8_t(c)) * 1099511628211ull; }
+    return h;
+  }
+
   struct Entry
   {
     std::uint32_t chunk;    ///< which chunk holds it
@@ -246,6 +351,9 @@ private:
   std::vector<std::unique_ptr<char[]>> chunks_;
   std::vector<Entry> entries_;
   std::unordered_map<std::string_view, Id> index_;
+  std::size_t k_ = 5;
+  std::vector<KMer> kmers_;          ///< ONE allocation, sorted by key
+  std::size_t indexed_upto_ = 0;
 };
 
 } // namespace odia
