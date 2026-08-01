@@ -1155,8 +1155,22 @@ protected:
         if (exp_rt[a] != exp_rt[b]) { return exp_rt[a] < exp_rt[b]; }
         return feature_id[a] < feature_id[b];
       });
+      // Both loaders fill all seven columns once per row, so a size mismatch is a bug, not a case
+      // to tolerate. Skipping the odd one out would leave it misaligned against the rest -- scores
+      // silently attached to the wrong precursor, which no test would catch and no output would
+      // flag. Refuse to reorder anything rather than reorder some of it.
+      for (const std::size_t sz : {labels.size(), group.size(), feature_id.size(),
+                                   library_rt.size(), exp_rt.size(), traml_id.size()})
+      {
+        if (sz != n)
+        {
+          OPENMS_LOG_ERROR << "OpenDIAlyzer: OswRows column length " << sz << " != " << n
+                           << "; refusing to canonicalise (rows left in extraction order, so this "
+                              "run is not reproducible)" << std::endl;
+          return;
+        }
+      }
       const auto apply = [&](auto& v) {
-        if (v.size() != n) { return; }
         std::decay_t<decltype(v)> out;
         out.reserve(n);
         for (std::size_t i = 0; i < n; ++i) { out.push_back(std::move(v[idx[i]])); }
