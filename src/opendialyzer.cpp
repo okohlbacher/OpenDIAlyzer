@@ -58,7 +58,8 @@
 
 #include "odia_lda.h"                                          // in-process semi-supervised LDA
 #include "odia_fdr.h"
-#include "odia_library.h"                                   // compact library probe
+#include "odia_library.h"
+#include "odia_split.h"                                   // compact library probe
 #include <OpenMS/FORMAT/FASTAFile.h>
 #include <unordered_set>
 #include <arrow/array.h>
@@ -3248,7 +3249,38 @@ protected:
     // occupancy cap, not the allocator, not batch granularity, not barrier spinning.
     // A positive value splits threads outer x inner instead; it also disables the wave scheduler,
     // which costs nothing on a path that cannot reach it. Default unchanged.
-    const int outer_loop_threads = getIntOption_("outer_loop_threads");
+    // Derive the split when the user left both at -1. Measured on the Astral benchmark
+    // (423079 precursors, 150 windows, 224 threads):
+    //   baseline -1          : inner 1 thread,  1 batch/window  ->  38.2 cores, peak 187 GB
+    //   -innerBatchSize 2000 : inner 1 thread                   ->  43.0 cores, 26% slower
+    //   -outer_loop_threads 16: 14 threads, 1 batch/window       ->  16.4 cores (worse)
+    //   16 x 14 + batch 200  : 14 threads, ~14 batches/window    -> 105.6 cores, peak 88 GB
+    // Neither lever does anything alone; the pair has to supply both threads and iterations.
+    // Resolved HERE, not after the workflow is built: a positive outer_loop_threads sets
+    // nested_scheduler_requested, which DISABLES the SWATH wave scheduler. Deriving a positive
+    // value without knowing load_into_memory would silently take that scheduler away from anyone
+    // who asked for residency with -readOptions cacheWorkingInMemory.
+    std::string eff; bool load_into_memory = false;
+    resolveReadOptions_(in_file, eff, load_into_memory);
+
+    int outer_loop_threads = getIntOption_("outer_loop_threads");
+    int inner_batch_size   = getIntOption_("innerBatchSize");
+    if (outer_loop_threads < 0 && inner_batch_size < 0 && !load_into_memory && !swath_maps.empty())
+    {
+      std::size_t n_ms2 = 0;
+      for (const auto& sm : swath_maps) { if (!sm.ms1) { ++n_ms2; } }
+      if (n_ms2 == 0) { n_ms2 = swath_maps.size(); }
+      const odia::ExtractionSplit sp = odia::deriveExtractionSplit(
+        getIntOption_("threads"), n_ms2, transition_exp.getCompounds().size());
+      outer_loop_threads = sp.outer_threads;
+      inner_batch_size   = sp.batch_size;
+      OPENMS_LOG_INFO << "OpenDIAlyzer: extraction split derived from -threads "
+                      << getIntOption_("threads") << " and " << n_ms2 << " MS2 windows: "
+                      << sp.outer_threads << " outer x " << sp.inner_threads << " inner threads, "
+                      << "innerBatchSize=" << sp.batch_size << " (~" << sp.batches_per_window
+                      << " batches/window). Passing -1 for both leaves the inner extraction loop "
+                         "SERIAL; set either option to opt out." << std::endl;
+    }
     FeatureMap fmap;
     OpenSwathWorkflow wf(use_ms1, use_ms1_im, prm, pasef, mrm, outer_loop_threads);
     wf.setLogType(log_type_);
@@ -3258,8 +3290,6 @@ protected:
     // silently defeated an mzPeak-backed run. Now driven by -readOptions.
     // Must AGREE with what loadDIARun_ actually did, or the workflow is told the maps are
     // resident when they are not -- so both sites go through the same resolver.
-    std::string eff; bool load_into_memory = false;
-    resolveReadOptions_(in_file, eff, load_into_memory);
     if (!load_into_memory && getIntOption_("batchSize") <= 0)
     {
       // INFO, not WARN: this is the default path now. The old WARN asserted "throughput will drop";
@@ -3276,7 +3306,7 @@ protected:
                          fmap, /*store_features*/ parquet_out_, oswwriter, chrom,
                          getIntOption_("batchSize"), getIntOption_("ms1_isotopes"),
                          load_into_memory,
-                         mrm_map, /*mobilogram*/ nullptr, getIntOption_("innerBatchSize"),
+                         mrm_map, /*mobilogram*/ nullptr, inner_batch_size,
                          getIntOption_("max_concurrent_swaths"));
     {
       const double secs = std::chrono::duration<double>(
