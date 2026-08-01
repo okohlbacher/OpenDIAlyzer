@@ -465,3 +465,37 @@ across different schedulers, thread topologies and node loads. That is what make
 fix load-bearing: quality questions stay answerable on a busy cluster.
 
 `bench_odia.sh` now records `uptime` and top consumers before and after every run.
+
+### The paired configuration works: peak RSS 187 -> 88 GB, identical IDs
+
+`-outer_loop_threads 16 -innerBatchSize 200` (16 outer windows x 14 inner threads, ~14 batches per
+window):
+
+| | det1 (idle node) | outer16_b200 (load 156) | confidence |
+|---|---:|---:|---|
+| `extract_pass1_wide` | 576.0 s / 38.2 cores | **353.8 s / 105.6** | lower bound -- handicapped and still won |
+| extraction total | 841.6 s | **682.3 s (-19%)** | lower bound |
+| **peak RSS** | **187.15 GB** | **88.13 GB (-53%)** | **solid -- load-independent** |
+| IDs @ q<0.01 | 6430 | **6430** | **solid** |
+| total wall | 33:22 | 37:26 | **contaminated -- do not read** |
+
+Occupancy by configuration, showing that neither lever does anything alone:
+
+| | inner threads | batches/window | avg cores |
+|---|---:|---:|---:|
+| baseline (`-1`) | **1** | 1 | 38.2 |
+| `batch2k` | **1** | ~1.4 | 43.0 |
+| `outer16` | 14 | **1** | 16.4 |
+| **`outer16_b200`** | **14** | **~14** | **105.6** |
+
+The memory result was not the goal and is the most valuable part: 187 GB confines this benchmark to
+the cluster's largest nodes, 88 GB fits nearly anything. Sixteen concurrent windows carrying
+200-compound batches hold far smaller live feature buffers than ~150 windows carrying 10000-compound
+batches.
+
+The peak has moved to `write_parquet_bundle` -- extraction memory fell far enough that the serial
+parquet writer is now the high-water mark as well as a 166-199 s single-core stage. It is now the
+target on both axes.
+
+Total wall cannot be compared across these two runs: `det1` had an idle node, `outer16_b200` had
+load 156. A clean head-to-head needs both under the same conditions.
