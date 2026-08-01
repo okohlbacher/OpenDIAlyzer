@@ -4207,7 +4207,8 @@ protected:
           mass_cal_trafo = native_trafo;
           mass_cal_trafo.invert();                 // run -> iRT  becomes  iRT -> run
         }
-        calibrateMassFromPass_(swath_maps, transition_exp, mass_cal_trafo);
+        { PhaseTimer pt_mc("setup/mass_calibration");
+          calibrateMassFromPass_(swath_maps, transition_exp, mass_cal_trafo); }
         // Diagnostic only: this is the IN-SAMPLE anchor residual (small); it is NOT the
         // predictive residual on unseen peptides, so it must NOT auto-size the window
         // (would collapse it and lose unseen precursors). Window sizing stays fixed until a
@@ -4221,7 +4222,11 @@ protected:
       // The assay library + scored features, written ONCE, from memory. This is the only time the
       // features touch disk in a parquet run.
       OpenSwathOSWParquetWriter pw;
-      pw.write(out, transition_exp, pass_features_, run_id_, in, /*uis*/ false);
+      // Serialises 2.07M features and 30.2M subordinates. It sat between the pass loop and
+      // finalScore_, inside the 183 s that no phase accounted for -- of which retain_features
+      // explained only 15.4 s.
+      { PhaseTimer pt_pw("write_parquet_bundle");
+        pw.write(out, transition_exp, pass_features_, run_id_, in, /*uis*/ false); }
       OPENMS_LOG_INFO << "OpenDIAlyzer: wrote parquet bundle " << out << " ("
                       << pass_features_.size() << " features)." << std::endl;
     }
