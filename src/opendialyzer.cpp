@@ -3272,9 +3272,11 @@ protected:
     {
       OPENMS_LOG_INFO << "OpenDIAlyzer[progress] retained " << fmap.size()
                       << " features in memory (no sqlite round trip)." << std::endl;
-      pass_features_ = std::move(fmap);       // must happen while fmap is still in scope
+      { PhaseTimer pt_fm("setup/retain_features");
+        pass_features_ = std::move(fmap); }   // must happen while fmap is still in scope
     }
-    delete chrom;
+    { PhaseTimer pt_ch("setup/free_chromatograms");
+    delete chrom; }
     }                                         // <- oswwriter closes its sqlite connection here
     // remapFeaturePrecursorIds_ is a SQLITE-ONLY fixup: OpenSwathOSWWriter emits whatever string id
     // the library carried into a column declared INT NOT NULL. The parquet schema declares
@@ -3953,6 +3955,10 @@ protected:
     // range exploded the candidate-peak count ~100x and choked the single-threaded OSW
     // writer.) recalibrate_ then refines this map nonlinearly from confident IDs.
     double rt_min = std::numeric_limits<double>::max(), rt_max = std::numeric_limits<double>::lowest();
+    // 271.8 s sat un-phased between precursor_index and pass 1 -- 14% of the run in code nothing
+    // was watching. Two 300-call metadata probes look free on a resident map and are not
+    // necessarily free on a streaming one; time them rather than assume.
+    { PhaseTimer pt_rtr("setup/run_rt_range");
     for (const auto& sm : swath_maps)                          // any map (MS1 or MS2), not only MS1 (C18)
     {
       if (!sm.sptr) { continue; }
@@ -3962,6 +3968,7 @@ protected:
       const double b = sm.sptr->getSpectrumMetaById(static_cast<int>(ns) - 1).RT;
       rt_min = std::min(rt_min, std::min(a, b));
       rt_max = std::max(rt_max, std::max(a, b));
+    }
     }
     if (!(rt_max > rt_min) || !std::isfinite(rt_min) || !std::isfinite(rt_max))
     {
