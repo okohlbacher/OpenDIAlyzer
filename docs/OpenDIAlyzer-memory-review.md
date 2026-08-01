@@ -325,3 +325,41 @@ what fragments an arena.
    fragmenting independently. `MALLOC_ARENA_MAX` is an environment variable, not a refactor.
 4. Extraction is the only phase still uninstrumented (it is inside OpenMS's `performExtraction`),
    and it holds the global peak. That is where the next timer goes.
+
+## 7.1 The compact representation, measured on the real library
+
+`-compact_probe` loads the same 7,149,966-precursor `.oswpq` into `CompactLibrary`
+(`src/odia_library.h`), on the same machine, with `human.fasta` (20,416 proteins, 10.89 MB of
+sequence) supplied so peptides can be stored as substrings.
+
+| | `LightTargetedExperiment` | `CompactLibrary` | |
+|---|---:|---:|---|
+| wall | 144.8 s | **27.0 s** | 5.4x |
+| peak RSS | 38.79 GB | **12.26 GB** | 3.2x |
+| the structure itself | ~30 GB accounted | **1.94 GB** | 8.6x vs string-bearing objects |
+| **arena retained afterwards** | **11.29 GB** | **0.07 GB** | **161x** |
+
+The retained figure is the one that matters. Fragmentation debris is what compounds into 153 GB by
+the end of a full run; removing the allocations removes the debris.
+
+### The substring split is exactly the target/decoy split
+
+```
+7,149,966 peptides -> 3,603,425 as FASTA substrings, 3,546,541 standalone
+```
+
+Those are precisely the library's own target (3,603,425) and decoy (3,546,541) counts. Every TARGET
+peptide was located in its protein; NO decoy was -- correct, because OpenSWATH decoys are SHUFFLED
+sequences that occur in no protein, and the fallback stores them explicitly.
+
+One implementation detail decides this: matching must use the UNMODIFIED sequence. A modified one
+carries `(UniMod:4)` and occurs in no protein, so matching on it reports 0% substrings and makes the
+whole approach look worthless.
+
+### What it does not yet show
+
+This is the REPRESENTATION cost, not a pipeline saving. Every downstream OpenMS API takes a
+`LightTargetedExperiment`, so realising it in production means ODIA loading the library itself and
+materialising that type only for the ~5.7% that survives prefiltering (423,079 precursors /
+4,463,919 transitions instead of 7,149,966 / 78,569,077). The probe exists to say whether that
+restructure is worth its cost. At 3.2x peak, 5.4x time and 161x less fragmentation, it is.

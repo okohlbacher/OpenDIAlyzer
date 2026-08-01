@@ -57,7 +57,10 @@
 #include <OpenMS/METADATA/ExperimentalSettings.h>
 
 #include "odia_lda.h"                                          // in-process semi-supervised LDA
-#include "odia_fdr.h"                                          // peptide/protein context + picked + entrapment FDR
+#include "odia_fdr.h"
+#include "odia_library.h"                                   // compact library probe
+#include <OpenMS/FORMAT/FASTAFile.h>
+#include <OpenMS/FORMAT/ArrowSchemaRegistry.h>        // OSWPrecursorSchema / OSWTransitionSchema
 #ifdef __GLIBC__
 #include <malloc.h>                                            // malloc_trim: return the freed library to the OS
 #endif
@@ -181,6 +184,14 @@ protected:
     // the NUMBER OF QUERIES, so a window that is fatal across 7.15M library targets is safe across
     // a few hundred anchors. Do not raise much beyond this -- past ~50 ppm even constrained
     // matching admits too many coincidences.
+    registerStringOption_("compact_probe", "<lib.oswpq>", "", "PROBE: load this library into the "
+                          "compact representation (src/odia_library.h) and report what it costs, "
+                          "then exit. For comparing against the LightTargetedExperiment path on the "
+                          "same file.", false, true);
+    registerStringOption_("compact_probe_fasta", "<fasta>", "", "FASTA for -compact_probe. With it, "
+                          "a peptide that occurs in its protein costs (protein, offset, length) and "
+                          "no characters of its own; without it, sequences are interned instead.",
+                          false, true);
     registerFlag_("ms1_scores", "Give the classifier the MS1-level sub-scores (var_ms1_*: isotope "
                   "correlation/overlap, mass deviation, MS1 xcorr shape/coelution) alongside the MS2 "
                   "ones. Off by default -- not because it is known worse, but because the evidence "
@@ -3324,6 +3335,121 @@ protected:
     sqlite3_close(db);
   }
 
+
+  /// Load the library into CompactLibrary and report what it costs. A PROBE, not the production
+  /// path: it exists so the compact representation can be compared against the measured 38.79 GB
+  /// of the LightTargetedExperiment path on the same file and the same machine, before anything is
+  /// restructured around it.
+  ///
+  /// The .oswpq carries protein ACCESSIONS but not protein SEQUENCES, so the substring win needs a
+  /// FASTA. With one supplied, a peptide costs (protein, offset, length) and no characters;
+  /// without, sequences are interned -- still no per-string malloc and no duplication, but every
+  /// distinct peptide keeps its own characters. Reporting both is the point.
+  ExitCodes compactProbe_(const std::string& lib, const std::string& fasta)
+  {
+    odia::CompactLibrary clib;
+    std::unordered_map<std::string, odia::CompactLibrary::Protein> prot_by_acc;
+
+    if (!fasta.empty())
+    {
+      PhaseTimer pt("compact_probe/fasta");
+      std::vector<FASTAFile::FASTAEntry> entries;
+      FASTAFile().load(fasta, entries);
+      std::size_t chars = 0;
+      for (const auto& e : entries) { chars += e.sequence.size(); }
+      clib.reserve(entries.size(), 0, 0, chars);
+      for (const auto& e : entries)
+      {
+        // OpenSWATH accessions are the FASTA id; index by both the raw id and its middle field
+        // ("sp|P02768|ALBU_HUMAN" -> "P02768") because libraries differ in which they carry.
+        const auto h = clib.addProtein(e.identifier, e.sequence);
+        prot_by_acc[e.identifier] = h;
+        const auto bar1 = e.identifier.find('|');
+        if (bar1 != std::string::npos)
+        {
+          const auto bar2 = e.identifier.find('|', bar1 + 1);
+          if (bar2 != std::string::npos) { prot_by_acc[e.identifier.substr(bar1 + 1, bar2 - bar1 - 1)] = h; }
+        }
+      }
+      OPENMS_LOG_INFO << "OpenDIAlyzer[compact] FASTA: " << entries.size() << " proteins, "
+                      << std::fixed << std::setprecision(2) << chars / 1048576.0 << " MB of sequence"
+                      << std::endl;
+    }
+
+    std::unique_ptr<File::TempDir> temp_dir;
+    // ZipRandomAccessFile is internal to OpenMS and not in the installed prefix, so this takes the
+    // documented fallback: extract the entry to a temp file and read it. Slower and it touches
+    // disk, which is acceptable for a probe -- the measurement here is MEMORY, not load time.
+    auto open_entry = [&](const std::string& entry) -> std::shared_ptr<arrow::Table> {
+      return ParquetFile::readTable(ZipArchiveFile::extractEntryToTempFile(lib, entry, temp_dir));
+    };
+
+    std::unordered_map<long long, odia::CompactLibrary::Peptide> pep_by_id;
+    {
+      PhaseTimer pt("compact_probe/precursors");
+      auto tbl = open_entry("library/precursors.parquet");
+      auto id_c  = ParquetFile::getColumn(tbl, OSWPrecursorSchema::PRECURSOR_ID);
+      auto ch_c  = ParquetFile::getColumn(tbl, OSWPrecursorSchema::CHARGE);
+      auto mod_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::MODIFIED_SEQUENCE);
+      auto unm_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::UNMODIFIED_SEQUENCE);
+      auto acc_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::PROTEIN_ACCESSIONS);
+      const int64_t n = tbl->num_rows();
+      pep_by_id.reserve(n);
+      clib.reserve(prot_by_acc.size(), n, 0, 0);
+      for (int64_t r = 0; r < n; ++r)
+      {
+        const std::string acc = acc_c ? ParquetFile::getString(acc_c, r) : std::string();
+        const std::string seq_m = mod_c ? ParquetFile::getString(mod_c, r) : std::string();
+        const std::string seq_u = unm_c ? ParquetFile::getString(unm_c, r) : std::string();
+        // Substring matching must use the UNMODIFIED sequence: a modified one carries "(UniMod:4)"
+        // and occurs in no protein. The peptide identity for scoring is still the modified form,
+        // which is why a library needs both.
+        const std::string& seq = !seq_u.empty() ? seq_u : seq_m;
+        auto parent = odia::CompactLibrary::no_protein;
+        if (!acc.empty())
+        {
+          const auto first = acc.substr(0, acc.find('/'));
+          const auto it = prot_by_acc.find(first);
+          if (it != prot_by_acc.end()) { parent = it->second; }
+        }
+        const auto pep = clib.addPeptide(parent, seq,
+                                         int(ParquetFile::getInt64(ch_c, r, 0, true)));
+        pep_by_id[ParquetFile::getInt64(id_c, r, 0, false)] = pep;
+      }
+    }
+    {
+      PhaseTimer pt("compact_probe/transitions");
+      auto tbl = open_entry("library/transitions.parquet");
+      using CC = ParquetFile::ChunkedColumn;
+      CC pid(tbl, OSWTransitionSchema::PRECURSOR_ID), mz(tbl, OSWTransitionSchema::PRODUCT_MZ);
+      CC inten(tbl, OSWTransitionSchema::LIBRARY_INTENSITY), ann(tbl, OSWTransitionSchema::ANNOTATION, false);
+      const int64_t n = tbl->num_rows();
+      clib.reserve(0, 0, n, 0);
+      for (int64_t r = 0; r < n; ++r)
+      {
+        const auto it = pep_by_id.find(ParquetFile::getInt64(pid, r, 0, false));
+        if (it == pep_by_id.end()) { continue; }
+        clib.addTransition(it->second, ParquetFile::getDouble(mz, r, 0.0, false),
+                           float(ParquetFile::getDouble(inten, r, 0.0, true)),
+                           ParquetFile::getString(ann, r));
+      }
+    }
+    clib.finalize();
+
+    const auto st = clib.stats();
+    const double gb = 1073741824.0;
+    OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << st.proteins << " proteins, " << st.peptides
+                    << " peptides (" << st.peptides_from_fasta << " as FASTA substrings, "
+                    << st.peptides_standalone << " standalone), " << st.transitions << " transitions"
+                    << std::endl;
+    OPENMS_LOG_INFO << "OpenDIAlyzer[compact] CompactLibrary " << std::fixed << std::setprecision(2)
+                    << st.bytes / gb << " GB  vs  string-bearing objects " << st.bytes_as_objects / gb
+                    << " GB  (" << (st.bytes ? double(st.bytes_as_objects) / double(st.bytes) : 0.0)
+                    << "x)" << std::endl;
+    MemProbe::logAllocator("compact probe done");
+    return EXECUTION_OK;
+  }
+
   ExitCodes main_(int, const char**) override
   {
     if (getFlag_("selftest")) { return selftest_(); }
@@ -3366,6 +3492,19 @@ protected:
       return EXECUTION_OK;
     }
 
+    // Standalone probe: needs a library and nothing else, so it must be handled BEFORE the
+    // -in/-tr/-out requirement, next to the other modes that do not run a search.
+    if (!getStringOption_("compact_probe").empty())
+    {
+      MemProbe::instance().start();
+      MemProbe::logAllocator("startup");
+      const ExitCodes rc = compactProbe_(getStringOption_("compact_probe"),
+                                         getStringOption_("compact_probe_fasta"));
+      MemProbe::instance().stop();
+      MemProbe::instance().report();
+      return rc;
+    }
+
     if (in.empty() || tr.empty() || out.empty())
     {
       OPENMS_LOG_ERROR << "OpenDIAlyzer: -in, -tr and -out are required." << std::endl;
@@ -3389,6 +3528,7 @@ protected:
     // sqlite. Chosen by extension, exactly as TOPP OpenSwathWorkflow does it.
     MemProbe::instance().start();
     MemProbe::logAllocator("startup");
+
     // RAII, not a call before `return`: main_ has six return sites and an early one would have been
     // missed. This reports on every exit path, including the error ones -- which are exactly the
     // runs where knowing the memory profile matters most.
