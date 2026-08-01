@@ -407,3 +407,61 @@ wave scheduler batches differently and finds different peak groups.
 
 `-outer_loop_threads` targets the same defect on the streaming path -- no cache to build, no
 residency, no +23 GB.
+
+### Instrumentation complete: 27% invisible -> 2.8%
+
+With every large block named, `outer16` reports:
+
+| block | wall | cores |
+|---|---:|---:|
+| `setup/cirt_calibration` | 424.9 s (contended node) | 36.0 |
+| `write_parquet_bundle` | **166.4 s** | **1.0** |
+| all remaining un-phased | **56.6 s** | -- |
+
+Un-phased fell from 519.6 s (27% of the run) to 56.6 s (2.8%), the remainder being six gaps none
+larger than 22 s.
+
+**New target: `write_parquet_bundle` is 166.4 s on ONE core** while 223 sit idle -- serialising
+2.07M features with 30.2M subordinates. Unlike the extraction ceiling, this is unambiguous
+single-threaded work with obvious parallel structure (row groups, column encoding).
+
+`setup/mass_calibration` is 1.2 s, so the component once suspected of costing 154 IDs is free; any
+effect it has is a quality question, not a cost one.
+
+### outer_loop_threads and innerBatchSize are one lever, not two
+
+| run | supplied | missing | avg cores |
+|---|---|---|---:|
+| baseline | -- | -- | 38.2 |
+| `batch2k` (`-innerBatchSize 2000`) | 443 batches | inner loop had 1 thread | 43.0, 26% slower |
+| `outer16` (`-outer_loop_threads 16`) | 14 inner threads | 1 batch per window | **16.4** |
+
+423079 precursors over 150 windows is ~2820 each, against an auto batch size of 10000, so
+`nr_batches == 1` per window. Sixteen outer windows x one batch = 16.4 cores, as measured. Each
+option was tested in isolation and each failed for the other's reason -- one incomplete experiment
+run twice.
+
+Correct pairing: batch size ~ 2820 / inner_threads. Queued 16x14 with batch 200, and 32x7 with
+batch 400.
+
+**Pre-registered exit condition: if neither clears 38.2 avg cores, window-level parallelism is the
+ceiling and this line is finished.**
+
+### A third memory lever, found by accident
+
+`-outer_loop_threads 16` limits concurrent windows and roughly halves extraction memory: pass 1
++51.19 GB vs +103.55, ending pass 2 at 106.80 GB vs 185.27. Alongside tcmalloc (peak 189 -> 106 GB)
+and `-innerBatchSize 2000` (extraction growth -41 GB), there are now three independent ways to trade
+wall time for peak RSS -- which matters because 189 GB confines this benchmark to the largest nodes.
+
+### Measurement hygiene: the node stopped being idle
+
+`det1` and `det2` are the same invocation. Pass 1: **576.0 s vs 823.6 s**. spock acquired four other
+users mid-session (load 232, 1.04/core). Every wall-time comparison spanning that window is
+unreliable, and the percentages quoted for `batch2k`, `passive` and `wave_passive` are withdrawn.
+
+ID counts are unaffected -- `det1`, `passive`, `det2` and `outer16` all returned exactly **6430**
+across different schedulers, thread topologies and node loads. That is what makes the determinism
+fix load-bearing: quality questions stay answerable on a busy cluster.
+
+`bench_odia.sh` now records `uptime` and top consumers before and after every run.
