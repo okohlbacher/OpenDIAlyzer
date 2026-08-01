@@ -45,6 +45,8 @@ public:
   enum class Protein : std::uint32_t {};
   enum class Peptide : std::uint32_t {};
   enum class Transition : std::uint32_t {};
+  /// Opaque handle for an interned fragment annotation.
+  using AnnotationId = SequenceStore::Id;
 
   static constexpr Protein no_protein = Protein(~std::uint32_t(0));
 
@@ -89,6 +91,67 @@ public:
     transitions_.push_back(r);
     return Transition(std::uint32_t(transitions_.size() - 1));
   }
+
+
+  // ---- parallel bulk fill ------------------------------------------------------------------
+  // The row-by-row readers run at 1.0 core (measured: 4.8 s for 7.1M precursors, 20.6 s for 78.6M
+  // transitions). The rows are independent, so the only obstacles are the shared vectors and the
+  // interning map. Both are removed by pre-sizing and pre-interning, after which threads write to
+  // disjoint indices and touch nothing shared.
+  //
+  // Contract, deliberately narrow: resize first, intern every annotation BEFORE the parallel
+  // region, then fill each index exactly once. Filling an index twice or leaving one unset is a
+  // caller error this cannot detect cheaply -- which is why it is a separate, explicitly named API
+  // rather than an overload of addTransition().
+
+  /// Pre-size for index-addressed filling. Parquet's footer gives the exact count.
+  void resizeTransitions(std::size_t n) { transitions_.assign(n, TransitionRec{}); }
+  void resizePeptides(std::size_t n) { peptides_.assign(n, PeptideRec{}); }
+
+  /// Intern an annotation up front, OUTSIDE any parallel region, and reuse the handle inside.
+  /// Fragment annotations are a tiny distinct set ("y7", "b3", ...) repeated across millions of
+  /// transitions, so this is a few hundred calls, not 78 million.
+  AnnotationId internAnnotation(std::string_view a)
+  {
+    return a.empty() ? SequenceStore::npos : store_.intern(a);
+  }
+
+  /// Thread-safe when every index is written exactly once by one thread.
+  void setTransition(std::size_t i, Peptide p, double product_mz, float intensity, AnnotationId ann)
+  {
+    TransitionRec& r = transitions_[i];
+    r.peptide = p;
+    r.product_mz = product_mz;
+    r.intensity = intensity;
+    r.annotation = ann;
+  }
+
+  /// Peptides cannot be filled in parallel the same way: locating a peptide inside its protein
+  /// mutates nothing, but a peptide that is NOT a substring must be appended to the store, which
+  /// does. So the parallel form takes a pre-resolved span, and the caller decides how to obtain it
+  /// -- see locateOrNull()/internPeptideSequence() below.
+  void setPeptide(std::size_t i, Protein parent, SequenceStore::Span span, int charge, bool derived)
+  {
+    PeptideRec& r = peptides_[i];
+    r.parent = parent;
+    r.span = span;
+    r.charge = std::int16_t(charge);
+    if (derived) { ++derived_; }
+  }
+
+  /// Substring lookup only -- no mutation, safe to call from many threads at once.
+  /// Returns an invalid span when the sequence does not occur in the protein.
+  SequenceStore::Span locateOrNull(Protein parent, std::string_view seq) const
+  {
+    if (parent == no_protein) { return {}; }
+    const auto pseq = proteins_[idx(parent)].sequence;
+    if (pseq == SequenceStore::npos) { return {}; }
+    return store_.locate(pseq, seq);
+  }
+
+  /// Mutating: store a sequence that is not a substring. Call from ONE thread (or serially after
+  /// a parallel locate pass has identified the misses).
+  SequenceStore::Span internPeptideSequence(std::string_view seq) { return store_.internAsSpan(seq); }
 
   /// Pre-size everything. Parquet's footer gives exact row counts and total column bytes, so a
   /// caller loading from parquet never has to guess -- and the vectors then never reallocate, which

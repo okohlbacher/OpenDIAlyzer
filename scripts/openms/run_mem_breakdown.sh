@@ -12,6 +12,13 @@ TAG=${TAG:-membreak}
 
 ssh -o BatchMode=yes -J "$JUMP" "$NODE" "
   export HOME=$ROOT/home
+  # -tempDirectory is a TOPP parameter that File::TempDir NEVER consults. OpenMS resolves its temp
+  # path as OPENMS_TMPDIR -> the 'temp_dir' system param -> fs::temp_directory_path(), so without
+  # this the .oswpq's 1.29 GB of parquet unpacks to /tmp -- which on these nodes is /dev/sda1, the
+  # ROOT filesystem, not /scratch and not NVMe. Verified live: the ramdisk goes 0 -> 231 -> 1289 MB
+  # only once OPENMS_TMPDIR is set.
+  export OPENMS_TMPDIR=/dev/shm/\$USER-odia-tmp
+  mkdir -p \$OPENMS_TMPDIR
   mkdir -p $ROOT/bench/$TAG
   cd $ROOT
   BIN=$ROOT/odia-build/OpenDIAlyzer OUT=$ROOT/bench/$TAG/$TAG.oswpq \

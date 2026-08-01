@@ -60,6 +60,8 @@
 #include "odia_fdr.h"
 #include "odia_library.h"                                   // compact library probe
 #include <OpenMS/FORMAT/FASTAFile.h>
+#include <unordered_set>
+#include <arrow/array.h>
 #include <OpenMS/FORMAT/ArrowSchemaRegistry.h>        // OSWPrecursorSchema / OSWTransitionSchema
 #ifdef __GLIBC__
 #include <malloc.h>                                            // malloc_trim: return the freed library to the OS
@@ -3336,6 +3338,48 @@ protected:
   }
 
 
+
+  /// Global-row-range access to an arrow::ChunkedArray without per-row shared_ptr traffic.
+  ///
+  /// Two facts make the obvious approaches wrong. Columns do NOT share a chunk layout -- string
+  /// columns split at arrow's 2 GB array limit while an int64 column of the same table does not --
+  /// so a chunk index from one column cannot address another. And ChunkedColumn::resolve() returns
+  /// shared_ptr BY VALUE, so per-row access costs atomic refcount updates on control blocks shared
+  /// by every thread; measured, that turned a 20.1 s serial loop into 34.5 s on 64 threads.
+  ///
+  /// This resolves once per (column, segment) and hands back a raw pointer plus the local offset.
+  struct ChunkCursor
+  {
+    const arrow::ChunkedArray* col = nullptr;
+    std::vector<int64_t> start;                 ///< global row where each chunk begins
+    explicit ChunkCursor(const std::shared_ptr<arrow::ChunkedArray>& c) : col(c.get())
+    {
+      if (!col) { return; }
+      start.resize(col->num_chunks() + 1, 0);
+      for (int i = 0; i < col->num_chunks(); ++i) { start[i + 1] = start[i] + col->chunk(i)->length(); }
+    }
+    /// Chunk index containing global row r (binary search: once per segment, not per row).
+    int chunkOf(int64_t r) const
+    {
+      return int(std::upper_bound(start.begin(), start.end(), r) - start.begin()) - 1;
+    }
+    const arrow::Array* chunk(int i) const { return col->chunk(i).get(); }
+    int64_t local(int64_t r, int i) const { return r - start[i]; }
+    int64_t chunkEnd(int i) const { return start[i + 1]; }
+    bool valid() const { return col != nullptr && col->num_chunks() > 0; }
+  };
+
+  /// Text of row `r`, handling both utf8 and large_utf8 -- the writer picks either depending on
+  /// column size, and a dynamic_cast to only one of them silently yields nothing. That is exactly
+  /// how a probe reported "0 distinct fragment annotations" where there were 102.
+  static std::string_view arrowText(const arrow::Array* a, int64_t i)
+  {
+    if (!a || a->IsNull(i)) { return {}; }
+    if (const auto* s = dynamic_cast<const arrow::StringArray*>(a)) { return std::string_view(s->GetView(i)); }
+    if (const auto* l = dynamic_cast<const arrow::LargeStringArray*>(a)) { return std::string_view(l->GetView(i)); }
+    return {};
+  }
+
   /// Load the library into CompactLibrary and report what it costs. A PROBE, not the production
   /// path: it exists so the compact representation can be compared against the measured 38.79 GB
   /// of the LightTargetedExperiment path on the same file and the same machine, before anything is
@@ -3396,7 +3440,20 @@ protected:
       const int64_t n = tbl->num_rows();
       pep_by_id.reserve(n);
       clib.reserve(prot_by_acc.size(), n, 0, 0);
-      for (int64_t r = 0; r < n; ++r)
+      clib.resizePeptides(std::size_t(n));
+
+      // PASS 1, PARALLEL: resolve each peptide's span. locate() only READS the store, so it is
+      // safe from many threads; interning a miss MUTATES it, so misses are only recorded here and
+      // stored serially afterwards. The plain (non-chunked) Arrow arrays are read-only and shared.
+      std::vector<odia::SequenceStore::Span> spans(n);
+      std::vector<odia::CompactLibrary::Protein> parents(n, odia::CompactLibrary::no_protein);
+      std::vector<int> charges(n, 0);
+      std::vector<std::string> misses(n);          // sequence, only where locate() failed
+      std::vector<long long> ids(n, 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+      for (long long r = 0; r < n; ++r)
       {
         const std::string acc = acc_c ? ParquetFile::getString(acc_c, r) : std::string();
         const std::string seq_m = mod_c ? ParquetFile::getString(mod_c, r) : std::string();
@@ -3409,30 +3466,101 @@ protected:
         if (!acc.empty())
         {
           const auto first = acc.substr(0, acc.find('/'));
-          const auto it = prot_by_acc.find(first);
+          const auto it = prot_by_acc.find(first);      // read-only after the FASTA pass
           if (it != prot_by_acc.end()) { parent = it->second; }
         }
-        const auto pep = clib.addPeptide(parent, seq,
-                                         int(ParquetFile::getInt64(ch_c, r, 0, true)));
-        pep_by_id[ParquetFile::getInt64(id_c, r, 0, false)] = pep;
+        parents[r] = parent;
+        charges[r] = int(ParquetFile::getInt64(ch_c, r, 0, true));
+        ids[r] = ParquetFile::getInt64(id_c, r, 0, false);
+        const auto sp = clib.locateOrNull(parent, seq);
+        if (sp.valid()) { spans[r] = sp; } else { misses[r] = seq; }
+      }
+      // PASS 2, SERIAL and only for the misses -- on this library that is the decoys, which are
+      // shuffled and occur in no protein.
+      for (long long r = 0; r < n; ++r)
+      {
+        if (!spans[r].valid()) { spans[r] = clib.internPeptideSequence(misses[r]); }
+        clib.setPeptide(std::size_t(r), parents[r], spans[r], charges[r], misses[r].empty());
+        pep_by_id[ids[r]] = odia::CompactLibrary::Peptide(std::uint32_t(r));
       }
     }
     {
       PhaseTimer pt("compact_probe/transitions");
       auto tbl = open_entry("library/transitions.parquet");
       using CC = ParquetFile::ChunkedColumn;
-      CC pid(tbl, OSWTransitionSchema::PRECURSOR_ID), mz(tbl, OSWTransitionSchema::PRODUCT_MZ);
-      CC inten(tbl, OSWTransitionSchema::LIBRARY_INTENSITY), ann(tbl, OSWTransitionSchema::ANNOTATION, false);
       const int64_t n = tbl->num_rows();
-      clib.reserve(0, 0, n, 0);
-      for (int64_t r = 0; r < n; ++r)
+      clib.resizeTransitions(std::size_t(n));
+
+      // PARALLEL OVER ROW RANGES, with each column resolved once per segment.
+      std::unordered_map<std::string, odia::CompactLibrary::AnnotationId> ann_id;
+      std::mutex ann_mu;
+      std::atomic<std::size_t> unmapped{0};
       {
-        const auto it = pep_by_id.find(ParquetFile::getInt64(pid, r, 0, false));
-        if (it == pep_by_id.end()) { continue; }
-        clib.addTransition(it->second, ParquetFile::getDouble(mz, r, 0.0, false),
-                           float(ParquetFile::getDouble(inten, r, 0.0, true)),
-                           ParquetFile::getString(ann, r));
+        ChunkCursor pidc(tbl->GetColumnByName(OSWTransitionSchema::PRECURSOR_ID));
+        ChunkCursor mzc (tbl->GetColumnByName(OSWTransitionSchema::PRODUCT_MZ));
+        ChunkCursor inc (tbl->GetColumnByName(OSWTransitionSchema::LIBRARY_INTENSITY));
+        ChunkCursor annc(tbl->GetColumnByName(OSWTransitionSchema::ANNOTATION));
+        if (!pidc.valid() || !mzc.valid() || !inc.valid())
+        {
+          OPENMS_LOG_ERROR << "OpenDIAlyzer[compact] transitions table is missing a required column."
+                           << std::endl;
+          return INPUT_FILE_CORRUPT;
+        }
+        // Fixed block count, so the partition depends on the DATA rather than the thread count.
+        const int64_t nblk = std::max<int64_t>(1, std::min<int64_t>(4096, n / 20000));
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (int64_t b = 0; b < nblk; ++b)
+        {
+          const int64_t lo = n * b / nblk, hi = n * (b + 1) / nblk;
+          std::unordered_map<std::string_view, odia::CompactLibrary::AnnotationId> local_ann;
+          std::size_t local_unmapped = 0;
+          for (int64_t r = lo; r < hi; )
+          {
+            // Resolve every column ONCE for this segment, then walk it.
+            const int ci = pidc.chunkOf(r), cm = mzc.chunkOf(r), cn = inc.chunkOf(r);
+            const int ca = annc.valid() ? annc.chunkOf(r) : -1;
+            int64_t seg = std::min({pidc.chunkEnd(ci), mzc.chunkEnd(cm), inc.chunkEnd(cn), hi});
+            if (ca >= 0) { seg = std::min(seg, annc.chunkEnd(ca)); }
+            const auto* pa = static_cast<const arrow::Int64Array*>(pidc.chunk(ci));
+            const auto* ma = static_cast<const arrow::DoubleArray*>(mzc.chunk(cm));
+            const auto* ia = static_cast<const arrow::DoubleArray*>(inc.chunk(cn));
+            const arrow::Array* aa = ca >= 0 ? annc.chunk(ca) : nullptr;
+            for (int64_t g = r; g < seg; ++g)
+            {
+              const auto it = pep_by_id.find(pa->Value(pidc.local(g, ci)));
+              if (it == pep_by_id.end()) { ++local_unmapped; continue; }
+              odia::CompactLibrary::AnnotationId aid = odia::SequenceStore::npos;
+              if (aa)
+              {
+                const std::string_view av = arrowText(aa, annc.local(g, ca));
+                if (!av.empty())
+                {
+                  const auto f = local_ann.find(av);
+                  if (f != local_ann.end()) { aid = f->second; }
+                  else
+                  {
+                    std::lock_guard<std::mutex> lk(ann_mu);
+                    const std::string key(av);
+                    auto g2 = ann_id.find(key);
+                    if (g2 == ann_id.end()) { g2 = ann_id.emplace(key, clib.internAnnotation(av)).first; }
+                    aid = g2->second;
+                    local_ann.emplace(av, aid);
+                  }
+                }
+              }
+              clib.setTransition(std::size_t(g), it->second,
+                                 ma->Value(mzc.local(g, cm)), float(ia->Value(inc.local(g, cn))), aid);
+            }
+            r = seg;
+          }
+          unmapped += local_unmapped;
+        }
       }
+      OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << ann_id.size() << " distinct fragment annotations"
+                      << (unmapped ? ", " + std::to_string(unmapped.load()) + " transitions with no precursor" : "")
+                      << std::endl;
     }
     clib.finalize();
 
