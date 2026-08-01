@@ -64,6 +64,8 @@
 
 #include <sqlite3.h>
 #include <sys/resource.h>
+#include <unistd.h>
+#include <cstdio>
 #include <chrono>
 #include <memory>
 #include <unordered_set>
@@ -174,6 +176,12 @@ protected:
     // the NUMBER OF QUERIES, so a window that is fatal across 7.15M library targets is safe across
     // a few hundred anchors. Do not raise much beyond this -- past ~50 ppm even constrained
     // matching admits too many coincidences.
+    registerFlag_("ms1_scores", "Give the classifier the MS1-level sub-scores (var_ms1_*: isotope "
+                  "correlation/overlap, mass deviation, MS1 xcorr shape/coelution) alongside the MS2 "
+                  "ones. Off by default -- not because it is known worse, but because the evidence "
+                  "that originally excluded them was confounded by the library_rt defect and the "
+                  "alternative has not been measured since. In-memory (parquet) scoring only; the "
+                  "sqlite path reads FEATURE_MS2 and cannot see them.", true);
     registerDoubleOption_("mz_calib_bootstrap_ppm", "<ppm>", 50.0,
                           "Wide window used only to COLLECT calibration anchor errors, before any "
                           "window is inferred. 0 disables m/z inference.", false, true);
@@ -450,6 +458,7 @@ protected:
     const char* name;
     std::chrono::steady_clock::time_point t0;
     double c0;
+    double r0;
     static double cpuSeconds()
     {
       struct rusage ru{};
@@ -457,15 +466,41 @@ protected:
       return ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6
            + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
     }
+
+    /// CURRENT resident set in GB. ru_maxrss is a high-water mark and so cannot attribute growth to
+    /// a phase; /proc/self/statm's resident field is the live value, which is what a per-phase
+    /// delta needs.
+    ///
+    /// This exists because the memory decomposition in docs/OpenDIAlyzer-memory-review.md was a
+    /// MODEL, and its own A/B refuted it: cutting 62% of the chromatogram term moved peak RSS by
+    /// 4.6%. The dominant term is unidentified, and the document says finding it needs a
+    /// phase-resolved measurement rather than another model. This is that measurement.
+    static double rssGB()
+    {
+      std::FILE* f = std::fopen("/proc/self/statm", "r");
+      if (!f) { return -1.0; }                       // not Linux; report nothing rather than a guess
+      long long total = 0, resident = 0;
+      const int n = std::fscanf(f, "%lld %lld", &total, &resident);
+      std::fclose(f);
+      if (n != 2) { return -1.0; }
+      return static_cast<double>(resident) * static_cast<double>(::sysconf(_SC_PAGESIZE)) / 1073741824.0;
+    }
     explicit PhaseTimer(const char* n)
-      : name(n), t0(std::chrono::steady_clock::now()), c0(cpuSeconds()) {}
+      : name(n), t0(std::chrono::steady_clock::now()), c0(cpuSeconds()), r0(rssGB()) {}
     ~PhaseTimer()
     {
       const double w = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       const double c = cpuSeconds() - c0;
+      const double r1 = rssGB();
       OPENMS_LOG_INFO << "OpenDIAlyzer[phase] " << name << ": " << std::fixed << std::setprecision(1)
                       << w << " s wall, " << c << " s cpu, " << (w > 0.01 ? c / w : 0.0)
-                      << " avg cores" << std::endl;
+                      << " avg cores";
+      if (r0 >= 0.0 && r1 >= 0.0)
+      {
+        OPENMS_LOG_INFO << "; RSS " << std::setprecision(2) << r0 << " -> " << r1 << " GB ("
+                        << std::showpos << (r1 - r0) << std::noshowpos << ")";
+      }
+      OPENMS_LOG_INFO << std::endl;
     }
   };
 
@@ -1127,31 +1162,41 @@ protected:
       fmap[i].getKeys(keys);
       for (const auto& k : keys) { keyset.insert(std::string(k)); }
     }
-    // MATCH THE SQLITE PATH'S SCOPE. loadOswScores_ reads the FEATURE_MS2 table, so it sees MS2-level
-    // sub-scores only -- OpenSWATH keeps the MS1-level ones (var_ms1_*) in a separate FEATURE_MS1
-    // table. Taking every var_* meta value off the Feature sweeps both together and hands the
-    // classifier a different, wider problem than the established path solves.
+    // MS1 SUB-SCOPE. loadOswScores_ reads FEATURE_MS2, so it sees MS2-level sub-scores only;
+    // OpenSWATH keeps the MS1-level ones (var_ms1_*) in a separate FEATURE_MS1 table. This path has
+    // both on the Feature and can use either scope.
     //
-    // That is not a theoretical difference. Measured on this benchmark, identical settings, only the
-    // -out extension differing: sqlite (29 sub-scores) gave 6,607 identifications, this path
-    // (35-36 sub-scores) gave 4,913 -- 26% fewer for having MORE features. The extra MS1 columns are
-    // sparsely populated relative to MS2, so they mostly contribute missingness, and a semi-supervised
-    // fit spends its capacity on them.
+    // THE EVIDENCE THAT ORIGINALLY JUSTIFIED DROPPING THEM WAS CONFOUNDED. It was: "identical
+    // settings, only the -out extension differing: sqlite (29 sub-scores) gave 6,607 identifications,
+    // this path (35-36 sub-scores) gave 4,913 -- 26% fewer for having MORE features", concluding the
+    // MS1 columns were sparse noise the fit wasted capacity on.
+    //
+    // That 4,913 is now explained by a different defect entirely: this path read `library_rt` from
+    // the feature's norm_RT (the OBSERVED rt in iRT space) instead of the library's PREDICTION, so
+    // recalibrate_ fitted a function of exp_rt against exp_rt and pass 2 extracted on a corrupted RT
+    // axis. With that fixed the same path reaches 6,522 -- WITHOUT any MS1 scores. So the MS1
+    // columns were never shown to hurt; they were blamed for a deficit another bug caused.
+    //
+    // Default stays 'false' because the alternative is unmeasured, not because it is known worse.
+    // -ms1_scores true hands the classifier ~12 more features (isotope correlation/overlap, mass
+    // deviation, MS1 xcorr shape/coelution): a real precursor has the right isotope envelope at MS1,
+    // which is information the MS2-only scope discards. The GBT treats missing as its own category
+    // (odia_gbt_test T5), so sparsity is handled rather than imputed.
+    const bool use_ms1_scores = getFlag_("ms1_scores");
     std::vector<std::string> vkeys, dropped;
     for (const auto& s : keyset)
     {
       std::string up = s;
       std::transform(up.begin(), up.end(), up.begin(), ::toupper);
       if (up.rfind("VAR_", 0) != 0) { continue; }
-      if (up.rfind("VAR_MS1_", 0) == 0) { dropped.push_back(s); continue; }   // FEATURE_MS1 scope
+      if (!use_ms1_scores && up.rfind("VAR_MS1_", 0) == 0) { dropped.push_back(s); continue; }
       if (for_anchors && up == "VAR_NORM_RT_SCORE") { continue; }   // circular for RT anchors (C8)
       vkeys.push_back(s);
     }
-    OPENMS_LOG_INFO << "OpenDIAlyzer: in-memory scoring found " << vkeys.size()
-                    << " MS2 VAR_ sub-scores across " << probe << " probed features (of "
-                    << fmap.size() << "); excluded " << dropped.size()
-                    << " MS1-level (var_ms1_*) to match the FEATURE_MS2 scope the sqlite path uses."
-                    << std::endl;
+    OPENMS_LOG_INFO << "OpenDIAlyzer: in-memory scoring found " << vkeys.size() << " VAR_ sub-scores ("
+                    << (use_ms1_scores ? "MS1+MS2 scope" : "MS2 scope; " + std::to_string(dropped.size())
+                                                           + " var_ms1_* excluded, -ms1_scores to include")
+                    << ") across " << probe << " probed features (of " << fmap.size() << ")." << std::endl;
     if (vkeys.empty()) { return R; }
 
     R.feats.reserve(fmap.size());
@@ -2318,8 +2363,19 @@ protected:
       // Wired here so that implementing either one needs no plumbing changes. Both no-op today and
       // say so once, rather than pretending the calibration is doing something it is not.
       {
-        const double mz_ms2 = inferMassAccuracyPpm_(swath_maps, irt.nonlinear_irt, rt_trafo, false);
-        const double mz_ms1 = inferMassAccuracyPpm_(swath_maps, irt.nonlinear_irt, rt_trafo, true);
+        // SAME DIRECTION RULE as calibrateMassFromPass_. res.rt_trafo is the calibration's output in
+        // OpenSWATH's convention -- RUN rt -> iRT (see the comment at the `native_trafo` declaration)
+        // -- while irt.nonlinear_irt's compound.rt values are library iRT. inferMassAccuracyPpm_ needs
+        // to go the other way: from a library rt to the RUN rt at which to look for the peak.
+        //
+        // Passing rt_trafo unmodified fed a run->iRT map a value already in iRT. The result is not a
+        // retention time, so the "nearest spectrum in time" search landed on an arbitrary spectrum and
+        // the peak search sampled interference -- the FLAT residual distribution this site has been
+        // reporting (peakedness 1.17 over 1066 MS2 anchors).
+        TransformationDescription mz_trafo = rt_trafo;
+        mz_trafo.invert();                                  // run -> iRT  becomes  iRT -> run
+        const double mz_ms2 = inferMassAccuracyPpm_(swath_maps, irt.nonlinear_irt, mz_trafo, false);
+        const double mz_ms1 = inferMassAccuracyPpm_(swath_maps, irt.nonlinear_irt, mz_trafo, true);
         if (mz_ms2 > 0.0) { inferred_mz_window_ms2_ = mz_ms2; }
         if (mz_ms1 > 0.0) { inferred_mz_window_ms1_ = mz_ms1; }
         if (mz_ms2 > 0.0 || mz_ms1 > 0.0)

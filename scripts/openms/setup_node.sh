@@ -64,6 +64,29 @@ if [[ ! -d $SRC/OpenMS ]]; then
   # Standing rule: never push to OpenMS.
   git -C "$SRC/OpenMS" remote set-url --push origin DISABLED_no_push
 fi
+# REFUSE TO DESTROY A DIRTY REFERENCE TREE.
+#
+# ext/ and this clone are gitignored, so uncommitted work here exists NOWHERE ELSE. An earlier
+# version of these lines ran `checkout -- .` + `clean -fd` unconditionally, and doing exactly that
+# by hand destroyed load-bearing uncommitted changes (ParquetFile's ChunkedColumn, without which a
+# >2 GB arrow string array silently truncates the library). It was recoverable only because a diff
+# happened to have been saved moments earlier.
+#
+# So: snapshot first, then abort unless the caller has explicitly opted in.
+if [[ -n $(git -C "$SRC/OpenMS" status --porcelain 2>/dev/null) ]]; then
+  SNAP="$SRC/openms-dirty-$(date +%Y%m%d-%H%M%S).diff"
+  git -C "$SRC/OpenMS" diff > "$SNAP" 2>/dev/null || true
+  git -C "$SRC/OpenMS" status --porcelain > "$SNAP.status" 2>/dev/null || true
+  if [[ ${FORCE_RESET_OPENMS:-0} != 1 ]]; then
+    echo "ERROR: $SRC/OpenMS has uncommitted changes." >&2
+    echo "  Snapshot written to $SNAP (+ .status)." >&2
+    echo "  Those changes exist nowhere else -- this clone is gitignored." >&2
+    echo "  Reconcile them into vendored-patches/ first (scripts/openms/regen-patch.sh)," >&2
+    echo "  or re-run with FORCE_RESET_OPENMS=1 to discard them deliberately." >&2
+    exit 1
+  fi
+  log "FORCE_RESET_OPENMS=1: discarding local OpenMS changes (snapshot at $SNAP)"
+fi
 git -C "$SRC/OpenMS" checkout --quiet "$OPENMS_REF"
 # Reset tracked AND untracked files: the patch adds new files, so a bare
 # `checkout -- .` leaves them behind and the next apply fails on re-run.

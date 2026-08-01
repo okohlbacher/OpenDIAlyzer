@@ -5,6 +5,9 @@ competing plan/status files, and no notion of which is current. This is the tabl
 
 ## Start here
 
+| [`OpenDIAlyzer-path-forward.md`](OpenDIAlyzer-path-forward.md) | **What to do next, and why in that order** |
+
+
 | Document | What it is |
 |---|---|
 | [`../README.md`](../README.md) | Why the project exists, and what it is not |
