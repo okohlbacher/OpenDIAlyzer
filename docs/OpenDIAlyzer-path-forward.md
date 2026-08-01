@@ -249,8 +249,23 @@ Extraction occupancy is **unchanged** (41.9 vs 40.8), so malloc is not the limit
 steady-state sample showed 123/224 and was not representative; the phase average supersedes it.)
 `MALLOC_ARENA_MAX=4` being >2x slower was a real effect read as evidence for the wrong cause.
 
-tcmalloc's actual effect is memory: less than half the RSS through extraction, at ~68% more
-extraction wall time. Candidate as a documented option for memory-constrained nodes, not a default.
+tcmalloc's actual effect is memory. Complete run, same input, same binary:
+
+| | glibc | tcmalloc | delta |
+|---|---:|---:|---:|
+| peak RSS | 189.4 GB | **105.8 GB** | **-44%** |
+| wall | 32:07.65 | 38:58.74 | +21% |
+| user CPU | 53195 s | 71298 s | +34% |
+| sys CPU | 5466 s | 6347 s | +16% |
+| IDs @ q<0.01 | 6433 | 6417 | none |
+
+44% off the peak for 21% more wall time and identical IDs. Document as an `LD_PRELOAD` option for
+memory-constrained nodes -- 189 GB needs a large node, 106 GB fits most of the cluster -- not a
+default, since wall time is what the tool optimises.
+
+Caveat not yet separated: glibc's peak lands in the un-phased gap, where the ~150M-allocation
+`mem/component` walk also lived. Part of that 189 GB may have been the diagnostic itself. The `gap`
+run (walk gated off, gap accounting on) settles it.
 
 ### The live candidate: batch granularity
 
