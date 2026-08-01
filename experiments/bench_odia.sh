@@ -22,6 +22,15 @@ cd "$ROOT"
 # Fail loudly at load time rather than 20 minutes later with an empty log.
 ldd "$ROOT/bin/OpenDIAlyzer" | grep -q "not found" && { echo "FATAL: unresolved libs" >&2; ldd "$ROOT/bin/OpenDIAlyzer" | grep "not found" >&2; exit 1; }
 
+# Record who else is on the node. Two runs of the SAME configuration came out 576 s and 824 s
+# because the node acquired four other users mid-session, and that was only noticed by chance.
+# A timing number without the load it was taken under is not a measurement.
+{
+  echo "== node conditions at start =="
+  uptime
+  ps -eo user,pcpu,comm --sort=-pcpu | awk 'NR<=6'
+} > "$OUT/$TAG.nodeload.txt" 2>&1
+
 # -in from /scratch (nvram), tempDirectory likewise: the zip must not unpack to a spinning fs.
 /usr/bin/time -v "$ROOT/bin/OpenDIAlyzer" \
   -in bench/astral.mzML -tr bench/library_ids.oswpq \
@@ -30,4 +39,6 @@ ldd "$ROOT/bin/OpenDIAlyzer" | grep -q "not found" && { echo "FATAL: unresolved 
   -classifier gbt -tempDirectory "$ROOT/tmp" \
   $EXTRA_ARGS \
   -out "$OUT/$TAG.oswpq" > "$OUT/$TAG.oswpq.log" 2>&1
-echo "### $TAG exit $? (extra: ${EXTRA_ARGS:-none})"
+rc=$?
+{ echo "== node conditions at end =="; uptime; } >> "$OUT/$TAG.nodeload.txt" 2>&1
+echo "### $TAG exit $rc (extra: ${EXTRA_ARGS:-none}) load: $(uptime | sed 's/.*average: //')"
