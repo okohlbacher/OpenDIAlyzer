@@ -165,7 +165,7 @@ index 10b4280..e993e72 100644
      }
  
 diff --git a/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp b/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
-index 2167591..6c97e31 100644
+index 2167591..d149f4a 100644
 --- a/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
 +++ b/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
 @@ -7,6 +7,10 @@
@@ -232,15 +232,19 @@ index 2167591..6c97e31 100644
  namespace OpenMS
  {
    namespace
-@@ -321,6 +371,7 @@ namespace OpenMS
- 
-       writeOutFeaturesAndChroms_(filtered_chroms, empty_ms1_chromatograms, featureFile, out_featureFile, store_features, chromConsumer);
-       this->endProgress();
-+    reportRegions_("performExtraction");
-       return;
-     }
- 
-@@ -656,8 +707,72 @@ namespace OpenMS
+@@ -298,6 +348,11 @@ namespace OpenMS
+     int innerBatchSize,
+     int maxConcurrentSwaths)
+   {
++    // RAII, not a call before a return. performExtraction has several exit paths and two
++    // hand-placed reports both landed on ones ODIA never takes -- the run completed with the
++    // profile silently unprinted. A guard cannot be put on the wrong path.
++    struct RegionReport { ~RegionReport() { reportRegions_("performExtraction"); } } _region_report;
++    (void)_region_report;
+     // Suppress repeated resampling-spacing warnings for this workflow call
+     // only, so embedded use does not affect later resampling in the process.
+     Internal::ScopedResamplingWarningSuppression scoped_resampling_warning_suppression;
+@@ -656,8 +711,72 @@ namespace OpenMS
  
          prepareExtractionCoordinates_(chrom_list, coordinates, context.transition_exp_used_all, trafo_inverse, cp);
  
@@ -315,7 +319,7 @@ index 2167591..6c97e31 100644
  
          extractor.return_chromatogram(chrom_list, coordinates, context.transition_exp_used_all, SpectrumSettings(),
                                        context.chrom_exp.getChromatograms(), false, cp.im_extraction_window);
-@@ -1096,8 +1211,9 @@ namespace OpenMS
+@@ -1096,8 +1215,9 @@ namespace OpenMS
              if (ms1_map_ != nullptr)
              {
                OpenSwath::SpectrumAccessPtr threadsafe_ms1 = ms1_map_->lightClone();
@@ -326,7 +330,7 @@ index 2167591..6c97e31 100644
              }
  
              // Step 2.1: extract these transitions
-@@ -1109,29 +1225,34 @@ namespace OpenMS
+@@ -1109,29 +1229,34 @@ namespace OpenMS
              // chrom_list contains one entry for each fragment ion (transition) in transition_exp_used
              prepareExtractionCoordinates_(chrom_list, coordinates, transition_exp_used, trafo_inverse, cp);
  
