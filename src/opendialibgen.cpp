@@ -741,6 +741,37 @@ int main(int argc, char** argv)
   try { tsv = generate(precursors, model_dir, threads, pc); }
   catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
 
+  // A predicted library is only interpretable together with the conditions it was predicted at,
+  // and nothing downstream records them: the parquet metadata.json carries generator, counts and
+  // fragment types, but no NCE, no instrument, no model. Asked "was this library built for the
+  // instrument we are searching?", the honest answer for every library shipped so far is that it
+  // cannot be told from the file. Sidecar, because the parquet metadata belongs to OpenMS.
+  {
+    static const char* const kInstrNames[] = {"QE", "Lumos", "timsTOF", "SciexTOF", "ThermoTOF"};
+    const char* iname = (pc.instrument >= 0 && pc.instrument < 5)
+                        ? kInstrNames[pc.instrument] : "unknown";
+    const std::string prov = out_path + ".provenance.json";
+    std::ofstream o(prov, std::ios::binary);
+    if (o)
+    {
+      o << "{\n  \"generator\": \"OpenDIALibGen\",\n"
+        << "  \"prediction\": {\n"
+        << "    \"nce\": " << pc.nce << ",\n"
+        << "    \"instrument\": \"" << iname << "\",\n"
+        << "    \"instrument_index\": " << pc.instrument << ",\n"
+        << "    \"model_dir\": \"" << model_dir << "\"\n  },\n"
+        << "  \"digest\": { \"missed_cleavages\": " << dig.missed
+        << ", \"min_len\": " << dig.min_len << ", \"max_len\": " << dig.max_len
+        << ", \"min_charge\": " << dig.min_charge << ", \"max_charge\": " << dig.max_charge
+        << " },\n  \"decoys\": " << (decoys ? "true" : "false") << "\n}\n";
+      std::printf("prediction conditions -> %s\n", prov.c_str());
+    }
+    else
+    {
+      std::fprintf(stderr, "warning: could not write %s\n", prov.c_str());
+    }
+  }
+
   if (raw || fasta_path.empty())
   {
     // Stage 1 semantics, or -raw: write the raw target transitions as-is.
