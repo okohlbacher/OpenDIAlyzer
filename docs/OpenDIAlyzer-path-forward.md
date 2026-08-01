@@ -83,6 +83,33 @@ Two things this also exposes, independent of the outcome:
   observed NCE needs no new dependency — but that is an optimisation to consider *after* the
   correlation test says the mismatch matters.
 
+## Decided against: hand-rolling a replacement for `TransitionParquetFile`
+
+The compact reader loads the same library in 15.0 s against the OpenMS reader's 144.8 s, so
+replacing the production loader looks obvious. It was attempted and abandoned, deliberately.
+
+Producing a `LightTargetedExperiment` requires reimplementing that reader's whole field mapping:
+modification parsing (`(UniMod:4)` -> `compound.modifications`), the TraML-id fallback that decoy
+pairing depends on, `/`-separated accession splitting, decoy flags, fragment types, and the
+detecting/identifying/quantifying flags. A subtle mismatch anywhere produces a library that is
+WRONG BUT STILL RUNS, and still emits q-values.
+
+The arithmetic does not support that risk:
+
+| | |
+|---|---|
+| gain | 145 s of a 1,903 s run (**4%**); ~6 GB transient of a 186 GB peak (**3%**) |
+| risk | silent corruption of the most load-bearing structure in the tool |
+| meanwhile | **extraction is 65% of wall and 90% of CPU** |
+
+The compact representation's value is real but it is realised by the pipeline NOT materialising
+`LightTargetedExperiment` for all 7.1M precursors -- only for the ~5.7% that survive prefiltering.
+That is a pipeline change, not a loader swap, and it should be judged after extraction is fixed,
+because extraction dominates everything else.
+
+`-compact_probe` stays: it is the measurement that quantified the representation (1.94 GB vs
+16.70 GB; 0.07 GB retained vs 11.29 GB) and it costs nothing to keep.
+
 ## Phase 2 — memory, gated on Phase 0.2
 
 Do not start until the phase-resolved measurement names the dominant term. If it is chromatograms,

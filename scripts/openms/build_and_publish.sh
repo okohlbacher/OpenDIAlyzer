@@ -29,7 +29,22 @@ ssh -o BatchMode=yes -J "$JUMP" "$BUILD_NODE" "
     echo 'BUILD FAILED -- nothing published' >&2; exit 1
   fi
   cd $ROOT && ./odia-build/OpenDIAlyzer -selftest 2>&1 | grep -iE 'selftest (OK|FAILED)'
+  # PROVE the artifact contains what was built. Three separate silent failures on 2026-08-01 gave a
+  # 'published, selftest OK' toolchain that did NOT contain the change about to be benchmarked:
+  #   * cmake --install blocked by a chmod a-w lock, swallowed by >/dev/null
+  #   * cp to the run node refused with 'Text file busy'
+  #   * an untracked header (PeptDeepModX.h) removed by a git clean, hidden by incremental build
+  # -selftest passes through all of them: it exercises RT transforms, not the code under test.
+  if [ -n '${VERIFY_SYMBOL:-}' ]; then
+    N=\$(nm -DC $ROOT/openms/lib/libOpenMS.so 2>/dev/null | grep -c '${VERIFY_SYMBOL:-__none__}' || true)
+    echo \"  VERIFY_SYMBOL '${VERIFY_SYMBOL:-}' -> \$N matches\"
+    if [ \"\$N\" -lt 1 ]; then echo '  ABSENT - refusing to publish' >&2; exit 1; fi
+  fi
   echo '== publishing to Ceph =='
+  # BOTH artifacts. Publishing only the ODIA binary is how a libOpenMS-side fix reached a
+  # 'verified' publish and then failed to reach the run node: the binary was new, the library was
+  # four hours old, and every check passed because they were checks on the binary.
+  rsync -a --delete $ROOT/openms/ $CEPH/openms/
   cp $ROOT/odia-build/OpenDIAlyzer $CEPH/bin/OpenDIAlyzer
   ls -l --time-style=+%Y-%m-%d\ %H:%M $CEPH/bin/OpenDIAlyzer
 "

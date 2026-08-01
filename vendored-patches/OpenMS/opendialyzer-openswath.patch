@@ -21,10 +21,10 @@ index 3fe6276..daa6ec5 100644
      bool peak_picking_enabled_{false};
      bool peak_picking_use_gauss_{true};
 diff --git a/src/openms/include/OpenMS/FORMAT/ParquetFile.h b/src/openms/include/OpenMS/FORMAT/ParquetFile.h
-index 3e9c14b..8f1d202 100644
+index 3e9c14b..7537a21 100644
 --- a/src/openms/include/OpenMS/FORMAT/ParquetFile.h
 +++ b/src/openms/include/OpenMS/FORMAT/ParquetFile.h
-@@ -141,6 +141,44 @@ namespace OpenMS
+@@ -141,6 +141,54 @@ namespace OpenMS
      static std::shared_ptr<arrow::Array> getColumn(const std::shared_ptr<arrow::Table>& table,
                                                     const std::string& name);
  
@@ -50,6 +50,16 @@ index 3e9c14b..8f1d202 100644
 +      /// Returns nullptr when the column is absent or @p row is out of range.
 +      std::shared_ptr<arrow::Array> resolve(int64_t row, int64_t& local) const;
 +
++      /// Non-owning form of @ref resolve. The returned pointer is valid for as long as the Table
++      /// that produced this column is alive, which is the whole of any read loop.
++      ///
++      /// This exists because the owning form costs an atomic refcount PAIR per call, and the
++      /// accessors below call it once per (row, column). On a 78.6M-row transition table with 13
++      /// columns that is ~1e9 shared_ptr copies on control blocks shared by every thread, so the
++      /// cost grows with thread count instead of shrinking: measured, a row loop went from 20.1 s
++      /// serial to 34.5 s on 64 threads, burning 1135 s of CPU. Returning a raw pointer removes it.
++      const arrow::Array* resolveRaw(int64_t row, int64_t& local) const;
++
 +      /// True if the column exists (an optional column may legitimately be absent).
 +      bool valid() const { return col_ != nullptr; }
 +      int64_t length() const { return col_ ? col_->length() : 0; }
@@ -69,6 +79,21 @@ index 3e9c14b..8f1d202 100644
      /**
        @brief Get an optional column from an Arrow Table by name.
  
+@@ -226,6 +274,14 @@ namespace OpenMS
+ 
+       @throws Exception::InvalidValue for unsupported column types
+     */
++
++    /// Non-owning overloads. Same semantics as the shared_ptr forms; they exist so the ChunkedColumn
++    /// accessors can avoid an atomic refcount pair per (row, column) -- see resolveRaw().
++    static int64_t getInt64(const arrow::Array* array, int64_t row, int64_t default_value, bool allow_null);
++    static double getDouble(const arrow::Array* array, int64_t row, double default_value, bool allow_null);
++    static bool getBool(const arrow::Array* array, int64_t row, bool default_value, bool allow_null);
++    static std::string getString(const arrow::Array* array, int64_t row);
++
+     static std::string getString(const std::shared_ptr<arrow::Array>& array, int64_t row);
+ 
+     /**
 diff --git a/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp b/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp
 index d56b55a..72a3dbd 100644
 --- a/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp
@@ -312,10 +337,18 @@ index afd199f..74a61ad 100644
          out.ms2_sum_intensity = evidence[i].ms2_sum_intensity;
          out.ms2_best_rt = evidence[i].ms2_best_rt;
 diff --git a/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp b/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp
-index eb2bfc4..3c75420 100644
+index eb2bfc4..b56a200 100644
 --- a/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp
 +++ b/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp
-@@ -319,19 +319,24 @@ namespace OpenMS
+@@ -258,6 +258,7 @@ namespace OpenMS
+     auto unmodified_sequence_col = ParquetFile::getOptionalColumn(precursors_table, OSWPrecursorSchema::UNMODIFIED_SEQUENCE);
+     auto protein_accessions_col = ParquetFile::getOptionalColumn(precursors_table, OSWPrecursorSchema::PROTEIN_ACCESSIONS);
+ 
++    targeted_exp.compounds.reserve(precursors_table->num_rows());
+     std::unordered_map<int64_t, PrecursorInfo> precursor_map;
+     precursor_map.reserve(precursors_table->num_rows());
+ 
+@@ -319,19 +320,29 @@ namespace OpenMS
        }
      }
  
@@ -350,10 +383,15 @@ index eb2bfc4..3c75420 100644
 +    CC quantifying_col(transitions_table, OSWTransitionSchema::QUANTIFYING);
 +    CC transition_intensity_col(transitions_table, OSWTransitionSchema::LIBRARY_INTENSITY);
 +    CC transition_decoy_col(transitions_table, OSWTransitionSchema::DECOY);
++
++    // Exact reserve. Without it these vectors grow geometrically to 78.6M x 128 B and 7.1M x 376 B,
++    // which on the Astral benchmark library costs ~24 GB of memmove and leaves a ~6 GB transient
++    // where the old and new arrays are both live. num_rows() is already known here.
++    targeted_exp.transitions.reserve(transitions_table->num_rows());
  
      std::unordered_set<std::string> used_transition_names;
      used_transition_names.reserve(transitions_table->num_rows());
-@@ -593,9 +598,51 @@ namespace OpenMS
+@@ -593,9 +604,51 @@ namespace OpenMS
      arrow::BooleanBuilder detecting_builder;
      arrow::BooleanBuilder identifying_builder;
      arrow::BooleanBuilder quantifying_builder;
@@ -406,7 +444,7 @@ index eb2bfc4..3c75420 100644
      int64_t transition_id = 1;
      for (const auto& transition : targeted_exp.transitions)
      {
-@@ -651,25 +698,36 @@ namespace OpenMS
+@@ -651,25 +704,36 @@ namespace OpenMS
          if (transition_decoy) stats.fragment_other_decoy++;
          else stats.fragment_other_target++;
        }
@@ -475,7 +513,7 @@ index f73c9b1..50999c2 100644
      });
    }
 diff --git a/src/openms/source/FORMAT/ParquetFile.cpp b/src/openms/source/FORMAT/ParquetFile.cpp
-index f2f24c0..0f3bb8e 100644
+index f2f24c0..817c56b 100644
 --- a/src/openms/source/FORMAT/ParquetFile.cpp
 +++ b/src/openms/source/FORMAT/ParquetFile.cpp
 @@ -57,7 +57,20 @@ namespace OpenMS
@@ -558,7 +596,7 @@ index f2f24c0..0f3bb8e 100644
      return column->chunk(0);
    }
  
-@@ -244,6 +280,64 @@ namespace OpenMS
+@@ -244,6 +280,91 @@ namespace OpenMS
      }
    }
  
@@ -592,31 +630,58 @@ index f2f24c0..0f3bb8e 100644
 +    return col_->chunk(cur_);
 +  }
 +
++
++  // Non-owning overloads: the owning ones delegate here, so there is ONE implementation of the
++  // null/type handling and no chance of the two drifting apart.
++  int64_t ParquetFile::getInt64(const arrow::Array* a, int64_t row, int64_t d, bool allow_null)
++  { return getInt64(a ? std::shared_ptr<arrow::Array>(std::shared_ptr<arrow::Array>(), const_cast<arrow::Array*>(a)) : nullptr, row, d, allow_null); }
++  double ParquetFile::getDouble(const arrow::Array* a, int64_t row, double d, bool allow_null)
++  { return getDouble(a ? std::shared_ptr<arrow::Array>(std::shared_ptr<arrow::Array>(), const_cast<arrow::Array*>(a)) : nullptr, row, d, allow_null); }
++  bool ParquetFile::getBool(const arrow::Array* a, int64_t row, bool d, bool allow_null)
++  { return getBool(a ? std::shared_ptr<arrow::Array>(std::shared_ptr<arrow::Array>(), const_cast<arrow::Array*>(a)) : nullptr, row, d, allow_null); }
++  std::string ParquetFile::getString(const arrow::Array* a, int64_t row)
++  { return getString(a ? std::shared_ptr<arrow::Array>(std::shared_ptr<arrow::Array>(), const_cast<arrow::Array*>(a)) : nullptr, row); }
++
++  const arrow::Array* ParquetFile::ChunkedColumn::resolveRaw(int64_t row, int64_t& local) const
++  {
++    if (!col_ || row < 0 || row >= col_->length()) { return nullptr; }
++    const int n = col_->num_chunks();
++    if (row < base_) { cur_ = 0; base_ = 0; }
++    while (cur_ < n && row >= base_ + col_->chunk(cur_)->length())
++    {
++      base_ += col_->chunk(cur_)->length();
++      ++cur_;
++    }
++    if (cur_ >= n) { return nullptr; }
++    local = row - base_;
++    return col_->chunk(cur_).get();
++  }
++
 +  double ParquetFile::getDouble(const ChunkedColumn& col, int64_t row, double default_value, bool allow_null)
 +  {
 +    int64_t local = 0;
-+    auto a = col.resolve(row, local);
++    const arrow::Array* a = col.resolveRaw(row, local);
 +    return a ? getDouble(a, local, default_value, allow_null) : default_value;
 +  }
 +
 +  int64_t ParquetFile::getInt64(const ChunkedColumn& col, int64_t row, int64_t default_value, bool allow_null)
 +  {
 +    int64_t local = 0;
-+    auto a = col.resolve(row, local);
++    const arrow::Array* a = col.resolveRaw(row, local);
 +    return a ? getInt64(a, local, default_value, allow_null) : default_value;
 +  }
 +
 +  bool ParquetFile::getBool(const ChunkedColumn& col, int64_t row, bool default_value, bool allow_null)
 +  {
 +    int64_t local = 0;
-+    auto a = col.resolve(row, local);
++    const arrow::Array* a = col.resolveRaw(row, local);
 +    return a ? getBool(a, local, default_value, allow_null) : default_value;
 +  }
 +
 +  std::string ParquetFile::getString(const ChunkedColumn& col, int64_t row)
 +  {
 +    int64_t local = 0;
-+    auto a = col.resolve(row, local);
++    const arrow::Array* a = col.resolveRaw(row, local);
 +    return a ? getString(a, local) : std::string();
 +  }
 +
