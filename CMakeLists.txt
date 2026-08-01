@@ -59,6 +59,13 @@ add_executable(odia-chromatogram-test src/odia_chromatogram_test.cpp)
 # bring its own RNG and threading into a path that must stay deterministic (it feeds an FDR).
 add_executable(odia-gbt-test src/odia_gbt_test.cpp)
 
+# Interned/substring sequence storage, and the library object graph built on it. Header-only and
+# dependency-free like the other kernels. These exist because a phase-resolved memory probe showed
+# 83% of peak RSS was glibc arena fragmentation from ~471M string allocations, not any data
+# structure -- a peptide is a substring of its protein and needs no characters of its own.
+add_executable(odia-seqstore-test src/odia_seqstore_test.cpp)
+add_executable(odia-library-test src/odia_library_test.cpp)
+
 # The semi-supervised loop on a REAL score matrix (44,568 peak groups x 29 sub-scores extracted
 # from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
 # rather than failed when testdata/lda_fixture.txt is absent, so a clone without it still passes.
@@ -148,6 +155,8 @@ add_test(NAME odia-lda-adversarial COMMAND odia-lda-adversarial-test)
 add_test(NAME odia-fdr COMMAND odia-fdr-test)
 add_test(NAME odia-chromatogram COMMAND odia-chromatogram-test)
 add_test(NAME odia-gbt COMMAND odia-gbt-test)
+add_test(NAME odia-seqstore COMMAND odia-seqstore-test)
+add_test(NAME odia-library COMMAND odia-library-test)
 add_test(NAME odia-gbt-serial COMMAND odia-gbt-test-serial)
 add_test(NAME odia-lda-realdata
          COMMAND odia-lda-realdata-test "${CMAKE_CURRENT_SOURCE_DIR}/testdata/lda_fixture.txt")

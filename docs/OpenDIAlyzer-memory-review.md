@@ -251,3 +251,77 @@ code. There is a real candidate for a genuine slowdown — the exact-reserve cha
 metadata pass over every spectrum (`getSpectrumMetaById`) before extraction, and under streaming
 access that may not be free — but this measurement cannot separate the two. Re-run on an idle node
 before concluding anything.
+
+---
+
+# 7. ANSWERED: 83% of peak RSS is allocator fragmentation, not data
+
+Measured 2026-08-01 on `spock` (224 cores, **load 0.95, other-user CPU 6%** — the first uncontended
+node used in this project), with a 5 Hz RSS sampler attributing every sample to the active phase,
+`mallinfo2` at five checkpoints, and explicit component sizing.
+
+Section 2's model, and every ranked list derived from it, was wrong. Section 6 already refuted it
+with an A/B; this identifies what the real term is.
+
+## Peak RSS by phase
+
+| phase | peak RSS |
+|---|---:|
+| **(outside any phase) — extraction** | **186.28 GB** ← global peak |
+| classifier_fit_gbt | 184.25 GB |
+| score_load | 184.22 GB |
+| write_scores | 184.12 GB |
+| context_fdr | 175.37 GB |
+| prefilter (all sub-phases) | 55.6–66.5 GB |
+| library_load | 45.78 GB |
+| dia_run_load | 44.97 GB |
+| precursor_index | 35.73 GB |
+
+## The allocator, start to finish
+
+| checkpoint | in_use | **retained** | mmapped | arena | RSS |
+|---|---:|---:|---:|---:|---:|
+| startup | 0.00 | 0.00 | 0.00 | 0.00 | 0.06 |
+| after `library_load` | 7.92 | **11.29** | 18.94 | 19.20 | 38.79 |
+| after `prefilter` | 10.32 | **28.69** | 0.00 | 39.01 | 35.73 |
+| before `score_load` | 32.88 | **153.32** | 0.58 | 186.20 | 184.22 |
+| final | 22.59 | **163.50** | 0.58 | 186.08 | 175.23 |
+
+**Live data never exceeds ~33 GB. The arena grows to 186 GB and never shrinks.** At the end,
+163.50 GB is freed-but-unreturnable against 22.59 GB live — **88% debris**. What this project has
+been calling "peak RSS" is cumulative fragmentation.
+
+## Every previously suspected term, measured
+
+| suspected term | measured |
+|---|---|
+| chromatograms | **0.58 GB** (`mmapped` — glibc returns large blocks; they were never the problem) |
+| the library | 38.79 GB at load, **1.73 GB live after prefilter** |
+| feature map | 2,070,089 features, 0.57 GB in `Feature` objects |
+| **allocator retention** | **153–164 GB** |
+
+This is why cutting 62% of the chromatogram term moved peak by 4.6% (section 6): the term was 0.3%
+of peak.
+
+## Where the churn comes from
+
+- **Library load: ~471 million allocations.** 78,569,077 transitions x (3 `getString` + 2 string
+  copies + 1 hash-set insert). `peptide_ref` alone is 78.6M copies of ~7.1M distinct values, an 11x
+  duplication that the parquet source stored dictionary-encoded, i.e. once.
+- **Scoring: 113,854,895 meta values** on 2.07M features, each a string key plus a `DataValue`.
+
+Neither is a large *quantity* of data. Both are enormous *counts* of small allocations, which is
+what fragments an arena.
+
+## Consequences for the plan
+
+1. `ChromatogramStore` integration cannot deliver a large memory win: its target is 0.58 GB and
+   already returned to the OS. Its 4.09x figure was computed against the refuted decomposition.
+2. The structural fix is to stop making hundreds of millions of small allocations —
+   `src/odia_seqstore.h` + `src/odia_library.h`, where a peptide is a (protein, offset, length)
+   span into its FASTA sequence and costs no characters of its own. Measured 5.3x smaller on a
+   proteome-scale model with 100% of peptides stored as substrings.
+3. **Test the free lever first:** glibc allocates up to 8 x ncores arenas (1,792 here), each
+   fragmenting independently. `MALLOC_ARENA_MAX` is an environment variable, not a refactor.
+4. Extraction is the only phase still uninstrumented (it is inside OpenMS's `performExtraction`),
+   and it holds the global peak. That is where the next timer goes.

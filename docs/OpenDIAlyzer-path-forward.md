@@ -59,6 +59,30 @@ is what three earlier mass-calibration fixes did.
 (`library_rt`; `native_trafo` at *two* call sites). `LibraryToRun` / `RunToLibrary` as distinct
 types makes the class unrepresentable rather than fixed case by case.
 
+**1.5 Library fragment intensities may be predicted for the wrong collision energy.** Four of the
+24 sub-scores are library-correlation terms (`var_library_corr`, `_dotprod`, `_manhattan`,
+`_sangle`); they can only be as good as the library's predicted intensities. The AlphaPeptDeep MS2
+model is conditioned on (charge, **NCE**, **instrument**), and:
+
+| | value | status |
+|---|---|---|
+| benchmark run | Orbitrap Astral (`MS:1003378`), beam-type CID, **collision energy 25.0** | **verified from the mzML** |
+| OpenDIALibGen default | **NCE 30.0**, instrument `QE` | verified in `docs/OpenDIALibGen.md` |
+| the 7.1M library actually used | unknown | **NOT verified** — the `.oswpq` metadata records the OpenMS converter, not the prediction parameters |
+
+So the premise is half-established and must not be built on. **The decisive test needs no search
+and no library rebuild**: take the confident IDs, and compare their observed fragment intensities
+against PeptDeep predictions at NCE 25 vs NCE 30 (Astral vs QE). Whichever correlates better is the
+answer, measured directly. Only if 25/Astral wins is re-predicting the library worth its cost.
+
+Two things this also exposes, independent of the outcome:
+- **The library format does not record how it was predicted.** A predicted library whose NCE and
+  instrument are unrecoverable cannot be validated against the run it is used on. Whatever is
+  decided here, `OpenDIALibGen` should write NCE/instrument/model-version into the bundle metadata.
+- `PeptDeepMS2Inference::predictMS2` is callable at search time, so per-run re-prediction at the
+  observed NCE needs no new dependency — but that is an optimisation to consider *after* the
+  correlation test says the mismatch matters.
+
 ## Phase 2 — memory, gated on Phase 0.2
 
 Do not start until the phase-resolved measurement names the dominant term. If it is chromatograms,
