@@ -72,8 +72,29 @@ namespace
 // Collision energy read from the run itself (analysis.tdf, DiaFrameMsMsWindows):
 // 25.84 - 46.77 eV, mean 35.43, ramped with ion mobility as diaPASEF does.
 // Use the mean; a grid search over NCE is the refinement if it matters.
+// These are properties of the RUN being searched, not of this program, so they are
+// options with the agxt/timsTOF values as defaults -- baking them into the binary
+// silently predicted Bruker spectra for every other instrument.
 constexpr float kNCE = 35.0f;
 constexpr int64_t kInstrument = 2; // timsTOF (peptdeep model_const.yaml)
+
+struct PredConds
+{
+  float nce = kNCE;
+  int64_t instrument = kInstrument;
+};
+
+/// peptdeep model_const.yaml order; 7 = unknown.
+int64_t instrumentIndex(const std::string& name)
+{
+  static const std::vector<std::string> kNames = {"QE", "Lumos", "timsTOF", "SciexTOF", "ThermoTOF"};
+  for (std::size_t i = 0; i < kNames.size(); ++i)
+  {
+    if (name == kNames[i]) return static_cast<int64_t>(i);
+  }
+  if (name == "unknown") return 7;
+  return -1;                                  // caller reports; never guess an embedding
+}
 
 // PeptDeep MS2 output layout (from PeptDeepInference_test and the reference
 // CSV's fragment_position/ion_index/ion_type columns): per peptide a flat
@@ -169,7 +190,7 @@ std::vector<std::string> peptidoforms(const std::string& base, const ModPolicy& 
 // The whole pipeline, into a string so --selftest can diff two runs for the
 // byte-identical-output requirement without touching the filesystem.
 std::string generate(const std::vector<Precursor>& precursors,
-                     const std::string& model_dir, int threads)
+                     const std::string& model_dir, int threads, PredConds pc = {})
 {
   // Predict from the (possibly modified) AASequences. mod_x is populated by the
   // vendored P2 patch, so predictions reflect the modifications. An unmodified
@@ -182,8 +203,8 @@ std::string generate(const std::vector<Precursor>& precursors,
   {
     aaseqs.push_back(OpenMS::AASequence::fromString(p.modseq.empty() ? p.sequence : p.modseq));
     charges.push_back(static_cast<float>(p.charge));
-    nces.push_back(kNCE);
-    instruments.push_back(kInstrument);
+    nces.push_back(pc.nce);
+    instruments.push_back(pc.instrument);
   }
 
   OpenMS::PeptDeepRTInference rt_model(model_dir + "/peptdeep_rt_dynamic.onnx", threads);
@@ -651,6 +672,7 @@ int main(int argc, char** argv)
   std::string in_path, fasta_path, out_path, model_dir;
   int threads = 1; // explicit, never omp_get_max_threads(); 1 = deterministic default
   bool do_selftest = false, raw = false, decoys = true;
+  PredConds pc;
   DigestOpts dig;
   ModPolicy mods;
 
@@ -663,6 +685,18 @@ int main(int argc, char** argv)
     else if (a == "-out" && i + 1 < argc) out_path = argv[++i];
     else if (a == "-model_dir" && i + 1 < argc) model_dir = argv[++i];
     else if (a == "-threads" && i + 1 < argc) threads = std::atoi(argv[++i]);
+    else if (a == "-nce" && i + 1 < argc) pc.nce = static_cast<float>(std::atof(argv[++i]));
+    else if (a == "-instrument" && i + 1 < argc)
+    {
+      const std::string name = argv[++i];
+      pc.instrument = instrumentIndex(name);
+      if (pc.instrument < 0)
+      {
+        std::fprintf(stderr, "error: -instrument '%s' is not one of "
+                             "QE, Lumos, timsTOF, SciexTOF, ThermoTOF, unknown\n", name.c_str());
+        return 1;
+      }
+    }
     else if (a == "-missed_cleavages" && i + 1 < argc) dig.missed = std::atoi(argv[++i]);
     else if (a == "-min_len" && i + 1 < argc) dig.min_len = std::atoi(argv[++i]);
     else if (a == "-max_len" && i + 1 < argc) dig.max_len = std::atoi(argv[++i]);
@@ -688,6 +722,8 @@ int main(int argc, char** argv)
                  "                   [-missed_cleavages 1] [-min_len 7] [-max_len 30]\n"
                  "                   [-min_charge 2] [-max_charge 3] [-no_decoys] [-raw] [-threads N]\n"
                  "         selftest: OpenDIALibGen --selftest -model_dir <dir> [-threads N]\n"
+                 "  prediction conditions: [-nce F (default 35)] [-instrument NAME (default timsTOF;\n"
+                 "                         QE|Lumos|timsTOF|SciexTOF|ThermoTOF|unknown)]\n"
                  "model_dir must contain peptdeep_rt_dynamic.onnx and peptdeep_ms2_dynamic.onnx\n");
     return 2;
   }
@@ -702,7 +738,7 @@ int main(int argc, char** argv)
   else if (read_precursors(in_path.c_str(), precursors) != 0) return 1;
 
   std::string tsv;
-  try { tsv = generate(precursors, model_dir, threads); }
+  try { tsv = generate(precursors, model_dir, threads, pc); }
   catch (const std::exception& e) { std::fprintf(stderr, "error: %s\n", e.what()); return 1; }
 
   if (raw || fasta_path.empty())
