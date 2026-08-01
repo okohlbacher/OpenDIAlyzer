@@ -3447,8 +3447,24 @@ protected:
         // calibrate from; and after native_trafo is updated, because inferMassAccuracyPpm_ uses the
         // transform to locate each anchor's spectra and the pre-update value belongs to the previous
         // pass. An earlier version of this call had both wrong.
-        calibrateMassFromPass_(swath_maps, transition_exp,
-                               use_native_trafo ? native_trafo : identity);
+        // DIRECTION MATTERS, and it is not the transform handed to OpenMS. native_trafo is
+        // run RT -> iRT (the convention OpenMS wants, line ~3262) and on this path the library is
+        // deliberately kept in iRT units. inferMassAccuracyPpm_ starts from a LIBRARY rt and needs
+        // the RUN rt at which to look for the peak, i.e. iRT -> run: the INVERSE.
+        //
+        // Applying native_trafo directly fed a run->iRT map an iRT value. The result is not a
+        // retention time at all, so "nearest spectrum in time" picked an arbitrary spectrum and
+        // "most intense peak within the window" then sampled interference -- which is exactly the
+        // FLAT residual distribution the peakedness gate kept reporting (1.17 over 1066 anchors).
+        // On the fallback path the library was already rescaled into run seconds, so identity is
+        // still correct there.
+        TransformationDescription mass_cal_trafo = identity;
+        if (use_native_trafo)
+        {
+          mass_cal_trafo = native_trafo;
+          mass_cal_trafo.invert();                 // run -> iRT  becomes  iRT -> run
+        }
+        calibrateMassFromPass_(swath_maps, transition_exp, mass_cal_trafo);
         // Diagnostic only: this is the IN-SAMPLE anchor residual (small); it is NOT the
         // predictive residual on unseen peptides, so it must NOT auto-size the window
         // (would collapse it and lose unseen precursors). Window sizing stays fixed until a

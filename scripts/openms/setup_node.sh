@@ -2,7 +2,7 @@
 # Build the full OpenDIAlyzer stack (deps -> OpenMS -> OpenDIAlyzer) on a bare
 # IBMI node, so no single node is a prerequisite for the project.
 #
-#   ssh <node> 'bash -s' < experiments/setup_node.sh
+#   ssh <node> 'bash -s' < scripts/openms/setup_node.sh
 #
 # Everything lands in /scratch/<user> (node-local, fast) -- NEVER /home, which is
 # at quota, and NEVER /ceph/ibmi/it, which is the IT department's tree. Final
@@ -56,8 +56,8 @@ log "fetching sources"
 git -C "$SRC/OpenDIAlyzer" pull --quiet --ff-only || true
 
 OPENMS_REF=$(sed -n 's/^\*\*Base commit:\*\* `\([0-9a-f]*\)`.*/\1/p' \
-              "$SRC/OpenDIAlyzer/patches/README.md" | head -1)
-: "${OPENMS_REF:?could not read base commit from patches/README.md}"
+              "$SRC/OpenDIAlyzer/vendored-patches/README.md" | head -1)
+: "${OPENMS_REF:?could not read base commit from vendored-patches/README.md}"
 
 if [[ ! -d $SRC/OpenMS ]]; then
   git clone --quiet https://github.com/OpenMS/OpenMS.git "$SRC/OpenMS"
@@ -70,7 +70,10 @@ git -C "$SRC/OpenMS" checkout --quiet "$OPENMS_REF"
 git -C "$SRC/OpenMS" checkout --quiet -- .
 git -C "$SRC/OpenMS" clean --quiet -fd
 log "applying OpenDIAlyzer patches to OpenMS @ $OPENMS_REF"
-git -C "$SRC/OpenMS" apply "$SRC/OpenDIAlyzer/patches/openms-opendialyzer.patch"
+git -C "$SRC/OpenMS" apply "$SRC/OpenDIAlyzer/vendored-patches/OpenMS/opendialyzer-openswath.patch"
+git -C "$SRC/OpenMS" apply "$SRC/OpenDIAlyzer/vendored-patches/OpenMS/peptdeep-mod-support.patch"
+cp "$SRC/OpenDIAlyzer/vendored-patches/OpenMS/PeptDeepModX.h" \
+   "$SRC/OpenMS/src/openms/include/OpenMS/ML/PEPTDEEP/PeptDeepModX.h"
 
 # ---- 3. OpenMS ------------------------------------------------------------
 # Re-running is normal (the OpenDIAlyzer step below iterates), and reconfiguring

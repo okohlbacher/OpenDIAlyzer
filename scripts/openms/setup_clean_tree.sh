@@ -16,7 +16,7 @@ set -euo pipefail
 NODE=${NODE:-data}
 JUMP=${JUMP:-sshgw}
 ROOT=${ROOT:-/scratch/kohlbach}
-LOCAL=${LOCAL:-$(cd "$(dirname "$0")/.." && pwd)}
+LOCAL=${LOCAL:-$(cd "$(dirname "$0")/../.." && pwd)}
 
 echo "== syncing ODIA source (this tree only) =="
 rsync -a --delete -e "ssh -o BatchMode=yes -J $JUMP" \

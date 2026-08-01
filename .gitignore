@@ -19,3 +19,10 @@ data/
 
 # Recovered CC BY 4.0 DIA-NN 1.7.x source - documentation only, never copied
 ext/diann-cc-by/
+
+# Real-data test fixture: 18 MB extract (44,568 peak groups x 29 sub-scores) from an Astral run.
+# Deliberately NOT tracked -- it is large, permanent in history, and derived from run data.
+# odia-lda-realdata-test SKIPS (ctest code 77) when it is absent, so a clone still passes.
+# Regenerate by dumping FEATURE_MS2's VAR_ columns with the group id and decoy label; the format is
+# "nrows ncols" then one "group label f0..fN" line per row.
+testdata/lda_fixture.txt

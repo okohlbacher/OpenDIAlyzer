@@ -59,6 +59,26 @@ add_executable(odia-chromatogram-test src/odia_chromatogram_test.cpp)
 # bring its own RNG and threading into a path that must stay deterministic (it feeds an FDR).
 add_executable(odia-gbt-test src/odia_gbt_test.cpp)
 
+# The semi-supervised loop on a REAL score matrix (44,568 peak groups x 29 sub-scores extracted
+# from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
+# rather than failed when testdata/lda_fixture.txt is absent, so a clone without it still passes.
+add_executable(odia-lda-realdata-test src/odia_lda_realdata_test.cpp)
+
+# The kernels in odia_lda.h / odia_gbt.h contain `#pragma omp` regions. Without linking OpenMP,
+# _OPENMP is undefined, every pragma is ignored, and the tests that set n_threads = 1/8/64 run
+# THREE IDENTICAL SERIAL FITS -- reporting "bit-identical across thread counts" while never having
+# started a second thread. Link it, so the determinism claim is actually exercised.
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(odia-lda-test            PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(odia-lda-adversarial-test PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(odia-lda-realdata-test   PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(odia-gbt-test            PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+# The GBT's determinism guarantee is "the threaded result equals the serial one". That is only a
+# real assertion if a genuinely serial build exists to compare against, so build one explicitly.
+add_executable(odia-gbt-test-serial src/odia_gbt_test.cpp)
+
 # Stage-1 library generator: peptide list -> PeptDeep-predicted RT/MS2 ->
 # OpenSWATH transition TSV. Requires the ONNX-enabled OpenMS build
 # (-DOpenMS_DIR=.../openms-onnx/lib/cmake/OpenMS). The PeptDeep ONNX models
@@ -128,6 +148,10 @@ add_test(NAME odia-lda-adversarial COMMAND odia-lda-adversarial-test)
 add_test(NAME odia-fdr COMMAND odia-fdr-test)
 add_test(NAME odia-chromatogram COMMAND odia-chromatogram-test)
 add_test(NAME odia-gbt COMMAND odia-gbt-test)
+add_test(NAME odia-gbt-serial COMMAND odia-gbt-test-serial)
+add_test(NAME odia-lda-realdata
+         COMMAND odia-lda-realdata-test "${CMAKE_CURRENT_SOURCE_DIR}/testdata/lda_fixture.txt")
+set_tests_properties(odia-lda-realdata PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME OpenDIALibGen-selftest
          COMMAND OpenDIALibGen --selftest -model_dir "${OPENDIALIBGEN_MODEL_DIR}")
 add_test(NAME odia-modx-p2 COMMAND odia-modx-test)

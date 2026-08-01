@@ -22,7 +22,14 @@ int main(int argc, char** argv)
 {
   const char* path = argc > 1 ? argv[1] : "testdata/lda_fixture.txt";
   std::ifstream in(path);
-  if (!in) { std::fprintf(stderr, "cannot open %s\n", path); return 2; }
+  if (!in)
+  {
+    // 77 is ctest's SKIP_RETURN_CODE, set in CMakeLists. The fixture is an 18 MB extract from a
+    // real run and is not carried in the repository, so a fresh clone must SKIP this rather than
+    // fail: a red test nobody can make green gets ignored, and then so does the next one.
+    std::fprintf(stderr, "odia-lda-realdata: fixture %s not present -- skipping\n", path);
+    return 77;
+  }
   size_t n = 0, m = 0;
   in >> n >> m;
   std::string rest;

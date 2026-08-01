@@ -4,7 +4,7 @@
 #
 #   ssh <node> 'bash -s' < experiments/build_library_on_node.sh
 #
-# Assumes experiments/setup_node.sh has run (it writes $ROOT/odia-env.sh).
+# Assumes scripts/openms/setup_node.sh has run (it writes $ROOT/odia-env.sh).
 set -euo pipefail
 
 ROOT=${ROOT:-/scratch/$USER}

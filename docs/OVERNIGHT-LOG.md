@@ -927,12 +927,12 @@ the raw run.
 
 spock has been login-blocked ~a day, and every build recipe lived only there, so
 the project had a single point of failure. Rebuilt everything on `data` and
-captured the recipe as [experiments/setup_node.sh](../experiments/setup_node.sh)
+captured the recipe as [scripts/openms/setup_node.sh](../scripts/openms/setup_node.sh)
 so any bare IBMI node can be brought up with one command.
 
 Also captured the OpenMS changes, which were **uncommitted** and existed only on
 my Mac + spock (9 modified files + 1 new, 215 insertions), as
-`patches/openms-opendialyzer.patch` against base `d77542d`, with
+`vendored-patches/OpenMS/opendialyzer-openswath.patch` against base `d77542de65`, with
 `patches/README.md` explaining each hunk. `ext/` is gitignored, so this is now the
 only durable record of the OpenSwathWorkflow chunked-parallel extraction patch.
 

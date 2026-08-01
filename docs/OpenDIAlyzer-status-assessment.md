@@ -13,7 +13,7 @@ recorded. "Builds", "runs without crashing", and "looks right" are NOT proof.
 | All 24 isolation windows recovered | matches vendor `analysis.tdf` exactly (24 windows / 12 WindowGroups); was 12 before the fix |
 | Mobility banding is sound | `frame 232979 = windows 232835 + outside-any-window 144`, no double counting, 3/3 frames |
 | True window bounds tile exactly | `[0.5991, 0.8999]` and `[0.8999, 1.4007]` share the boundary, matching vendor scans `[34,602)`/`[602,944)` |
-| Stack rebuilds on a bare node | `experiments/setup_node.sh` + `patches/openms-opendialyzer.patch`; selftest passes |
+| Stack rebuilds on a bare node | `scripts/openms/setup_node.sh` + `vendored-patches/OpenMS/opendialyzer-openswath.patch`; selftest passes |
 | Tool runs end-to-end on Bruker `.d` diaPASEF | rc=0, 16,177 features from 3,574 precursors. **Does NOT generalise — see below** |
 
 ## BROKEN or FAILING — with the evidence

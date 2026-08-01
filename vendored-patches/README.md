@@ -1,5 +1,9 @@
 # Vendored OpenMS patches
 
+**Base commit:** `d77542de65` of <https://github.com/OpenMS/OpenMS>
+(never push to that remote; the local clone's push URL is deliberately disabled).
+`scripts/openms/setup_node.sh` parses this exact line, so keep the format.
+
 OpenDIALibGen builds against a **vendored, patched** OpenMS (the user's decision;
 see `vault/20-OpenSWATH/Vendored OpenMS patches.md`). `ext/OpenMS` is gitignored,
 so the patches themselves are tracked here and copied into the vendored tree.
@@ -15,8 +19,10 @@ To apply on a fresh OpenMS clone: copy `PeptDeepModX.h` into place, then
 root, then rebuild the `OpenMS` target.
 
 Build-system patches (P1 FindONNXRuntime module-path, curl brotli/zstd off) are
-described in the vault note; they are one-line changes applied at build time by
-`build_openms_onnx.sh` rather than tracked files.
+described in the vault note. They are one-line changes applied by hand at
+configure time and are NOT tracked here. (An earlier revision of this file
+attributed them to a `build_openms_onnx.sh` that does not exist in the
+repository -- if that script is recreated, list it here.)
 
 Still to come: wiring the validated featurization into `PeptDeepInputBuilder`
 (`buildModified*`) and the inference classes, which does require an OpenMS
@@ -32,11 +38,11 @@ git -C ext/OpenMS diff -- . ':(exclude)*PEPTDEEP*' > vendored-patches/OpenMS/ope
 
 `ext/OpenMS` is gitignored, so an edit to the OpenMS core otherwise leaves no trace in this
 repository. That is exactly how a set of ad-hoc modifications once accumulated undetected while the
-tracked patch documented only a subset. Verify the two agree with
-`git -C ext/OpenMS diff --stat`; any file listed there and absent here is undocumented drift.
+tracked patch documented only a subset. `scripts/openms/regen-patch.sh --check` fails if the tree and this patch disagree — run it before
+committing, so forgetting becomes a failed check rather than a silent loss.
 
 After a build, both the installed prefix and `ext/OpenMS/src` are `chmod -R a-w`
-(`experiments/setup_clean_tree.sh` checks this), so modifying the core requires a deliberate
+(`scripts/openms/setup_clean_tree.sh` checks this), so modifying the core requires a deliberate
 `chmod -R u+w`. **All OpenDIAlyzer code belongs in `src/`, never in the OpenMS tree.**
 
 | Change | Why |
