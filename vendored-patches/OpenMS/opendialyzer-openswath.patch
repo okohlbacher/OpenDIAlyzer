@@ -165,86 +165,19 @@ index 10b4280..e993e72 100644
      }
  
 diff --git a/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp b/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
-index 2167591..d149f4a 100644
+index 2167591..1e977e9 100644
 --- a/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
 +++ b/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
-@@ -7,6 +7,10 @@
+@@ -7,6 +7,8 @@
  // --------------------------------------------------------------------------
  
  #include <OpenMS/ANALYSIS/OPENSWATH/OpenSwathWorkflow.h>
-+#include <atomic>
-+#include <chrono>
 +
 +#include <cstdlib>   // getenv: OPENSWATH_MIN_COORDS_PER_CHUNK
  #include <OpenMS/ANALYSIS/OPENSWATH/CalibrationWorkflow.h>
  #include <OpenMS/ANALYSIS/OPENSWATH/OpenSwathWorkflowScheduler.h>
  #include <OpenMS/ANALYSIS/TARGETED/IChromatogramHandler.h>
-@@ -36,6 +40,52 @@
- 
- 
- // OpenSwathWorkflow
-+namespace
-+{
-+  // Region accounting INSIDE performExtraction. This phase is 65% of wall and 90% of CPU
-+  // (48,120 CPU-s measured) and has never been broken down: perf is blocked by
-+  // perf_event_paranoid=4 and gdb by ptrace_scope on the benchmark nodes, so an external profiler
-+  // is not available. Without this, every proposal about extraction is a guess -- and guessing at
-+  // this black box is exactly what made -readOptions cacheWorkingInMemory raise occupancy from
-+  // 38.9 to 97.8 cores while COSTING 2.4x the CPU.
-+  //
-+  // Thread-seconds, summed across the parallel loop, so the totals are directly comparable with
-+  // the process CPU-seconds the phase timers report.
-+  struct RegionAcc
-+  {
-+    std::atomic<double> secs{0.0};
-+    std::atomic<long long> calls{0};
-+    void add(double s) noexcept
-+    {
-+      double cur = secs.load(std::memory_order_relaxed);
-+      while (!secs.compare_exchange_weak(cur, cur + s, std::memory_order_relaxed)) {}
-+      calls.fetch_add(1, std::memory_order_relaxed);
-+    }
-+  };
-+  RegionAcc g_rgn_extract, g_rgn_convert, g_rgn_score, g_rgn_write, g_rgn_ms1;
-+
-+  struct ScopedRegion
-+  {
-+    RegionAcc& acc;
-+    std::chrono::steady_clock::time_point t0;
-+    explicit ScopedRegion(RegionAcc& a) : acc(a), t0(std::chrono::steady_clock::now()) {}
-+    ~ScopedRegion() { acc.add(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); }
-+  };
-+
-+  void reportRegions_(const char* where)
-+  {
-+    const double e = g_rgn_extract.secs.load(), c = g_rgn_convert.secs.load();
-+    const double s = g_rgn_score.secs.load(), w = g_rgn_write.secs.load(), m = g_rgn_ms1.secs.load();
-+    const double tot = e + c + s + w + m;
-+    OPENMS_LOG_INFO << "OpenSwathWorkflow[region] " << where << " thread-seconds: "
-+                    << "extractChromatograms " << e << " (" << g_rgn_extract.calls.load() << " calls), "
-+                    << "return_chromatogram " << c << ", "
-+                    << "scoreAllChromatograms " << s << ", "
-+                    << "writeOutFeatures " << w << ", "
-+                    << "MS1Extraction " << m << "; accounted " << tot << std::endl;
-+  }
-+}
-+
- namespace OpenMS
- {
-   namespace
-@@ -298,6 +348,11 @@ namespace OpenMS
-     int innerBatchSize,
-     int maxConcurrentSwaths)
-   {
-+    // RAII, not a call before a return. performExtraction has several exit paths and two
-+    // hand-placed reports both landed on ones ODIA never takes -- the run completed with the
-+    // profile silently unprinted. A guard cannot be put on the wrong path.
-+    struct RegionReport { ~RegionReport() { reportRegions_("performExtraction"); } } _region_report;
-+    (void)_region_report;
-     // Suppress repeated resampling-spacing warnings for this workflow call
-     // only, so embedded use does not affect later resampling in the process.
-     Internal::ScopedResamplingWarningSuppression scoped_resampling_warning_suppression;
-@@ -656,8 +711,72 @@ namespace OpenMS
+@@ -656,8 +658,72 @@ namespace OpenMS
  
          prepareExtractionCoordinates_(chrom_list, coordinates, context.transition_exp_used_all, trafo_inverse, cp);
  
@@ -319,57 +252,16 @@ index 2167591..d149f4a 100644
  
          extractor.return_chromatogram(chrom_list, coordinates, context.transition_exp_used_all, SpectrumSettings(),
                                        context.chrom_exp.getChromatograms(), false, cp.im_extraction_window);
-@@ -1096,8 +1215,9 @@ namespace OpenMS
-             if (ms1_map_ != nullptr)
-             {
-               OpenSwath::SpectrumAccessPtr threadsafe_ms1 = ms1_map_->lightClone();
-+              { ScopedRegion _r(g_rgn_ms1);
-               MS1Extraction_(threadsafe_ms1, swath_maps, ms1_chromatograms, ms1_cp,
--                  transition_exp_used, trafo_inverse, ms1_only, ms1_isotopes);
-+                  transition_exp_used, trafo_inverse, ms1_only, ms1_isotopes); }
-             }
- 
-             // Step 2.1: extract these transitions
-@@ -1109,29 +1229,34 @@ namespace OpenMS
-             // chrom_list contains one entry for each fragment ion (transition) in transition_exp_used
-             prepareExtractionCoordinates_(chrom_list, coordinates, transition_exp_used, trafo_inverse, cp);
- 
-+            { ScopedRegion _r(g_rgn_extract);
-             extractor.extractChromatograms(current_swath_map_inner, chrom_list, coordinates, cp.mz_extraction_window,
--                cp.ppm, cp.im_extraction_window, cp.extraction_function);
-+                cp.ppm, cp.im_extraction_window, cp.extraction_function); }
- 
-             // Step 2.3: convert chromatograms back to OpenMS::MSChromatogram and write to output
+@@ -1116,7 +1182,8 @@ namespace OpenMS
              PeakMap chrom_exp;
-+            { ScopedRegion _r(g_rgn_convert);
              extractor.return_chromatogram(chrom_list, coordinates, transition_exp_used,  SpectrumSettings(),
--                                          chrom_exp.getChromatograms(), false, cp.im_extraction_window);
+                                           chrom_exp.getChromatograms(), false, cp.im_extraction_window);
 -
-+                                          chrom_exp.getChromatograms(), false, cp.im_extraction_window); }
 +            chrom_list.clear();
 +            chrom_list.shrink_to_fit();
  
              // Step 3: score these extracted transitions
              FeatureMap featureFile;
-             std::vector< OpenSwath::SwathMap > tmp = {swath_maps[i]};
-             tmp.back().sptr = current_swath_map_inner;
-+            { ScopedRegion _r(g_rgn_score);
-             scoreAllChromatograms_(chrom_exp.getChromatograms(), ms1_chromatograms, tmp, transition_exp_used,
-               feature_finder_param, trafo, cp.rt_extraction_window, featureFile, osw_writer, ms1_isotopes, false,
--              mobilogram_consumer);
-+              mobilogram_consumer); }
- 
-             // Step 4: write all chromatograms and features out into an output object / file
-             // (this needs to be done in a critical section since we only have one
-             // output file and one output map).
-             #pragma omp critical (osw_write_out)
-             {
--              writeOutFeaturesAndChroms_(chrom_exp.getChromatograms(), ms1_chromatograms, featureFile, out_featureFile, store_features, chromConsumer);
-+              { ScopedRegion _r(g_rgn_write);
-+              writeOutFeaturesAndChroms_(chrom_exp.getChromatograms(), ms1_chromatograms, featureFile, out_featureFile, store_features, chromConsumer); }
-             }
-           }
- 
 diff --git a/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp b/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp
 index afd199f..74a61ad 100644
 --- a/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp

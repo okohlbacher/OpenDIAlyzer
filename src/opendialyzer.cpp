@@ -186,6 +186,11 @@ protected:
     // the NUMBER OF QUERIES, so a window that is fatal across 7.15M library targets is safe across
     // a few hundred anchors. Do not raise much beyond this -- past ~50 ppm even constrained
     // matching admits too many coincidences.
+    registerFlag_("mem_components", "PROBE: walk the feature map to attribute memory by component. "
+                                   "Serial, and it constructs a vector<string> per subordinate plus a "
+                                   "lookup per meta value -- ~150M allocations against a fragmented "
+                                   "180 GB heap, measured at >=41 s. Off by default: it is a diagnostic, "
+                                   "not part of the search.");
     registerStringOption_("compact_probe", "<lib.oswpq>", "", "PROBE: load this library into the "
                           "compact representation (src/odia_library.h) and report what it costs, "
                           "then exit. For comparing against the LightTargetedExperiment path on the "
@@ -511,6 +516,10 @@ protected:
             if (r > peak_) { peak_ = r; peak_phase_ = ph; }
             double& p = phase_peak_[ph];
             if (r > p) { p = r; }
+            // 27% of wall (537 s) and 27% of CPU sat outside every phase, and the global RSS
+            // peak landed there. Un-instrumented time is not free time -- charge it to the
+            // phase it follows so the gap has a name instead of being invisible.
+            if (stack_.empty()) { gap_secs_["after " + last_phase_] += 0.2; }
           }
           std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
@@ -524,7 +533,11 @@ protected:
     }
 
     void push(const std::string& n) { std::lock_guard<std::mutex> g(mu_); stack_.push_back(n); }
-    void pop()                      { std::lock_guard<std::mutex> g(mu_); if (!stack_.empty()) { stack_.pop_back(); } }
+    void pop()
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      if (!stack_.empty()) { last_phase_ = stack_.back(); stack_.pop_back(); }
+    }
 
     /// Allocator state. `in_use` is live; `retained` is freed-but-not-returned, i.e. RSS the process
     /// holds for nothing. `mmapped` is large blocks, which glibc DOES return on free.
@@ -556,6 +569,19 @@ protected:
       }
       OPENMS_LOG_INFO << "OpenDIAlyzer[mem] GLOBAL PEAK " << std::fixed << std::setprecision(2)
                       << peak_ << " GB, reached during: " << peak_phase_ << std::endl;
+
+      std::vector<std::pair<std::string, double>> gv(gap_secs_.begin(), gap_secs_.end());
+      std::sort(gv.begin(), gv.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+      double gtot = 0.0;
+      for (const auto& kv : gv) { gtot += kv.second; }
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem] ---- un-phased wall time, total "
+                      << std::fixed << std::setprecision(1) << gtot << " s ----" << std::endl;
+      for (const auto& kv : gv)
+      {
+        if (kv.second < 1.0) { continue; }
+        OPENMS_LOG_INFO << "OpenDIAlyzer[mem]   " << std::fixed << std::setprecision(1)
+                        << std::setw(8) << kv.second << " s  " << kv.first << std::endl;
+      }
     }
 
   private:
@@ -566,6 +592,8 @@ protected:
     mutable std::mutex mu_;
     std::vector<std::string> stack_;
     std::map<std::string, double> phase_peak_;
+    std::map<std::string, double> gap_secs_;
+    std::string last_phase_ = "(startup)";
     double peak_ = 0.0;
     std::string peak_phase_ = "(none)";
   };
@@ -1959,8 +1987,12 @@ protected:
       // flat_map<UInt, DataValue> -- so the meta values are invisible in sizeof() and are the
       // larger term. Subordinates are a vector<Feature> per feature (the per-transition
       // sub-features in MRM), each 296 B with a MetaInfo of its own.
+      if (getFlag_("mem_components"))
+      {
+      PhaseTimer pt_mem("mem_components");
       std::size_t mv = 0, subs = 0, sub_mv = 0, str_vals = 0;
       std::vector<std::string> meta_keys;
+      std::vector<std::string> sk;                 // hoisted: was constructed 30.2M times
       for (const Feature& f : pass_features_)
       {
         meta_keys.clear();
@@ -1973,7 +2005,7 @@ protected:
         subs += f.getSubordinates().size();
         for (const Feature& sf : f.getSubordinates())
         {
-          std::vector<std::string> sk;
+          sk.clear();
           sf.getKeys(sk);
           sub_mv += sk.size();
         }
@@ -1994,6 +2026,7 @@ protected:
                       << (pass_features_.size() * sizeof(Feature)) / 1073741824.0
                       << " GB in Feature objects alone (meta values are extra and not counted here)"
                       << std::endl;
+      }
       MemProbe::logAllocator("before score_load");
     }
     OswRows R;

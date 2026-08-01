@@ -29,12 +29,31 @@ ssh -o BatchMode=yes -J "$JUMP" "$BUILD_NODE" "
     echo 'BUILD FAILED -- nothing published' >&2; exit 1
   fi
   cd $ROOT && ./odia-build/OpenDIAlyzer -selftest 2>&1 | grep -iE 'selftest (OK|FAILED)'
+  # This target builds ODIA ONLY. libOpenMS is a separate, deliberately read-only install, so an
+  # edit under src/OpenMS is compiled by NOTHING here and the stale .so is published as if fresh.
+  # That is not hypothetical: extraction-region instrumentation was 'published and verified' three
+  # times and benchmarked for ~75 minutes while strings(libOpenMS.so) contained none of it, and the
+  # absent output read as 'those regions cost nothing'. Refuse rather than ship a stale library.
+  # \( ... \) is load-bearing: without it -o binds as (-name '*.cpp') OR ('*.h' AND -newer), so every
+  # .cpp matches and the gate fires always. sed, not head: head closes the pipe and SIGPIPEs find,
+  # which under 'set -o pipefail' exits the script 141 with no message at all.
+  NEWER=\$(find $ROOT/src/OpenMS/src \\( -name '*.cpp' -o -name '*.h' \\) -newer $ROOT/openms/lib/libOpenMS.so 2>/dev/null | sed -n '1,3p')
+  if [ -n \"\$NEWER\" ]; then
+    echo '  OpenMS sources are NEWER than the installed libOpenMS.so:' >&2
+    echo \"\$NEWER\" | sed 's/^/    /' >&2
+    echo '  Rebuilding OpenMS is a deliberate act (the install is chmod a-w on purpose).' >&2
+    echo '  Either revert the OpenMS-side edit, or rebuild+reinstall OpenMS explicitly.' >&2
+    exit 1
+  fi
   # PROVE the artifact contains what was built. Three separate silent failures on 2026-08-01 gave a
   # 'published, selftest OK' toolchain that did NOT contain the change about to be benchmarked:
   #   * cmake --install blocked by a chmod a-w lock, swallowed by >/dev/null
   #   * cp to the run node refused with 'Text file busy'
   #   * an untracked header (PeptDeepModX.h) removed by a git clean, hidden by incremental build
   # -selftest passes through all of them: it exercises RT transforms, not the code under test.
+  # VERIFY_SYMBOL only proves anything if the symbol is NEW IN THIS CHANGE. Passing one that already
+  # existed (e.g. ChunkedColumn::resolveRaw) makes the gate a tautology -- it reported '1 matches' on
+  # a library that did not contain the change being deployed.
   if [ -n '${VERIFY_SYMBOL:-}' ]; then
     N=\$(nm -DC $ROOT/openms/lib/libOpenMS.so 2>/dev/null | grep -c '${VERIFY_SYMBOL:-__none__}' || true)
     echo \"  VERIFY_SYMBOL '${VERIFY_SYMBOL:-}' -> \$N matches\"
