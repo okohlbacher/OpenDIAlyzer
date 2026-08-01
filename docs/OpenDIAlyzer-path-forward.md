@@ -341,3 +341,69 @@ no model -- so for every library shipped so far, "was this predicted for the ins
 searching?" cannot be answered from the artifact. OpenDIALibGen now writes a provenance sidecar.
 Not exercised end to end: the PeptDeep ONNX models are on neither cluster node, so `generate()`
 throws before reaching it; the JSON formatting is verified by parsing the shipped emit expression.
+
+### The extraction cap: `std::max(1, 224 / -1) == 1`
+
+ODIA constructed the workflow with `outer_loop_threads = -1`, commented "wave scheduler (NOT
+legacy)". The intent is right -- `-1` keeps `nested_scheduler_requested` false, which is what LETS
+the SWATH wave scheduler be selected:
+
+```
+use_swath_range_scheduler = batchSize <= 0 && load_into_memory && !nested_scheduler_requested
+```
+
+But that scheduler also needs `load_into_memory`, and the streaming default does not provide it. So
+the run lands in the LEGACY path still carrying `-1`, where the inner batch team is sized
+
+```
+omp_set_num_threads(std::max(1, total_nr_threads / threads_outer_loop_));   // max(1, 224 / -1) == 1
+```
+
+(inside `#ifdef MT_ENABLE_NESTED_OPENMP`, which IS defined -- `openms/include/OpenMS/config.h:161`).
+
+The inner batch loop is therefore **serial**, and every bit of extraction parallelism comes from the
+~150 outer SWATH windows. Their measured max/mean work ratio is 3.95, so dynamic scheduling over
+150 units averages **150 / 3.95 = 38** concurrent. Measured: **38.2 avg cores**.
+
+It also explains why `-innerBatchSize` could not help: it subdivides work inside a loop that has one
+thread, buying overhead and no parallelism. `batch2k` measured exactly that -- 26% slower, occupancy
+flat.
+
+Four hypotheses were tested and refuted before this, at roughly 33 minutes of cluster time each:
+
+| hypothesis | test | outcome |
+|---|---|---|
+| allocator contention | tcmalloc | 40.8 vs 41.9 cores |
+| batch imbalance | `-innerBatchSize 2000` | balance 3.95->2.93, **26% slower** |
+| serialized output section | code reading | consumer is a no-op; feature copy lacks the magnitude |
+| barrier spinning | `OMP_WAIT_POLICY=passive` | **+48% wall, +47% CPU**, occupancy unchanged |
+
+The answer was arithmetic visible in the source. The occupancy question should have started with the
+parallel structure, not with contention theories.
+
+`-outer_loop_threads` is now an option (default unchanged at -1).
+
+### The wave scheduler works; its precondition does not
+
+`-readOptions cacheWorkingInMemory` reaches the wave scheduler and breaks the cap:
+
+| | det1 | wave_passive |
+|---|---:|---:|
+| `dia_run_load` | 125.5 s / 51.5 cores | **340.2 s / 3.2 cores** |
+| `extract_pass1_wide` | 576.0 s / 38.2 cores | **467.8 s / 83.7 cores** |
+| `extract_pass2_narrow` | 265.6 s / 38.1 cores | **235.1 s / 73.4 cores** |
+| un-phased | 471.6 s | 632.8 s |
+| IDs @ q<0.01 | 6430 | **6499 (+69)** |
+| **total wall** | **33:22** | 38:06 |
+| peak RSS | 196 GB | 219 GB |
+
+Extraction saves 139 s. Building the cache costs **+215 s at 3.2 of 224 cores**. Net loss. This is
+the same verdict the earlier `cacheWorkingInMemory` run reached (+10% wall) but with the mechanism
+attributed instead of a bare number.
+
+The `+69 IDs` is a real signal, not noise: with scoring now deterministic (`det1` and `passive` both
+returned exactly 6430 across a 48% timing perturbation), one run per configuration suffices. The
+wave scheduler batches differently and finds different peak groups.
+
+`-outer_loop_threads` targets the same defect on the streaming path -- no cache to build, no
+residency, no +23 GB.
