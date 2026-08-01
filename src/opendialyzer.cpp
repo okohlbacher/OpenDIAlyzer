@@ -3995,8 +3995,15 @@ protected:
     {
       const bool pasef_c = detectPasef_(swath_maps);
       double est_win = -1.0;
-      if (calibrateCiRT_(swath_maps, transition_exp, pasef_c,
-                         getDoubleOption_("rt_extraction_window"), in, pass_map, est_win))
+      // This is a real extraction pass over the run (500 linear anchors / 5293 transitions, plus
+      // 3897 nonlinear candidates) and it ran un-phased inside the 271.8 s after precursor_index.
+      // Worth naming: it is the default, it is ~14% of wall, and its measured yield is 70 anchor
+      // pairs from 3897 candidates (1.8%) with the MS1 mass component reporting flat residuals.
+      bool cirt_ok = false;
+      { PhaseTimer pt_cirt("setup/cirt_calibration");
+        cirt_ok = calibrateCiRT_(swath_maps, transition_exp, pasef_c,
+                                 getDoubleOption_("rt_extraction_window"), in, pass_map, est_win); }
+      if (cirt_ok)
       {
         calib_rt_window = est_win;
         // Direction: OpenSWATH's calibration transform maps RUN RT -> normalized iRT (the
