@@ -274,6 +274,12 @@ protected:
                        "Number of MS1 isotopes to extract per precursor.", false, true);
     registerIntOption_("batchSize", "<n>", 0,
                        "Precursors per batch (0 = no batching). Bounds peak memory on large libraries.", false, true);
+    registerIntOption_("outer_loop_threads", "<n>", -1,
+                       "Threads for the outer SWATH-window loop; the inner batch loop then gets "
+                       "threads/outer_loop_threads. -1 (default) leaves OpenMS's nested scheduler "
+                       "unrequested, which on the streaming path means the inner loop runs with ONE "
+                       "thread and all parallelism comes from the ~150 windows. Set e.g. 16 or 32 to "
+                       "split the thread budget across both loops.", false);
     registerIntOption_("innerBatchSize", "<n>", -1,
                        "Inner (per-SWATH) batch size; -1 = auto.", false, true);
     // Default 'normal' = STREAMING, chosen to MATCH OpenSwathWorkflow's own default so that ODIA is
@@ -3232,7 +3238,17 @@ protected:
     // discards four of the most discriminating features.
     ff.setValue("Scores:use_ion_mobility_scores", pasef ? "true" : "false");
     const bool use_ms1 = true, use_ms1_im = pasef, prm = false, mrm = false;
-    const int outer_loop_threads = -1;                        // wave scheduler (NOT legacy)
+    // -1 keeps nested_scheduler_requested false, which is what LETS the wave scheduler be chosen --
+    // but that scheduler also needs load_into_memory, and the streaming default does not provide it.
+    // So the run lands in the LEGACY path with threads_outer_loop_ == -1, where the inner batch team
+    // is sized std::max(1, total_nr_threads / threads_outer_loop_) = std::max(1, 224 / -1) = 1.
+    // The inner loop is therefore serial and every bit of extraction parallelism comes from the 150
+    // outer SWATH windows. With their measured max/mean work ratio of 3.95, dynamic scheduling over
+    // 150 units averages 150/3.95 = 38 concurrent -- against 38.2 avg cores measured. That is the
+    // occupancy cap, not the allocator, not batch granularity, not barrier spinning.
+    // A positive value splits threads outer x inner instead; it also disables the wave scheduler,
+    // which costs nothing on a path that cannot reach it. Default unchanged.
+    const int outer_loop_threads = getIntOption_("outer_loop_threads");
     FeatureMap fmap;
     OpenSwathWorkflow wf(use_ms1, use_ms1_im, prm, pasef, mrm, outer_loop_threads);
     wf.setLogType(log_type_);
