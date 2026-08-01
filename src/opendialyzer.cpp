@@ -1132,6 +1132,39 @@ protected:
     std::vector<long long> feature_id;
     std::vector<double> library_rt, exp_rt;
     std::vector<std::string> traml_id;        // PRECURSOR.TRAML_ID (== library compound.id)
+
+    /// Put the rows in an order that depends on the DATA, not on the order extraction produced them.
+    ///
+    /// Two separate order-dependencies fed off row position. Fold assignment used a group's
+    /// first-occurrence index (fixed in odia_lda.h). GBT's histogram reduction partitions rows into
+    /// chunks by index -- lo = n_rows*c/nchunk -- so permuting rows regroups the partial sums, and
+    /// the resulting floating-point difference flips split points and diverges the trees. That one
+    /// is invisible without OpenMP and identical at 1/8/64 threads, so it reads as deterministic:
+    /// measured max |delta| 1.965 on permuted rows, against 6.2e-14 once the order is canonical.
+    ///
+    /// Sort on physical quantities first (precursor, then peak apex RT) so the key means something
+    /// even if feature ids are themselves assigned in extraction order; feature_id only breaks ties.
+    void canonicalize()
+    {
+      const std::size_t n = feats.size();
+      if (n < 2) { return; }
+      std::vector<std::size_t> idx(n);
+      for (std::size_t i = 0; i < n; ++i) { idx[i] = i; }
+      std::sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) {
+        if (group[a] != group[b]) { return group[a] < group[b]; }
+        if (exp_rt[a] != exp_rt[b]) { return exp_rt[a] < exp_rt[b]; }
+        return feature_id[a] < feature_id[b];
+      });
+      const auto apply = [&](auto& v) {
+        if (v.size() != n) { return; }
+        std::decay_t<decltype(v)> out;
+        out.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) { out.push_back(std::move(v[idx[i]])); }
+        v = std::move(out);
+      };
+      apply(feats); apply(labels); apply(group); apply(feature_id);
+      apply(library_rt); apply(exp_rt); apply(traml_id);
+    }
   };
 
   // Read all FEATURE_MS2 VAR_* sub-scores + label/RT for every candidate peak group.
@@ -1270,6 +1303,7 @@ protected:
                     << (R.feats.empty() ? 0 : R.feats[0].size())
                     << " after dropping uninformative; targets "
                     << std::count(R.labels.begin(), R.labels.end(), 1) << std::endl;
+    R.canonicalize();
     return R;
   }
 
@@ -1427,6 +1461,7 @@ protected:
                     << (R.feats.empty() ? 0 : R.feats[0].size())
                     << " after dropping uninformative; targets "
                     << std::count(R.labels.begin(), R.labels.end(), 1) << std::endl;
+    R.canonicalize();
     return R;
   }
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <tuple>
 #include <utility>
 #include <cstdio>
 #include <random>
@@ -71,12 +72,12 @@ int main()
 
     std::vector<std::vector<double>> f2(feats.size());
     std::vector<int> l2(feats.size());
-    std::vector<long long> g2(feats.size());
+    std::vector<long long> g2_ids(feats.size());
     for (std::size_t i = 0; i < perm.size(); ++i)
     {
-      f2[i] = feats[perm[i]]; l2[i] = labels[perm[i]]; g2[i] = group[perm[i]];
+      f2[i] = feats[perm[i]]; l2[i] = labels[perm[i]]; g2_ids[i] = group[perm[i]];
     }
-    const odia::ScoredGroups s2 = odia::scoreSemiSupervisedLDA(f2, l2, g2, p);
+    const odia::ScoredGroups s2 = odia::scoreSemiSupervisedLDA(f2, l2, g2_ids, p);
     double worst = 0.0;
     for (std::size_t i = 0; i < perm.size(); ++i)
     {
@@ -86,6 +87,47 @@ int main()
     if (worst > 1e-9)
     {
       std::fprintf(stderr, "FAIL: row order changed the scores (max delta %.3e)\n", worst);
+      return 1;
+    }
+
+    // GBT is the classifier the benchmark actually runs (-classifier gbt), and it is NOT
+    // order-invariant on raw input: its histogram reduction partitions rows into chunks by INDEX
+    // (lo = n_rows*c/nchunk), so permuting rows regroups the partial sums and the floating-point
+    // difference flips split points. Measured max |delta| 1.965 -- and only with OpenMP compiled
+    // in, identical at 1/8/64 threads, so it reads as deterministic under a serial test build.
+    //
+    // Chunking by index is deliberate: that loop is ~93% of a fit and contiguous chunks are what
+    // make it cache-friendly. So determinism is supplied UPSTREAM -- OswRows::canonicalize() sorts
+    // by (precursor, apex RT, feature id) before scoring. This asserts that contract: canonically
+    // ordered input gives identical scores no matter what order the rows arrived in.
+    odia::LDAParams pg = p;
+    pg.classifier = odia::LDAParams::Classifier::GBT;
+    const auto canon = [&](std::vector<std::vector<double>> F, std::vector<int> L,
+                           std::vector<long long> G) {
+      std::vector<std::size_t> ix(F.size());
+      for (std::size_t i = 0; i < ix.size(); ++i) { ix[i] = i; }
+      // same key shape as OswRows::canonicalize(): group first, then a per-row physical value
+      std::stable_sort(ix.begin(), ix.end(), [&](std::size_t a, std::size_t b) {
+        if (G[a] != G[b]) { return G[a] < G[b]; }
+        return F[a][0] < F[b][0];
+      });
+      std::vector<std::vector<double>> F2; std::vector<int> L2; std::vector<long long> G2;
+      for (std::size_t i : ix) { F2.push_back(F[i]); L2.push_back(L[i]); G2.push_back(G[i]); }
+      return std::make_tuple(F2, L2, G2);
+    };
+    const auto [fa, la, ga] = canon(feats, labels, group);
+    const auto [fb, lb, gb] = canon(f2, l2, g2_ids);
+    const odia::ScoredGroups g1 = odia::scoreSemiSupervisedLDA(fa, la, ga, pg);
+    const odia::ScoredGroups gg2 = odia::scoreSemiSupervisedLDA(fb, lb, gb, pg);
+    double gworst = 0.0;
+    for (std::size_t i = 0; i < g1.dscore.size(); ++i)
+    {
+      gworst = std::max(gworst, std::fabs(gg2.dscore[i] - g1.dscore[i]));
+    }
+    std::fprintf(stderr, "canonicalised-then-permuted GBT d-score max |delta| = %.3e\n", gworst);
+    if (gworst > 1e-9)
+    {
+      std::fprintf(stderr, "FAIL: canonical ordering did not make GBT reproducible (%.3e)\n", gworst);
       return 1;
     }
   }
