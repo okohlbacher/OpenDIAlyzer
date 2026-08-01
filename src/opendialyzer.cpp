@@ -64,6 +64,11 @@
 
 #include <sqlite3.h>
 #include <sys/resource.h>
+#include <malloc.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <map>
 #include <unistd.h>
 #include <cstdio>
 #include <chrono>
@@ -448,6 +453,130 @@ protected:
   }
 
 
+
+  /// Continuous RSS probe with phase attribution, plus allocator and component accounting.
+  ///
+  /// WHY THIS EXISTS. docs/OpenDIAlyzer-memory-review.md section 2 modelled peak RSS as
+  /// library + chromatograms + features. Its own section 6 REFUTED that model: removing 62% of the
+  /// chromatogram term moved peak RSS by 4.6%, and the document concludes the dominant term is
+  /// unidentified and needs "a phase-resolved measurement, not another model". This is it.
+  ///
+  /// Three things the previous entry/exit sampling could not do:
+  ///   1. Catch a peak INSIDE a phase. Extraction's high-water mark is mid-phase; sampling at the
+  ///      boundaries reports the quiet ends and misses it entirely.
+  ///   2. Separate live data from allocator retention. glibc returns freed blocks to an arena, not
+  ///      to the OS, so RSS can stay high with nothing live. mallinfo2's uordblks (in use) against
+  ///      fordblks (free but retained) says which.
+  ///   3. Attribute anything to a named structure. A delta says WHICH phase grew; a component size
+  ///      says WHAT.
+  struct MemProbe
+  {
+    static MemProbe& instance() { static MemProbe m; return m; }
+
+    static double rssGB()
+    {
+      std::FILE* f = std::fopen("/proc/self/statm", "r");
+      if (!f) { return -1.0; }
+      long long total = 0, resident = 0;
+      const int n = std::fscanf(f, "%lld %lld", &total, &resident);
+      std::fclose(f);
+      if (n != 2) { return -1.0; }
+      return static_cast<double>(resident) * static_cast<double>(::sysconf(_SC_PAGESIZE)) / 1073741824.0;
+    }
+
+    void start()
+    {
+      if (running_.exchange(true)) { return; }
+      th_ = std::thread([this] {
+        while (running_.load())
+        {
+          const double r = rssGB();
+          if (r >= 0.0)
+          {
+            std::lock_guard<std::mutex> g(mu_);
+            const std::string ph = stack_.empty() ? std::string("(outside any phase)") : stack_.back();
+            if (r > peak_) { peak_ = r; peak_phase_ = ph; }
+            double& p = phase_peak_[ph];
+            if (r > p) { p = r; }
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+      });
+    }
+
+    void stop()
+    {
+      if (!running_.exchange(false)) { return; }
+      if (th_.joinable()) { th_.join(); }
+    }
+
+    void push(const std::string& n) { std::lock_guard<std::mutex> g(mu_); stack_.push_back(n); }
+    void pop()                      { std::lock_guard<std::mutex> g(mu_); if (!stack_.empty()) { stack_.pop_back(); } }
+
+    /// Allocator state. `in_use` is live; `retained` is freed-but-not-returned, i.e. RSS the process
+    /// holds for nothing. `mmapped` is large blocks, which glibc DOES return on free.
+    static void logAllocator(const char* where)
+    {
+#if defined(__GLIBC__) && defined(__GLIBC_MINOR__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 33)
+      const struct mallinfo2 mi = mallinfo2();
+      const double g = 1073741824.0;
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem/alloc] " << where << ": in_use "
+                      << std::fixed << std::setprecision(2) << mi.uordblks / g << " GB, retained "
+                      << mi.fordblks / g << " GB, mmapped " << mi.hblkhd / g << " GB, arena "
+                      << mi.arena / g << " GB; RSS " << rssGB() << " GB" << std::endl;
+#else
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem/alloc] " << where << ": RSS " << std::fixed
+                      << std::setprecision(2) << rssGB() << " GB (mallinfo2 unavailable)" << std::endl;
+#endif
+    }
+
+    void report() const
+    {
+      std::lock_guard<std::mutex> g(mu_);
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem] ---- peak RSS by phase (sampled at 5 Hz) ----" << std::endl;
+      std::vector<std::pair<std::string, double>> v(phase_peak_.begin(), phase_peak_.end());
+      std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+      for (const auto& kv : v)
+      {
+        OPENMS_LOG_INFO << "OpenDIAlyzer[mem]   " << std::fixed << std::setprecision(2)
+                        << std::setw(8) << kv.second << " GB  " << kv.first << std::endl;
+      }
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem] GLOBAL PEAK " << std::fixed << std::setprecision(2)
+                      << peak_ << " GB, reached during: " << peak_phase_ << std::endl;
+    }
+
+  private:
+    MemProbe() = default;
+    ~MemProbe() { stop(); }
+    std::thread th_;
+    std::atomic<bool> running_{false};
+    mutable std::mutex mu_;
+    std::vector<std::string> stack_;
+    std::map<std::string, double> phase_peak_;
+    double peak_ = 0.0;
+    std::string peak_phase_ = "(none)";
+  };
+
+  /// Bytes actually held by a LightTargetedExperiment, capacity-based (capacity, not size, is what
+  /// the process holds) and including the heap each std::string owns beyond its SSO buffer.
+  static std::size_t libraryBytes_(const OpenSwath::LightTargetedExperiment& e)
+  {
+    auto strb = [](const std::string& s) -> std::size_t {
+      return sizeof(std::string) + (s.capacity() > 15 ? s.capacity() + 1 : 0);   // libstdc++ SSO = 15
+    };
+    std::size_t b = e.compounds.capacity() * sizeof(OpenSwath::LightCompound)
+                  + e.transitions.capacity() * sizeof(OpenSwath::LightTransition)
+                  + e.proteins.capacity() * sizeof(OpenSwath::LightProtein);
+    for (const auto& c : e.compounds)
+    {
+      b += strb(c.id) + strb(c.sequence) + strb(c.peptide_group_label) + strb(c.gene_name);
+      b += c.protein_refs.capacity() * sizeof(std::string);
+      for (const auto& r : c.protein_refs) { b += strb(r); }
+    }
+    for (const auto& t : e.transitions) { b += strb(t.transition_name) + strb(t.peptide_ref); }
+    return b;
+  }
+
   /// Wall+CPU stopwatch for the phases OpenMS does not instrument.
   ///
   /// The four OpenMS "Progress of ..." phases accounted for only 49% of a 37-minute run; the other
@@ -486,12 +615,16 @@ protected:
       return static_cast<double>(resident) * static_cast<double>(::sysconf(_SC_PAGESIZE)) / 1073741824.0;
     }
     explicit PhaseTimer(const char* n)
-      : name(n), t0(std::chrono::steady_clock::now()), c0(cpuSeconds()), r0(rssGB()) {}
+      : name(n), t0(std::chrono::steady_clock::now()), c0(cpuSeconds()), r0(rssGB())
+    {
+      MemProbe::instance().push(n);
+    }
     ~PhaseTimer()
     {
       const double w = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       const double c = cpuSeconds() - c0;
       const double r1 = rssGB();
+      MemProbe::instance().pop();
       OPENMS_LOG_INFO << "OpenDIAlyzer[phase] " << name << ": " << std::fixed << std::setprecision(1)
                       << w << " s wall, " << c << " s cpu, " << (w > 0.01 ? c / w : 0.0)
                       << " avg cores";
@@ -1798,6 +1931,26 @@ protected:
   // Final FDR: in-process LDA on the last pass, write SCORE_MS2, report IDs@1%.
   int finalScore_(const std::string& osw)
   {
+    if (parquet_out_)
+    {
+      // pass_features_ is the other structure that OUTLIVES the phase that fills it. Meta values
+      // dominate it: ~30 named sub-scores per feature, each a string key plus a DataValue.
+      std::size_t mv = 0;
+      std::vector<std::string> meta_keys;
+      for (const Feature& f : pass_features_)
+      {
+        meta_keys.clear();
+        f.getKeys(meta_keys);
+        mv += meta_keys.size();
+      }
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem/component] pass_features_: " << pass_features_.size()
+                      << " features, " << mv << " meta values, "
+                      << std::fixed << std::setprecision(2)
+                      << (pass_features_.size() * sizeof(Feature)) / 1073741824.0
+                      << " GB in Feature objects alone (meta values are extra and not counted here)"
+                      << std::endl;
+      MemProbe::logAllocator("before score_load");
+    }
     OswRows R;
     { PhaseTimer pt("score_load");
       R = parquet_out_ ? loadScoresFromFeatureMap_(pass_features_, precursor_index_)
@@ -3208,6 +3361,21 @@ protected:
     // load library + DIA run ONCE (reused across passes)
     // .oswpq output selects the parquet path: features stay in memory and nothing is written to
     // sqlite. Chosen by extension, exactly as TOPP OpenSwathWorkflow does it.
+    MemProbe::instance().start();
+    MemProbe::logAllocator("startup");
+    // RAII, not a call before `return`: main_ has six return sites and an early one would have been
+    // missed. This reports on every exit path, including the error ones -- which are exactly the
+    // runs where knowing the memory profile matters most.
+    struct MemReport
+    {
+      ~MemReport()
+      {
+        MemProbe::logAllocator("final");
+        MemProbe::instance().stop();
+        MemProbe::instance().report();
+      }
+    } mem_report_guard;
+    (void)mem_report_guard;
     parquet_out_ = (FileHandler::getTypeByFileName(out) == FileTypes::OSWPQ);
     if (parquet_out_)
     {
@@ -3217,6 +3385,14 @@ protected:
 
     OpenSwath::LightTargetedExperiment transition_exp;
     { PhaseTimer pt("library_load"); transition_exp = loadLibrary_(tr); }
+    {
+      const double gb = libraryBytes_(transition_exp) / 1073741824.0;
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem/component] library AS LOADED: "
+                      << transition_exp.getCompounds().size() << " compounds, "
+                      << transition_exp.getTransitions().size() << " transitions, "
+                      << std::fixed << std::setprecision(2) << gb << " GB accounted" << std::endl;
+      MemProbe::logAllocator("after library_load");
+    }
     std::shared_ptr<ExperimentalSettings> exp_meta;
     std::vector<OpenSwath::SwathMap> swath_maps;
     const std::string tmp = getStringOption_("tempDirectory");
@@ -3255,6 +3431,14 @@ protected:
       { PhaseTimer pt("prefilter"); prefilterLibrary_(swath_maps, transition_exp, cp_pf, cp_pf_ms1); }
       // Build AFTER prefiltering: the index must describe the library actually searched, or the
       // integer precursor ids in the output will not line up with the features.
+      {
+        const double gb = libraryBytes_(transition_exp) / 1073741824.0;
+        OPENMS_LOG_INFO << "OpenDIAlyzer[mem/component] library AFTER prefilter: "
+                        << transition_exp.getCompounds().size() << " compounds, "
+                        << transition_exp.getTransitions().size() << " transitions, "
+                        << std::fixed << std::setprecision(2) << gb << " GB accounted" << std::endl;
+        MemProbe::logAllocator("after prefilter");
+      }
       if (parquet_out_) { PhaseTimer pt("precursor_index"); buildPrecursorIndex_(transition_exp); }
 
       // Dump-and-exit. Tuning the prefilter otherwise costs a full extraction (hours, ~1 TB) per

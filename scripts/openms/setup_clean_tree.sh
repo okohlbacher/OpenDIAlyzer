@@ -33,5 +33,13 @@ echo "== building ODIA =="
 ssh -o BatchMode=yes -J "$JUMP" "$NODE" "
   export HOME=$ROOT/home TMPDIR=$ROOT/tmp
   export LD_LIBRARY_PATH=$ROOT/odiaenv/lib:$ROOT/openms/lib:\${LD_LIBRARY_PATH:-}
-  cd $ROOT/odia-build && cmake --build . --target OpenDIAlyzer -j 16 2>&1 | tail -5
+  cd $ROOT/odia-build
+  # A trailing pipe swallows the build exit status, so a FAILED build used to fall through to a
+  # selftest of the PREVIOUS binary and print 'selftest OK'. That is how a broken build gets
+  # benchmarked. pipefail + an explicit check stops that.
+  set -o pipefail
+  if ! cmake --build . --target OpenDIAlyzer -j 16 2>&1 | tail -5; then
+    echo 'BUILD FAILED -- not running the selftest (it would test the previous binary)' >&2
+    exit 1
+  fi
   cd $ROOT && ./odia-build/OpenDIAlyzer -selftest 2>&1 | grep -iE 'selftest (OK|FAILED)'"
