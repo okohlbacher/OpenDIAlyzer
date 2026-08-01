@@ -281,3 +281,63 @@ capped before anything else applies. `calculateInnerBatchSize` sizes batches as 
 machine gets coarser work units. On a 2.2 TB node it pins at the 10000 ceiling.
 
 `-innerBatchSize` is already an ODIA option, so this is testable with no code change.
+
+### Where the un-phased time actually goes
+
+Gap accounting, two runs:
+
+| block | gap run | det1 |
+|---|---:|---:|
+| CiRT calibration (`after setup/run_rt_range`) | 271.8 s | **260.6 s** |
+| parquet bundle write (`after extract_pass2_narrow`) | 183.0 s | **158.4 s** |
+| after `extract_pass1_wide` | 20.8 s | 21.2 s |
+| after `context_fdr` | 26.0 s | 15.6 s |
+| after `library_load` | 16.0 s | 13.0 s |
+| after `prefilter` | 1.6 s | 2.0 s |
+| **total** | 519.6 s | **471.6 s** |
+
+Two blocks are 89% of it. For scale, `classifier_fit_gbt` -- a phase that had been watched all
+day -- is 86 s.
+
+**Block 1 is the CiRT calibration**, which `-rt_calibration` selects by DEFAULT and which runs a
+real extraction pass (500 linear anchors / 5293 transitions, plus 3897 nonlinear candidates). From
+the run log: **70 anchor pairs from 3897 candidates (1.8% yield)**, and the MS1 mass component
+reporting FLAT residuals (peakedness 1.47 < 3) over 680 anchors -- its own diagnostic for
+mostly-noise. Whether that earns ~14% of wall is queued as an A/B (`calib_bootstrap`,
+`calib_none`), which deterministic scoring finally makes a single-run question.
+
+**Block 2 is dominated by `pw.write()`**, serialising 2.07M features and 30.2M subordinates
+between the pass loop and `finalScore_`. Hypothesis, now instrumented.
+
+Three earlier hypotheses for these blocks were measured and discarded: `setup/run_rt_range` 0.0 s
+(the streaming-metadata guess), `setup/free_chromatograms` 0.0 s, and `setup/retain_features`
+15.4 s of the 183 (the FeatureMap-destruction guess -- real, but a twelfth of the block).
+Instrumenting found in one run what three rounds of reasoning had not.
+
+### GBT was order-dependent too
+
+The fold fix (`odia_lda.h`) closed one channel. The production classifier had another: GBT's
+histogram reduction partitions rows into chunks by INDEX (`lo = n_rows*c/nchunk`), so permuting
+rows regroups the partial sums and the floating-point difference flips split points. Measured max
+|delta| **1.965**.
+
+It hides well. Identical at 1, 8 and 64 threads -- chunk count depends only on row count, which was
+deliberate and is what the existing thread-invariance test checks -- and absent entirely without
+OpenMP compiled in, so the first (clang, no `-fopenmp`) run reported 6.2e-14 and looked clean.
+
+Index chunking stays: that loop is ~93% of a fit and contiguity is what makes it cache-friendly.
+`OswRows::canonicalize()` supplies the order instead -- (precursor, apex RT, feature id), physical
+quantities first so the key survives feature ids that are themselves assigned in extraction order.
+Verified with OpenMP linked at 1/8/64 threads: **0.000e+00**.
+
+Audited before trusting it: no consumer pairs scores to features by position. The sqlite writer
+inserts explicit FEATURE_ID, the parquet writer appends it, the anchor path stays inside R's own
+arrays.
+
+### Library provenance was unrecoverable
+
+`metadata.json` records generator, counts and fragment-type breakdowns but no NCE, no instrument,
+no model -- so for every library shipped so far, "was this predicted for the instrument we are
+searching?" cannot be answered from the artifact. OpenDIALibGen now writes a provenance sidecar.
+Not exercised end to end: the PeptDeep ONNX models are on neither cluster node, so `generate()`
+throws before reaching it; the JSON formatting is verified by parsing the shipped emit expression.
