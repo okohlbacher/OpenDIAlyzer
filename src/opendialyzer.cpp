@@ -1935,14 +1935,40 @@ protected:
     {
       // pass_features_ is the other structure that OUTLIVES the phase that fills it. Meta values
       // dominate it: ~30 named sub-scores per feature, each a string key plus a DataValue.
-      std::size_t mv = 0;
+      // Count what actually costs, not just the top-level array. sizeof(Feature) is 296 B, but
+      // MetaInfoInterface is an 8-BYTE POINTER to a separately heap-allocated MetaInfo holding a
+      // flat_map<UInt, DataValue> -- so the meta values are invisible in sizeof() and are the
+      // larger term. Subordinates are a vector<Feature> per feature (the per-transition
+      // sub-features in MRM), each 296 B with a MetaInfo of its own.
+      std::size_t mv = 0, subs = 0, sub_mv = 0, str_vals = 0;
       std::vector<std::string> meta_keys;
       for (const Feature& f : pass_features_)
       {
         meta_keys.clear();
         f.getKeys(meta_keys);
         mv += meta_keys.size();
+        for (const auto& k : meta_keys)
+        {
+          if (f.getMetaValue(k).valueType() == DataValue::STRING_VALUE) { ++str_vals; }
+        }
+        subs += f.getSubordinates().size();
+        for (const Feature& sf : f.getSubordinates())
+        {
+          std::vector<std::string> sk;
+          sf.getKeys(sk);
+          sub_mv += sk.size();
+        }
       }
+      const double gb = 1073741824.0;
+      const std::size_t pair_b = sizeof(UInt) + sizeof(DataValue) + 4;   // flat_map element, padded
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem/component] feature map detail: "
+                      << std::fixed << std::setprecision(2)
+                      << (pass_features_.size() * sizeof(Feature)) / gb << " GB top-level Features; "
+                      << subs << " subordinates = " << (subs * sizeof(Feature)) / gb << " GB; "
+                      << mv << "+" << sub_mv << " meta values ~= "
+                      << ((mv + sub_mv) * pair_b) / gb << " GB in flat_maps ("
+                      << str_vals << " are strings, each an extra allocation); "
+                      << (pass_features_.size() + subs) << " MetaInfo allocations" << std::endl;
       OPENMS_LOG_INFO << "OpenDIAlyzer[mem/component] pass_features_: " << pass_features_.size()
                       << " features, " << mv << " meta values, "
                       << std::fixed << std::setprecision(2)
@@ -3655,8 +3681,16 @@ protected:
       OPENMS_LOG_INFO << "[pass " << p << "/" << passes << (narrow ? " NARROW rt_win=" : " WIDE rt_win=")
                       << rt_win << "s] -> " << osw << std::endl;
 
-      const ExitCodes rc = extractPass_(swath_maps, exp_meta, transition_exp,
-                                        use_native_trafo ? native_trafo : identity, rt_win, in, osw);
+      // The GLOBAL peak RSS lands here -- 186.28 GB on the 2026-08-01 profile -- and it was the one
+      // phase with no timer, so the sampler could only attribute it to "(outside any phase)".
+      // Named per pass, because pass 1 (wide window) and pass 2 (narrow) are different workloads.
+      ExitCodes rc = EXECUTION_OK;
+      {
+        PhaseTimer pt(p == 1 ? "extract_pass1_wide" : "extract_pass2_narrow");
+        rc = extractPass_(swath_maps, exp_meta, transition_exp,
+                          use_native_trafo ? native_trafo : identity, rt_win, in, osw);
+      }
+      MemProbe::logAllocator(p == 1 ? "after extract pass1" : "after extract pass2");
       if (rc != EXECUTION_OK) { return rc; }
 
       if (p < passes)
