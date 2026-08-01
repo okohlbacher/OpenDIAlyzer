@@ -3,12 +3,13 @@
 # environment, so two chained runs died on a missing libxerces before doing any work --
 # and a run that dies at load looks exactly like a run that has not started yet.
 #
-# usage: bench_odia.sh <tag> [LD_PRELOAD_LIB]
+# usage: bench_odia.sh <tag> [LD_PRELOAD_LIB]   (extra ODIA flags via EXTRA_ARGS)
 set -euo pipefail
 
 ROOT=${ROOT:-/scratch/kohlbach}
 TAG=${1:?usage: bench_odia.sh <tag> [preload]}
 PRELOAD=${2:-}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 export LD_LIBRARY_PATH=$ROOT/odiaenv/lib:$ROOT/openms/lib:$ROOT/mzpeak-cpp/buildfix:$ROOT/mzpenv/lib:${LD_LIBRARY_PATH:-}
 export OPENMS_TMPDIR=${OPENMS_TMPDIR:-$ROOT/tmp}
@@ -27,5 +28,6 @@ ldd "$ROOT/bin/OpenDIAlyzer" | grep -q "not found" && { echo "FATAL: unresolved 
   -threads 224 \
   -mz_extraction_window 10 -mz_extraction_window_ms1 10 -prefilter_mz_extraction_window 10 \
   -classifier gbt -tempDirectory "$ROOT/tmp" \
+  $EXTRA_ARGS \
   -out "$OUT/$TAG.oswpq" > "$OUT/$TAG.oswpq.log" 2>&1
-echo "### $TAG exit $?"
+echo "### $TAG exit $? (extra: ${EXTRA_ARGS:-none})"
