@@ -61,10 +61,19 @@ namespace
 // Python ONNX output, so 0->QE is the empirically verified encoding.
 // NOTE: the docstring in PeptDeepMS2Inference.h claims 0=Lumos; the parity
 // data contradicts it and is the only source backed by a passing test.
-// REVIEWER TODO: cross-check against AlphaPeptDeep's instrument_dict for the
-// pinned checkpoint before Stage 2.
-constexpr float kNCE = 30.0f;
-constexpr int64_t kInstrument = 0; // QE, per the OpenMS parity reference data
+// RESOLVED (the TODO below). peptdeep/constants/model_const.yaml pins
+//   instruments: [QE, Lumos, timsTOF, SciexTOF, ThermoTOF], max_instrument_num: 8
+// so the encoding is QE=0, Lumos=1, *timsTOF=2*, SciexTOF=3, ThermoTOF=4,
+// unknown=7. The parity test passes with 0 because the reference CSV is QE data
+// -- it verifies the *encoding*, not that QE is right for our runs.
+//
+// agxt is timsTOF diaPASEF, so QE/NCE30 was predicting Orbitrap spectra for
+// Bruker data: numerically faithful to AlphaPeptDeep, physically wrong.
+// Collision energy read from the run itself (analysis.tdf, DiaFrameMsMsWindows):
+// 25.84 - 46.77 eV, mean 35.43, ramped with ion mobility as diaPASEF does.
+// Use the mean; a grid search over NCE is the refinement if it matters.
+constexpr float kNCE = 35.0f;
+constexpr int64_t kInstrument = 2; // timsTOF (peptdeep model_const.yaml)
 
 // PeptDeep MS2 output layout (from PeptDeepInference_test and the reference
 // CSV's fragment_position/ion_index/ion_type columns): per peptide a flat
@@ -117,7 +126,8 @@ struct ModPolicy
 // Fixed mods (Cam@C) are applied to every eligible site; variable mods
 // (Ox@M, N-term Acetyl) are enumerated in every subset up to max_var. The base
 // (fixed-only) form is always included. Deterministic (sorted, de-duplicated).
-std::vector<std::string> peptidoforms(const std::string& base, const ModPolicy& mp)
+std::vector<std::string> peptidoforms(const std::string& base, const ModPolicy& mp,
+                                      bool protein_nterm)
 {
   OpenMS::AASequence fixed = OpenMS::AASequence::fromString(base);
   if (mp.cam_c)
@@ -129,7 +139,10 @@ std::vector<std::string> peptidoforms(const std::string& base, const ModPolicy& 
   if (mp.ox_m)
     for (OpenMS::Size i = 0; i < fixed.size(); ++i)
       if (fixed[i].getOneLetterCode() == "M") slots.push_back(static_cast<int>(i));
-  if (mp.acetyl_nterm) slots.push_back(-1);
+  // "Acetyl (Protein N-term)" is only chemically available on the peptide that
+  // actually starts the protein. Offering it on every tryptic peptide invents
+  // impossible peptidoforms and inflates the search space (~40% more forms).
+  if (mp.acetyl_nterm && protein_nterm) slots.push_back(-1);
 
   // ponytail: 2^slots subset scan, filtered by popcount<=max_var. Fine because
   // real peptides have few M; a pathological run is capped here rather than
@@ -314,11 +327,14 @@ int read_precursors(const char* path, std::vector<Precursor>& out)
     return 1;
   }
   const std::vector<std::string> cols = split_tab(header);
-  int iseq = -1, ichg = -1;
+  int iseq = -1, ichg = -1, imod = -1;
   for (size_t i = 0; i < cols.size(); ++i)
   {
     if (cols[i] == "PeptideSequence") iseq = static_cast<int>(i);
     if (cols[i] == "PrecursorCharge") ichg = static_cast<int>(i);
+    // Optional: predict from a specific peptidoform (e.g. P2 decoy reprediction,
+    // where decoys carry Cam/Ox). generate() uses modseq when non-empty.
+    if (cols[i] == "ModifiedPeptideSequence") imod = static_cast<int>(i);
   }
   if (iseq < 0 || ichg < 0)
   {
@@ -348,7 +364,7 @@ int read_precursors(const char* path, std::vector<Precursor>& out)
                    path, lineno, f[ichg].c_str());
       return 1;
     }
-    const Precursor p{f[iseq], static_cast<int>(z)};
+    Precursor p{f[iseq], static_cast<int>(z)};
     if (!valid_precursor(p))
     {
       std::fprintf(stderr,
@@ -357,6 +373,8 @@ int read_precursors(const char* path, std::vector<Precursor>& out)
                    path, lineno, f[iseq].c_str(), z);
       return 1;
     }
+    if (imod >= 0 && static_cast<int>(f.size()) > imod && !f[imod].empty())
+      p.modseq = f[imod];  // predict this exact peptidoform
     out.push_back(p);
   }
   if (out.empty())
@@ -403,8 +421,13 @@ int digest_fasta(const char* path, const DigestOpts& d, const ModPolicy& mp,
     {
       const std::string s = pep.toUnmodifiedString();
       if (!valid_precursor({s, d.min_charge})) continue; // canonical AAs only (drops X/B/Z/U)
+      // Protein N-terminal peptide? Either it starts the protein, or it starts
+      // it after N-terminal Met excision. Gates "Acetyl (Protein N-term)".
+      const bool prot_nterm =
+          e.sequence.rfind(s, 0) == 0 ||
+          (!e.sequence.empty() && e.sequence[0] == 'M' && e.sequence.rfind(s, 1) == 1);
       // One precursor per (peptidoform x charge). Fixed Cam(C) + variable mods.
-      for (const std::string& form : peptidoforms(s, mp))
+      for (const std::string& form : peptidoforms(s, mp, prot_nterm))
         for (int z = d.min_charge; z <= d.max_charge; ++z)
           if (seen.insert(form + '\t' + std::to_string(z)).second) // first sighting only
             out.push_back({s, z, e.identifier, form});
@@ -527,11 +550,12 @@ int selftest(const std::string& model_dir, int threads)
   }
 
   // Stage 3: peptidoform enumeration. AMCK has one C (fixed Cam), one M (var Ox),
-  // plus the variable N-term Acetyl -> with max_var 2: base(Cam only) + {Ox},
-  // {Ac}, {Ox,Ac} = 4 forms. Every form must carry the fixed Cam on C.
+  // plus the variable N-term Acetyl -- but Acetyl is only offered on a PROTEIN
+  // N-terminal peptide. At the protein N-term with max_var 2: base(Cam only) +
+  // {Ox}, {Ac}, {Ox,Ac} = 4 forms. Every form carries the fixed Cam on C.
   {
     ModPolicy mp; mp.max_var = 2;
-    const auto forms = peptidoforms("AMCK", mp);
+    const auto forms = peptidoforms("AMCK", mp, /*protein_nterm*/ true);
     CHECK(forms.size() == 4);
     for (const std::string& f : forms)
       CHECK(f.find("UniMod:4") != std::string::npos); // Carbamidomethyl on C, always
@@ -542,11 +566,16 @@ int selftest(const std::string& model_dir, int threads)
       if (f.find("UniMod:1") != std::string::npos) ++with_ac;  // Acetyl
     }
     CHECK(with_ox == 2); CHECK(with_ac == 2);
+    // An INTERNAL peptide cannot carry protein-N-term Acetyl: base + {Ox} only.
+    const auto internal = peptidoforms("AMCK", mp, /*protein_nterm*/ false);
+    CHECK(internal.size() == 2);
+    for (const std::string& f : internal)
+      CHECK(f.find("UniMod:1") == std::string::npos);
     // max_var 0 -> only the fixed-Cam base form.
     ModPolicy zero; zero.max_var = 0;
-    CHECK(peptidoforms("AMCK", zero).size() == 1);
+    CHECK(peptidoforms("AMCK", zero, true).size() == 1);
     // Deterministic order.
-    CHECK(peptidoforms("AMCK", mp) == forms);
+    CHECK(peptidoforms("AMCK", mp, true) == forms);
   }
 
   std::puts("selftest OK");
@@ -580,13 +609,19 @@ int refine_and_decoy(const std::string& raw_tsv, const std::string& out_path, bo
     TargetedExperiment exp;
     TransitionTSVFile().convertTSVToTargetedExperiment(tmp_raw.c_str(), FileTypes::TSV, exp);
 
-    // Values copied verbatim from OpenSwathAssayGenerator's registered defaults
-    // (product m/z limits 350-2000 Th are the ones that actually change the
-    // transition set; using 0/inf kept small fragments the tool drops).
+    // P1 fragment-selection fix. OpenSwathAssayGenerator's SRM-era defaults
+    // (350 m/z floor, 6 transitions) gut a DIA library: the 350 floor deletes
+    // the intense low-mass b/y ions -- measured against DIA-NN's library, we
+    // dropped base peaks like b3@342 (intensity 1.0), and the 6-cap kept only
+    // mid-series ions (we had 6 vs DIA-NN's 10, missing ~6/precursor). DIA fills
+    // spectra to ~200 m/z and keeps ~10-12 fragments (DIA-NN TopF6+auxF12).
+    // See vault/30-Algorithms/Library dissection and fix plan.md.
+    const double kFragMzLow = 150.0;   // was 350: keep low-mass base peaks
+    const int kMinTr = 6, kMaxTr = 12; // was 6/6: DIA-NN-like transition count
     MRMAssay assay;
     assay.reannotateTransitions(exp, 0.025, 0.025, frag_types, frag_charges, false, false);
-    assay.restrictTransitions(exp, 350.0, 2000.0, no_swathes);
-    assay.detectingTransitions(exp, 6, 6);                   // min=max=6
+    assay.restrictTransitions(exp, kFragMzLow, 2000.0, no_swathes);
+    assay.detectingTransitions(exp, kMinTr, kMaxTr);
 
     if (decoys)
     {

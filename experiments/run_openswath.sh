@@ -76,9 +76,15 @@ IM_WIN=${IM_WIN:--1}
 # window, and ignoring it is correct. Do NOT keep -force for a run with
 # genuinely discontinuous windows: it would silently skip real m/z ranges.
 
-echo "threads=$THREADS outer=$OUTER  mz=${MZ_WIN}ppm ms1=${MZ_WIN_MS1}ppm rt_window=${RT_WIN}s"
+# Extra raw args (word-split on purpose), e.g. calibration overrides for a
+# predicted library whose RT is too noisy for the default rsq gate.
+EXTRA=${EXTRA:-}
 
-/usr/bin/time -v $OPENMS/bin/OpenSwathWorkflow \
+echo "threads=$THREADS outer=$OUTER  mz=${MZ_WIN}ppm ms1=${MZ_WIN_MS1}ppm rt_window=${RT_WIN}s"
+[ -n "$EXTRA" ] && echo "extra: $EXTRA"
+
+# shellcheck disable=SC2086
+/usr/bin/time -v $OPENMS/bin/OpenSwathWorkflow $EXTRA \
   -in "$MZML" \
   -tr "$LIB" \
   -out_features "$OUT/features.osw" \

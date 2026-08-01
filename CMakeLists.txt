@@ -40,6 +40,25 @@ target_link_libraries(odia-index PRIVATE OpenMS Threads::Threads)
 # is defined by OpenSWATH's reference values, asserted in the test.
 add_executable(odia-score-test src/odia_score_test.cpp)
 
+# In-process semi-supervised LDA (pyprophet-like) + its oracle test. Header-only,
+# pure C++ (no OpenMS/Eigen), so the same header links into OpenDIAlyzer and the
+# standalone test. Implementation delegated to codex; verified by the oracle.
+add_executable(odia-lda-test src/odia_lda_test.cpp)
+add_executable(odia-lda-adversarial-test src/odia_lda_adversarial_test.cpp)
+
+# Error control above the precursor: peptide/protein context FDR, picked protein-group
+# competition, entrapment FDP. Header-only and dependency-free, same as the LDA.
+add_executable(odia-fdr-test src/odia_fdr_test.cpp)
+
+# Compact XIC storage replacing vector<MSChromatogram>: shared RT grid + float32 intensities.
+# Measured 4.09x smaller (225 GB -> 55 GB on the Astral benchmark). Header-only, standalone.
+add_executable(odia-chromatogram-test src/odia_chromatogram_test.cpp)
+
+# Histogram gradient-boosted trees as an alternative learner inside the same semi-supervised
+# loop as the LDA. In-house because no GBT library is available to link and a vendored one would
+# bring its own RNG and threading into a path that must stay deterministic (it feeds an FDR).
+add_executable(odia-gbt-test src/odia_gbt_test.cpp)
+
 # Stage-1 library generator: peptide list -> PeptDeep-predicted RT/MS2 ->
 # OpenSWATH transition TSV. Requires the ONNX-enabled OpenMS build
 # (-DOpenMS_DIR=.../openms-onnx/lib/cmake/OpenMS). The PeptDeep ONNX models
@@ -49,6 +68,44 @@ add_executable(odia-score-test src/odia_score_test.cpp)
 # -DOPENDIALIBGEN_MODEL_DIR=... if the layout differs.
 add_executable(OpenDIALibGen src/opendialibgen.cpp)
 target_link_libraries(OpenDIALibGen PRIVATE OpenMS)
+
+# OpenDIAlyzer — the streaming DIA search tool (skeleton). TOPPBase-derived,
+# links libOpenMS. It will additionally link libmzpeak for streaming input once
+# the reader stage lands (target_link_libraries(... mzpeak) + include dir).
+# Companion to OpenDIALibGen; the two form the OpenDIAlyzer tool suite that USES
+# OpenMS but does not live in the OpenMS repository.
+add_executable(OpenDIAlyzer src/opendialyzer.cpp)
+target_link_libraries(OpenDIAlyzer PRIVATE OpenMS)
+
+# mzPeak streaming input. Optional: point -DMZPEAK_ROOT at an mzpeak-cpp build (headers in
+# <root>/include, libmzpeak in <root>/<builddir>). Without it OpenDIAlyzer still builds and
+# simply does not accept .mzpeak.
+if(MZPEAK_ROOT)
+  find_library(MZPEAK_LIB NAMES mzpeak PATHS ${MZPEAK_ROOT} PATH_SUFFIXES buildfix build build-fix REQUIRED)
+  find_package(Arrow REQUIRED)
+  find_package(Parquet REQUIRED)
+  target_include_directories(OpenDIAlyzer PRIVATE ${MZPEAK_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(OpenDIAlyzer PRIVATE ${MZPEAK_LIB} Arrow::arrow_shared Parquet::parquet_shared)
+  target_compile_definitions(OpenDIAlyzer PRIVATE WITH_MZPEAK=1)
+  message(STATUS "OpenDIAlyzer: mzPeak streaming input ENABLED (${MZPEAK_LIB})")
+endif()
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(OpenDIAlyzer PRIVATE OpenMP::OpenMP_CXX)
+endif()
+# OpenDIAlyzer reads the pass-1 .osw with sqlite3 to harvest RT anchors. libOpenMS
+# already exports the sqlite3_* symbols (it vendors sqlite3), so we need only the
+# header on the include path -- no extra link. The header ships with OpenMS (its
+# installed include/, or the vendored extern/ tree). ponytail: header-only hookup.
+find_path(SQLITE3_INCLUDE_DIR sqlite3.h
+  HINTS
+    "${OpenMS_DIR}/_deps/opentims-src/src/opentims++/sqlite"
+    "${OpenMS_DIR}/../../include"
+    "${OpenMS_DIR}/../../ext/OpenMS/src/openms/extern/SQLiteCpp/sqlite3"
+  DOC "Directory containing sqlite3.h (ships with OpenMS)")
+if(NOT SQLITE3_INCLUDE_DIR)
+  message(FATAL_ERROR "sqlite3.h not found; pass -DSQLITE3_INCLUDE_DIR=/path/to/dir")
+endif()
+target_include_directories(OpenDIAlyzer PRIVATE ${SQLITE3_INCLUDE_DIR})
 
 # P2 mod_x featurization validation. Links libOpenMS for AASequence/EmpiricalFormula;
 # the featurization itself is a header-only vendored patch (PeptDeepModX.h), so
@@ -66,6 +123,11 @@ enable_testing()
 add_test(NAME odia-info-selftest COMMAND odia-info --selftest)
 add_test(NAME odia-index-selftest COMMAND odia-index --selftest)
 add_test(NAME odia-score-oracle COMMAND odia-score-test)
+add_test(NAME odia-lda COMMAND odia-lda-test)
+add_test(NAME odia-lda-adversarial COMMAND odia-lda-adversarial-test)
+add_test(NAME odia-fdr COMMAND odia-fdr-test)
+add_test(NAME odia-chromatogram COMMAND odia-chromatogram-test)
+add_test(NAME odia-gbt COMMAND odia-gbt-test)
 add_test(NAME OpenDIALibGen-selftest
          COMMAND OpenDIALibGen --selftest -model_dir "${OPENDIALIBGEN_MODEL_DIR}")
 add_test(NAME odia-modx-p2 COMMAND odia-modx-test)

@@ -1,0 +1,713 @@
+diff --git a/src/openms/include/OpenMS/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.h b/src/openms/include/OpenMS/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.h
+index 3fe6276..daa6ec5 100644
+--- a/src/openms/include/OpenMS/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.h
++++ b/src/openms/include/OpenMS/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.h
+@@ -64,6 +64,9 @@ public:
+       Size ms2_hit_count{0};
+       /// Best number of distinct MS2 fragment hits in a single spectrum.
+       Size ms2_best_fragment_hits{0};
++      /// Number of spectra in which the precursor met the fragment threshold (how often the
++      /// evidence recurred; a real precursor persists across cycles, a coincidence does not).
++      Size ms2_qualifying_spectra{0};
+       /// Maximum matched MS2 peak intensity.
+       double ms2_max_intensity{0.0};
+       /// Sum of matched MS2 peak intensities from supporting spectra.
+@@ -137,6 +140,7 @@ private:
+     Size ms2_top_peaks_per_spectrum_{1000};
+     Size ms2_top_transitions_per_precursor_{6};
+     Size ms2_min_fragment_hits_{4};
++    Size ms2_min_qualifying_spectra_{1};
+     Size min_supported_precursors_{3};
+     bool peak_picking_enabled_{false};
+     bool peak_picking_use_gauss_{true};
+diff --git a/src/openms/include/OpenMS/FORMAT/ParquetFile.h b/src/openms/include/OpenMS/FORMAT/ParquetFile.h
+index 3e9c14b..8f1d202 100644
+--- a/src/openms/include/OpenMS/FORMAT/ParquetFile.h
++++ b/src/openms/include/OpenMS/FORMAT/ParquetFile.h
+@@ -141,6 +141,44 @@ namespace OpenMS
+     static std::shared_ptr<arrow::Array> getColumn(const std::shared_ptr<arrow::Table>& table,
+                                                    const std::string& name);
+ 
++    /**
++      @brief Random access to a possibly MULTI-CHUNK column, by global row index.
++
++      A single Arrow array cannot hold more than 2 GB of string data, so any large text column is
++      necessarily written as several chunks. getColumn() handles only the single-chunk case (and
++      now throws rather than silently returning a short column); this is the accessor for the
++      general case.
++
++      Resolution caches the current chunk, so sequential scans -- the normal access pattern when
++      reading a table row by row -- cost O(1) per row amortised rather than O(chunks).
++    */
++    class OPENMS_DLLAPI ChunkedColumn
++    {
++    public:
++      ChunkedColumn() = default;
++      ChunkedColumn(const std::shared_ptr<arrow::Table>& table, const std::string& name,
++                    bool required = true);
++
++      /// Underlying array holding @p row, with @p local set to the index within that array.
++      /// Returns nullptr when the column is absent or @p row is out of range.
++      std::shared_ptr<arrow::Array> resolve(int64_t row, int64_t& local) const;
++
++      /// True if the column exists (an optional column may legitimately be absent).
++      bool valid() const { return col_ != nullptr; }
++      int64_t length() const { return col_ ? col_->length() : 0; }
++
++    private:
++      std::shared_ptr<arrow::ChunkedArray> col_;
++      mutable int cur_ = 0;          ///< cached chunk index
++      mutable int64_t base_ = 0;     ///< global row index at which chunk cur_ starts
++    };
++
++    /// Value accessors for a ChunkedColumn. Semantics match the single-array overloads.
++    static double getDouble(const ChunkedColumn& col, int64_t row, double default_value, bool allow_null);
++    static int64_t getInt64(const ChunkedColumn& col, int64_t row, int64_t default_value, bool allow_null);
++    static bool getBool(const ChunkedColumn& col, int64_t row, bool default_value, bool allow_null);
++    static std::string getString(const ChunkedColumn& col, int64_t row);
++
+     /**
+       @brief Get an optional column from an Arrow Table by name.
+ 
+diff --git a/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp b/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp
+index d56b55a..72a3dbd 100644
+--- a/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp
++++ b/src/openms/source/ANALYSIS/OPENSWATH/ChromatogramExtractorAlgorithm.cpp
+@@ -271,6 +271,48 @@ namespace OpenMS
+         "Input to extractChromatogram needs to be sorted by m/z");
+     }
+ 
++    // Reserve each output array to its EXACT final length before extracting anything.
++    //
++    // Without this the two arrays of every chromatogram are grown purely by push_back below, so
++    // libstdc++ doubles them from 1 and the final capacity is the next power of two. That is not a
++    // rounding detail at this scale: a 1435 s RT window on a 0.6 s cycle gives 2392 points per
++    // chromatogram, which allocates 4096 -- 42% of the memory is capacity that is never written.
++    // Measured at the Astral benchmark shape (6,156,235 chromatograms), that slack alone is ~156 GB,
++    // and getting there costs 13 reallocations and a full copy of the data per array, ~2.7 million
++    // reallocations per batch. Both vanish with one reserve.
++    //
++    // The exact count is cheap to know: a chromatogram gets one point per spectrum whose RT falls in
++    // its [rt_start, rt_end] (see the skip test in the loop below), so a metadata-only pass over the
++    // spectrum RTs plus a binary search per coordinate gives it precisely. The loop below already
++    // calls getSpectrumMetaById for every spectrum, so this adds one metadata pass, not a data pass.
++    {
++      std::vector<double> spectrum_rt;
++      spectrum_rt.reserve(input_size);
++      for (Size scan_idx = 0; scan_idx < input_size; ++scan_idx)
++      {
++        spectrum_rt.push_back(input->getSpectrumMetaById(static_cast<int>(scan_idx)).RT);
++      }
++      // The skip test is a plain range check, so the count is order-independent; sorting lets us
++      // binary search rather than scan input_size spectra per coordinate.
++      std::vector<double> sorted_rt = spectrum_rt;
++      std::sort(sorted_rt.begin(), sorted_rt.end());
++      for (Size k = 0; k < extraction_coordinates.size(); ++k)
++      {
++        const auto& c = extraction_coordinates[k];
++        Size n = input_size;
++        if (c.rt_end - c.rt_start > 0)   // same condition the extraction loop uses to skip
++        {
++          n = static_cast<Size>(std::upper_bound(sorted_rt.begin(), sorted_rt.end(), c.rt_end) -
++                                std::lower_bound(sorted_rt.begin(), sorted_rt.end(), c.rt_start));
++        }
++        if (n > 0)
++        {
++          output[k]->getTimeArray()->data.reserve(n);
++          output[k]->getIntensityArray()->data.reserve(n);
++        }
++      }
++    }
++
+     //go through all spectra
+     startProgress(0, input_size, "Extracting chromatograms");
+     for (Size scan_idx = 0; scan_idx < input_size; ++scan_idx)
+diff --git a/src/openms/source/ANALYSIS/OPENSWATH/MRMScoring.cpp b/src/openms/source/ANALYSIS/OPENSWATH/MRMScoring.cpp
+index 10b4280..e993e72 100644
+--- a/src/openms/source/ANALYSIS/OPENSWATH/MRMScoring.cpp
++++ b/src/openms/source/ANALYSIS/OPENSWATH/MRMScoring.cpp
+@@ -110,6 +110,12 @@ namespace OpenSwath
+ 
+     const MRMScoring::XCorrMatrixType& MRMScoring::getXCorrMatrix() const
+     {
++      // MRMScoring_test asserts on this (rows/cols and (0,0).data.size()==21), so the arrays are
++      // still materialised even though no PRODUCTION code reads them -- every score uses only
++      // xcorr_matrix_max_peak_ / _sec_. Scoring::normalizedCrossCorrelationMaxPost() computes those
++      // two numbers with no allocation and would remove ~1e8 allocations per proteome-scale run;
++      // switching to it means changing this tested public contract, which is a decision for the
++      // OpenMS API, not a local optimisation. See docs/OpenDIAlyzer-chromatogram-speedup-review.md.
+       return xcorr_matrix_;
+     }
+ 
+diff --git a/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp b/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
+index 2167591..1e977e9 100644
+--- a/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
++++ b/src/openms/source/ANALYSIS/OPENSWATH/OpenSwathWorkflow.cpp
+@@ -7,6 +7,8 @@
+ // --------------------------------------------------------------------------
+ 
+ #include <OpenMS/ANALYSIS/OPENSWATH/OpenSwathWorkflow.h>
++
++#include <cstdlib>   // getenv: OPENSWATH_MIN_COORDS_PER_CHUNK
+ #include <OpenMS/ANALYSIS/OPENSWATH/CalibrationWorkflow.h>
+ #include <OpenMS/ANALYSIS/OPENSWATH/OpenSwathWorkflowScheduler.h>
+ #include <OpenMS/ANALYSIS/TARGETED/IChromatogramHandler.h>
+@@ -656,8 +658,72 @@ namespace OpenMS
+ 
+         prepareExtractionCoordinates_(chrom_list, coordinates, context.transition_exp_used_all, trafo_inverse, cp);
+ 
+-        extractor.extractChromatograms(context.current_swath_map, chrom_list, coordinates, cp.mz_extraction_window,
+-            cp.ppm, cp.im_extraction_window, cp.extraction_function);
++        // Chromatogram extraction is parallelised over *coordinate chunks* as well as over
++        // SWATHs. The outer wave loop can only ever reach `#SWATH windows` (24 on typical
++        // diaPASEF data), which leaves a 224-core machine ~90% idle during extraction.
++        //
++        // Splitting the coordinate list is safe by construction: extractChromatograms() keeps
++        // a merge-join cursor over the m/z-sorted coordinates *within one call*, and writes
++        // only to output[k] of its own slice, so independent calls cannot interact. The only
++        // duplicated work is the per-spectrum setup (getSpectrumById + array handles), which is
++        // O(#spectra) ~ 1.3e3 versus O(#coordinates) ~ 1e5-1e6 of real work -- i.e. negligible.
++        // Requires nested OpenMP (the caller enables it); with nesting off this degrades to the
++        // original single-threaded-per-SWATH behaviour, still correct.
++        {
++          const Size n_coord = coordinates.size();
++          int inner_threads = 1;
++#ifdef _OPENMP
++          const int outer_active = std::max(1, omp_get_num_threads());
++          inner_threads = std::max(1, omp_get_max_threads() / outer_active);
++#endif
++          // Only chunk when there is enough work to amortise the per-chunk spectrum sweep.
++          // Below this many coordinates per chunk the per-chunk spectrum sweep (O(#spectra))
++          // costs more than the extraction it parallelises, so chunking is skipped and we fall
++          // back to one thread per SWATH. That is CORRECT but was invisible: a small library
++          // silently pins the run at #SWATH-windows cores (measured 24/224 on a 39k-transition
++          // subset, ~1.6k coords/window), which looks like a hard parallelism ceiling and is
++          // not. Overridable so the trade-off can be measured rather than guessed.
++          // Read ONCE: this sits inside the per-SWATH extraction loop, and getenv() is neither
++          // free nor guaranteed safe against a concurrent setenv.
++          static const Size min_per_chunk = []() -> Size {
++            if (const char* e = std::getenv("OPENSWATH_MIN_COORDS_PER_CHUNK"))
++            {
++              const long v = std::atol(e);
++              if (v > 0) { return static_cast<Size>(v); }
++            }
++            return 2000;
++          }();
++          Size n_chunks = static_cast<Size>(inner_threads);
++          if (n_chunks > 1 && n_coord / n_chunks < min_per_chunk) { n_chunks = std::max<Size>(1, n_coord / min_per_chunk); }
++
++          if (n_chunks <= 1)
++          {
++            OPENMS_LOG_DEBUG << "[extract] no chunking: " << n_coord << " coords, "
++                             << inner_threads << " inner threads, min_per_chunk "
++                             << min_per_chunk << " -> 1 thread for this SWATH" << std::endl;
++            extractor.extractChromatograms(context.current_swath_map, chrom_list, coordinates, cp.mz_extraction_window,
++                cp.ppm, cp.im_extraction_window, cp.extraction_function);
++          }
++          else
++          {
++#ifdef _OPENMP
++#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_chunks))
++#endif
++            for (SignedSize c = 0; c < static_cast<SignedSize>(n_chunks); ++c)
++            {
++              const Size lo = n_coord * static_cast<Size>(c) / n_chunks;
++              const Size hi = n_coord * static_cast<Size>(c + 1) / n_chunks;
++              if (hi <= lo) { continue; }
++              std::vector<ChromatogramExtractor::ExtractionCoordinates> sub(coordinates.begin() + lo, coordinates.begin() + hi);
++              std::vector<OpenSwath::ChromatogramPtr> sub_out(chrom_list.begin() + lo, chrom_list.begin() + hi);
++              // lightClone() gives each chunk its own cursor into the (shared, immutable) data
++              OpenSwath::SpectrumAccessPtr map_c = context.current_swath_map->lightClone();
++              ChromatogramExtractor ex_c;
++              ex_c.extractChromatograms(map_c, sub_out, sub, cp.mz_extraction_window,
++                  cp.ppm, cp.im_extraction_window, cp.extraction_function);
++            }
++          }
++        }
+ 
+         extractor.return_chromatogram(chrom_list, coordinates, context.transition_exp_used_all, SpectrumSettings(),
+                                       context.chrom_exp.getChromatograms(), false, cp.im_extraction_window);
+@@ -1116,7 +1182,8 @@ namespace OpenMS
+             PeakMap chrom_exp;
+             extractor.return_chromatogram(chrom_list, coordinates, transition_exp_used,  SpectrumSettings(),
+                                           chrom_exp.getChromatograms(), false, cp.im_extraction_window);
+-
++            chrom_list.clear();
++            chrom_list.shrink_to_fit();
+ 
+             // Step 3: score these extracted transitions
+             FeatureMap featureFile;
+diff --git a/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp b/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp
+index afd199f..74a61ad 100644
+--- a/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp
++++ b/src/openms/source/ANALYSIS/OPENSWATH/TransitionListEvidenceFilter.cpp
+@@ -102,6 +102,7 @@ namespace OpenMS
+       double ms1_best_rt{-1.0};
+       Size ms2_hit_count{0};
+       Size ms2_best_fragment_hits{0};
++      Size ms2_qualifying_spectra{0};
+       double ms2_max_intensity{0.0};
+       double ms2_sum_intensity{0.0};
+       double ms2_best_rt{-1.0};
+@@ -118,6 +119,7 @@ namespace OpenMS
+ 
+         ms2_hit_count += rhs.ms2_hit_count;
+         ms2_sum_intensity += rhs.ms2_sum_intensity;
++        ms2_qualifying_spectra += rhs.ms2_qualifying_spectra;
+         ms2_best_fragment_hits = std::max(ms2_best_fragment_hits, rhs.ms2_best_fragment_hits);
+         if (rhs.ms2_max_intensity > ms2_max_intensity)
+         {
+@@ -342,6 +344,13 @@ namespace OpenMS
+     {
+       EvidenceAccum& evidence = local_evidence[candidate_index];
+       evidence.ms2_hit_count += distinct_fragment_hits;
++      // Called only when this spectrum already met min_fragment_hits, so this counts SPECTRA in
++      // which the precursor qualified -- i.e. how often the evidence RECURRED. Without it the
++      // criterion is a max over every spectrum in the run: on a 3889-cycle gradient a precursor
++      // gets 3889 independent chances at a coincidence, which is why shuffled decoys pass at
++      // 91-98% of the target rate. A real precursor persists across cycles (DIA-NN measures
++      // FWHM.Scans = 2.53 on this data); a coincidence is a one-off.
++      ++evidence.ms2_qualifying_spectra;
+       evidence.ms2_sum_intensity += sum_intensity;
+       evidence.ms2_best_fragment_hits = std::max(evidence.ms2_best_fragment_hits, distinct_fragment_hits);
+       if (max_intensity > evidence.ms2_max_intensity)
+@@ -1088,6 +1097,9 @@ namespace OpenMS
+     defaults_.setMinInt("ms2_min_fragment_hits", 1);
+     defaults_.setMaxInt("ms2_min_fragment_hits", 64);
+ 
++    defaults_.setValue("ms2_min_qualifying_spectra", 1, "Minimum number of spectra in which the fragment threshold must be met. 1 = the historical behaviour (best single spectrum in the entire run). Values >1 require the evidence to RECUR, which is what separates a real precursor (persists over several cycles) from a one-off m/z coincidence.");
++    defaults_.setMinInt("ms2_min_qualifying_spectra", 1);
++
+     defaults_.setValue("min_supported_precursors", 3, "Minimum number of supported precursors required when the prefilter is enabled.");
+     defaults_.setMinInt("min_supported_precursors", 1);
+ 
+@@ -1111,6 +1123,7 @@ namespace OpenMS
+     ms2_top_peaks_per_spectrum_ = static_cast<Size>(param_.getValue("ms2_top_peaks_per_spectrum"));
+     ms2_top_transitions_per_precursor_ = static_cast<Size>(param_.getValue("ms2_top_transitions_per_precursor"));
+     ms2_min_fragment_hits_ = static_cast<Size>(param_.getValue("ms2_min_fragment_hits"));
++    ms2_min_qualifying_spectra_ = static_cast<Size>(param_.getValue("ms2_min_qualifying_spectra"));
+     min_supported_precursors_ = static_cast<Size>(param_.getValue("min_supported_precursors"));
+     peak_picking_enabled_ = param_.getValue("peak_picking:enabled").toBool();
+     peak_picking_use_gauss_ = param_.getValue("peak_picking:use_gauss").toBool();
+@@ -1240,13 +1253,20 @@ namespace OpenMS
+       {
+         auto& out = result.evidence[i];
+         out.supported_ms1 = evidence[i].ms1_hit_count > 0;
+-        out.supported_ms2 = evidence[i].ms2_best_fragment_hits >= ms2_min_fragment_hits_;
++        // Recurrence is the discriminating dimension this filter was missing. Matching on m/z
++        // alone, taking the best single spectrum out of the whole gradient, does not separate
++        // targets from shuffled decoys (measured 1.02x enrichment at 4-of-6). Requiring the
++        // evidence to reappear in several spectra costs a real precursor almost nothing and
++        // makes an isolated coincidence fail.
++        out.supported_ms2 = evidence[i].ms2_best_fragment_hits >= ms2_min_fragment_hits_
++                            && evidence[i].ms2_qualifying_spectra >= ms2_min_qualifying_spectra_;
+         out.ms1_hit_count = evidence[i].ms1_hit_count;
+         out.ms1_max_intensity = evidence[i].ms1_max_intensity;
+         out.ms1_sum_intensity = evidence[i].ms1_sum_intensity;
+         out.ms1_best_rt = evidence[i].ms1_best_rt;
+         out.ms2_hit_count = evidence[i].ms2_hit_count;
+         out.ms2_best_fragment_hits = evidence[i].ms2_best_fragment_hits;
++        out.ms2_qualifying_spectra = evidence[i].ms2_qualifying_spectra;
+         out.ms2_max_intensity = evidence[i].ms2_max_intensity;
+         out.ms2_sum_intensity = evidence[i].ms2_sum_intensity;
+         out.ms2_best_rt = evidence[i].ms2_best_rt;
+diff --git a/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp b/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp
+index eb2bfc4..3c75420 100644
+--- a/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp
++++ b/src/openms/source/ANALYSIS/OPENSWATH/TransitionParquetFile.cpp
+@@ -319,19 +319,24 @@ namespace OpenMS
+       }
+     }
+ 
+-    auto transition_id_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::TRANSITION_ID);
+-    auto transition_traml_id_col = ParquetFile::getOptionalColumn(transitions_table, OSWTransitionSchema::TRAML_ID);
+-    auto transition_precursor_id_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::PRECURSOR_ID);
+-    auto product_mz_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::PRODUCT_MZ);
+-    auto fragment_charge_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::CHARGE);
+-    auto fragment_type_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::TYPE);
+-    auto fragment_annotation_col = ParquetFile::getOptionalColumn(transitions_table, OSWTransitionSchema::ANNOTATION);
+-    auto fragment_ordinal_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::ORDINAL);
+-    auto detecting_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::DETECTING);
+-    auto identifying_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::IDENTIFYING);
+-    auto quantifying_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::QUANTIFYING);
+-    auto transition_intensity_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::LIBRARY_INTENSITY);
+-    auto transition_decoy_col = ParquetFile::getColumn(transitions_table, OSWTransitionSchema::DECOY);
++    // Chunk-aware: the transitions table is written as several chunks per column (a single arrow
++    // string array cannot exceed 2 GB, and `traml_id` on a proteome-scale library is far past that).
++    // getColumn() returns only chunk 0 -- it now throws rather than silently truncating -- so every
++    // column here goes through ChunkedColumn, which resolves a global row index to (chunk, offset).
++    using CC = ParquetFile::ChunkedColumn;
++    CC transition_id_col(transitions_table, OSWTransitionSchema::TRANSITION_ID);
++    CC transition_traml_id_col(transitions_table, OSWTransitionSchema::TRAML_ID, false);
++    CC transition_precursor_id_col(transitions_table, OSWTransitionSchema::PRECURSOR_ID);
++    CC product_mz_col(transitions_table, OSWTransitionSchema::PRODUCT_MZ);
++    CC fragment_charge_col(transitions_table, OSWTransitionSchema::CHARGE);
++    CC fragment_type_col(transitions_table, OSWTransitionSchema::TYPE);
++    CC fragment_annotation_col(transitions_table, OSWTransitionSchema::ANNOTATION, false);
++    CC fragment_ordinal_col(transitions_table, OSWTransitionSchema::ORDINAL);
++    CC detecting_col(transitions_table, OSWTransitionSchema::DETECTING);
++    CC identifying_col(transitions_table, OSWTransitionSchema::IDENTIFYING);
++    CC quantifying_col(transitions_table, OSWTransitionSchema::QUANTIFYING);
++    CC transition_intensity_col(transitions_table, OSWTransitionSchema::LIBRARY_INTENSITY);
++    CC transition_decoy_col(transitions_table, OSWTransitionSchema::DECOY);
+ 
+     std::unordered_set<std::string> used_transition_names;
+     used_transition_names.reserve(transitions_table->num_rows());
+@@ -593,9 +598,51 @@ namespace OpenMS
+     arrow::BooleanBuilder detecting_builder;
+     arrow::BooleanBuilder identifying_builder;
+     arrow::BooleanBuilder quantifying_builder;
+-    arrow::DoubleBuilder transition_intensity_builder;
++    arrow::FloatBuilder transition_intensity_builder;   // float32: see ArrowSchemaRegistry (relative intensities)
+     arrow::BooleanBuilder transition_decoy_builder;
+ 
++    // Chunked columns. `arrow::StringBuilder` uses 32-bit offsets, so ONE array can hold at most
++    // 2 GB of string data; a whole-proteome library (78.5M transitions with long `traml_id`s)
++    // exceeds that and the write died with
++    //   "Capacity error: array cannot contain more than 2147483646 bytes, have 2147483647
++    //    ... Failed to append value for traml_id".
++    // Splitting each column into several arrays fixes it WITHOUT touching the on-disk schema:
++    // `arrow::Table` columns are ChunkedArrays, parquet writes them as successive row groups, and
++    // readers see an ordinary utf8 column. (`large_utf8` would also work but changes the format and
++    // breaks other OSWPQ readers.)
++    struct TransitionChunks
++    {
++      std::vector<std::shared_ptr<arrow::Array>> transition_id, precursor_id, traml_id, product_mz,
++        charge, type, annotation, ordinal, detecting, identifying, quantifying, intensity, decoy;
++    } chunks;
++
++    auto flush_transition_chunk = [&]() {
++      if (transition_id_builder.length() == 0) { return; }   // nothing pending
++      chunks.transition_id.push_back(ParquetFile::finishArray(transition_id_builder, "transition_id"));
++      chunks.precursor_id.push_back(ParquetFile::finishArray(transition_precursor_id_builder, "precursor_id"));
++      chunks.traml_id.push_back(ParquetFile::finishArray(transition_traml_id_builder, "traml_id"));
++      chunks.product_mz.push_back(ParquetFile::finishArray(product_mz_builder, "product_mz"));
++      chunks.charge.push_back(ParquetFile::finishArray(fragment_charge_builder, "charge"));
++      chunks.type.push_back(ParquetFile::finishArray(fragment_type_builder, "type"));
++      chunks.annotation.push_back(ParquetFile::finishArray(annotation_builder, "annotation"));
++      chunks.ordinal.push_back(ParquetFile::finishArray(ordinal_builder, "ordinal"));
++      chunks.detecting.push_back(ParquetFile::finishArray(detecting_builder, "detecting"));
++      chunks.identifying.push_back(ParquetFile::finishArray(identifying_builder, "identifying"));
++      chunks.quantifying.push_back(ParquetFile::finishArray(quantifying_builder, "quantifying"));
++      chunks.intensity.push_back(ParquetFile::finishArray(transition_intensity_builder, "library_intensity"));
++      chunks.decoy.push_back(ParquetFile::finishArray(transition_decoy_builder, "decoy"));
++    };
++
++    // Flush well before the hard 2 GB ceiling, and test the accumulated BYTES rather than a row
++    // count -- `traml_id` length varies with peptide and decoy prefix, so a fixed row quota either
++    // wastes memory or still overflows on an unusual library.
++    constexpr int64_t CHUNK_BYTES = 512LL * 1024 * 1024;
++    auto string_chunk_full = [&]() {
++      return transition_traml_id_builder.value_data_length() > CHUNK_BYTES
++             || annotation_builder.value_data_length() > CHUNK_BYTES
++             || fragment_type_builder.value_data_length() > CHUNK_BYTES;
++    };
++
+     int64_t transition_id = 1;
+     for (const auto& transition : targeted_exp.transitions)
+     {
+@@ -651,25 +698,36 @@ namespace OpenMS
+         if (transition_decoy) stats.fragment_other_decoy++;
+         else stats.fragment_other_target++;
+       }
++
++      if (string_chunk_full()) { flush_transition_chunk(); }
+     }
+ 
+     auto transition_schema = OSWTransitionSchema::schema();
++    flush_transition_chunk();   // close the final partial chunk
++
++    auto chunked = [](std::vector<std::shared_ptr<arrow::Array>>& v,
++                      const std::shared_ptr<arrow::DataType>& t) {
++      // An empty library still needs a typed, zero-length column.
++      return v.empty() ? std::make_shared<arrow::ChunkedArray>(arrow::ArrayVector{}, t)
++                       : std::make_shared<arrow::ChunkedArray>(v);
++    };
+ 
+     auto transitions_table = arrow::Table::Make(
+       transition_schema,
+-      {ParquetFile::finishArray(transition_id_builder, "transition_id"),
+-       ParquetFile::finishArray(transition_precursor_id_builder, "precursor_id"),
+-       ParquetFile::finishArray(transition_traml_id_builder, "traml_id"),
+-       ParquetFile::finishArray(product_mz_builder, "product_mz"),
+-       ParquetFile::finishArray(fragment_charge_builder, "charge"),
+-       ParquetFile::finishArray(fragment_type_builder, "type"),
+-       ParquetFile::finishArray(annotation_builder, "annotation"),
+-       ParquetFile::finishArray(ordinal_builder, "ordinal"),
+-       ParquetFile::finishArray(detecting_builder, "detecting"),
+-       ParquetFile::finishArray(identifying_builder, "identifying"),
+-       ParquetFile::finishArray(quantifying_builder, "quantifying"),
+-       ParquetFile::finishArray(transition_intensity_builder, "library_intensity"),
+-       ParquetFile::finishArray(transition_decoy_builder, "decoy")});
++      std::vector<std::shared_ptr<arrow::ChunkedArray>>{
++        chunked(chunks.transition_id, arrow::int64()),
++        chunked(chunks.precursor_id, arrow::int64()),
++        chunked(chunks.traml_id, arrow::utf8()),
++        chunked(chunks.product_mz, arrow::float64()),
++        chunked(chunks.charge, arrow::int32()),
++        chunked(chunks.type, arrow::utf8()),
++        chunked(chunks.annotation, arrow::utf8()),
++        chunked(chunks.ordinal, arrow::int32()),
++        chunked(chunks.detecting, arrow::boolean()),
++        chunked(chunks.identifying, arrow::boolean()),
++        chunked(chunks.quantifying, arrow::boolean()),
++        chunked(chunks.intensity, arrow::float32()),
++        chunked(chunks.decoy, arrow::boolean())});
+ 
+     // Validate transitions table against registry schema
+     auto trans_validation = ArrowSchemaValidation::validate(transitions_table, OSWTransitionSchema::schema());
+diff --git a/src/openms/source/FORMAT/ArrowSchemaRegistry.cpp b/src/openms/source/FORMAT/ArrowSchemaRegistry.cpp
+index f73c9b1..50999c2 100644
+--- a/src/openms/source/FORMAT/ArrowSchemaRegistry.cpp
++++ b/src/openms/source/FORMAT/ArrowSchemaRegistry.cpp
+@@ -772,7 +772,12 @@ namespace OpenMS
+       arrow::field(DETECTING, arrow::boolean()),
+       arrow::field(IDENTIFYING, arrow::boolean()),
+       arrow::field(QUANTIFYING, arrow::boolean()),
+-      arrow::field(LIBRARY_INTENSITY, arrow::float64()),
++      // float32, not float64: library intensities are RELATIVE fragment intensities (predicted or
++      // measured, then normalised), so ~7 significant digits is far more than the quantity carries.
++      // At float64 this column cost 654 MB on a 78.5M-transition library -- 12% of the whole
++      // bundle -- for precision that does not exist in the input. NOTE this is an on-disk format
++      // change: readers expecting float64 here must be updated in step.
++      arrow::field(LIBRARY_INTENSITY, arrow::float32()),
+       arrow::field(DECOY, arrow::boolean()),
+     });
+   }
+diff --git a/src/openms/source/FORMAT/ParquetFile.cpp b/src/openms/source/FORMAT/ParquetFile.cpp
+index f2f24c0..0f3bb8e 100644
+--- a/src/openms/source/FORMAT/ParquetFile.cpp
++++ b/src/openms/source/FORMAT/ParquetFile.cpp
+@@ -57,7 +57,20 @@ namespace OpenMS
+     const auto& outfile = outfile_result.ValueOrDie();
+     // Use a larger default row_group_size than 1024 to improve compression and reduce metadata overhead.
+     // Default is configurable by callers via the row_group_size parameter.
+-    auto status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile, static_cast<int>(row_group_size));
++    //
++    // Compression was never enabled: every column of a written file came back UNCOMPRESSED with a
++    // 1.00x ratio, which on a whole-proteome transition library meant 4.6 GB of parquet holding
++    // highly repetitive data (`traml_id` alone was 2.7 GB of near-identical peptide-derived
++    // strings). ZSTD at a low level is the right default here -- it compresses this shape far
++    // better than Snappy while staying fast enough that the write is still I/O-bound, and every
++    // Arrow/Parquet reader supports it.
++    parquet::WriterProperties::Builder props;
++    props.compression(parquet::Compression::ZSTD);
++    props.compression_level(3);            // ZSTD default; higher costs CPU for little on this data
++    props.enable_dictionary();             // repeated strings/ids collapse to dictionary indices
++    props.data_page_version(parquet::ParquetDataPageVersion::V2);   // enables better int encodings
++    auto status = parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), outfile,
++                                             static_cast<int>(row_group_size), props.build());
+     if (!status.ok())
+     {
+       throw Exception::InvalidValue(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
+@@ -108,11 +121,19 @@ namespace OpenMS
+       return table;
+     }
+ 
++    // Combining is a convenience for callers that index a column as one array -- it is NOT always
++    // possible. A single arrow string array caps at 2 GB, so a large text column (e.g. `traml_id`
++    // on a proteome-scale transition library) CANNOT be combined and the attempt fails with
++    // "array cannot contain more than 2147483646 bytes". Previously that threw and the file simply
++    // could not be read back, which is why a written library was unreadable. Fall back to the
++    // chunked table instead: ParquetFile::ChunkedColumn addresses it by global row index.
+     auto combined = table->CombineChunks(arrow::default_memory_pool());
+     if (!combined.ok())
+     {
+-      throw Exception::InvalidValue(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
+-                                    "Failed to combine parquet chunks", filename);
++      OPENMS_LOG_DEBUG << "ParquetFile: chunks could not be combined for " << filename << " ("
++                       << combined.status().ToString() << "); returning the chunked table. "
++                       << "Read it with ChunkedColumn, not getColumn()." << std::endl;
++      return table;
+     }
+ 
+     return *combined;
+@@ -151,11 +172,15 @@ namespace OpenMS
+       return table;
+     }
+ 
++    // See the filename overload: an oversized string column cannot be combined into one array, and
++    // failing here made written libraries unreadable. Return the chunked table for ChunkedColumn.
+     auto combined = table->CombineChunks(arrow::default_memory_pool());
+     if (!combined.ok())
+     {
+-      throw Exception::InvalidValue(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
+-                                    "Failed to combine parquet chunks from RandomAccessFile", "");
++      OPENMS_LOG_DEBUG << "ParquetFile: chunks could not be combined ("
++                       << combined.status().ToString() << "); returning the chunked table."
++                       << std::endl;
++      return table;
+     }
+ 
+     return *combined;
+@@ -177,6 +202,17 @@ namespace OpenMS
+       throw Exception::InvalidValue(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
+                                     "Column has no chunks", name);
+     }
++    // Returning chunk(0) for a MULTI-chunk column silently discards every later chunk -- the caller
++    // gets a short column and no error, which for a transition library means quietly losing most of
++    // it. Writers legitimately produce several chunks (a single arrow string array cannot exceed
++    // 2 GB, so any large text column must be split). Fail loudly and point at the chunk-aware API.
++    if (column->num_chunks() > 1)
++    {
++      throw Exception::InvalidValue(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
++                                    "Column '" + name + "' has " + std::to_string(column->num_chunks()) +
++                                    " chunks; use getChunkedColumn() -- getColumn() would silently "
++                                    "return only the first chunk", name);
++    }
+     return column->chunk(0);
+   }
+ 
+@@ -244,6 +280,64 @@ namespace OpenMS
+     }
+   }
+ 
++  // ---- ChunkedColumn: random access across chunk boundaries -------------------------------
++
++  ParquetFile::ChunkedColumn::ChunkedColumn(const std::shared_ptr<arrow::Table>& table,
++                                            const std::string& name, bool required)
++  {
++    col_ = table ? table->GetColumnByName(name) : nullptr;
++    if (!col_ && required)
++    {
++      throw Exception::MissingInformation(__FILE__, __LINE__, OPENMS_PRETTY_FUNCTION,
++                                          "Missing required column '" + name + "'");
++    }
++  }
++
++  std::shared_ptr<arrow::Array> ParquetFile::ChunkedColumn::resolve(int64_t row, int64_t& local) const
++  {
++    if (!col_ || row < 0 || row >= col_->length()) { return nullptr; }
++    const int n = col_->num_chunks();
++    // Rewind if the caller jumped backwards past the cached chunk.
++    if (row < base_) { cur_ = 0; base_ = 0; }
++    // Walk forward. Sequential scans advance at most one chunk per call, so this is O(1) amortised.
++    while (cur_ < n && row >= base_ + col_->chunk(cur_)->length())
++    {
++      base_ += col_->chunk(cur_)->length();
++      ++cur_;
++    }
++    if (cur_ >= n) { return nullptr; }
++    local = row - base_;
++    return col_->chunk(cur_);
++  }
++
++  double ParquetFile::getDouble(const ChunkedColumn& col, int64_t row, double default_value, bool allow_null)
++  {
++    int64_t local = 0;
++    auto a = col.resolve(row, local);
++    return a ? getDouble(a, local, default_value, allow_null) : default_value;
++  }
++
++  int64_t ParquetFile::getInt64(const ChunkedColumn& col, int64_t row, int64_t default_value, bool allow_null)
++  {
++    int64_t local = 0;
++    auto a = col.resolve(row, local);
++    return a ? getInt64(a, local, default_value, allow_null) : default_value;
++  }
++
++  bool ParquetFile::getBool(const ChunkedColumn& col, int64_t row, bool default_value, bool allow_null)
++  {
++    int64_t local = 0;
++    auto a = col.resolve(row, local);
++    return a ? getBool(a, local, default_value, allow_null) : default_value;
++  }
++
++  std::string ParquetFile::getString(const ChunkedColumn& col, int64_t row)
++  {
++    int64_t local = 0;
++    auto a = col.resolve(row, local);
++    return a ? getString(a, local) : std::string();
++  }
++
+   double ParquetFile::getDouble(const std::shared_ptr<arrow::Array>& array, int64_t row,
+                                 double default_value, bool allow_null)
+   {
+diff --git a/src/openswathalgo/include/OpenMS/OPENSWATHALGO/ALGO/Scoring.h b/src/openswathalgo/include/OpenMS/OPENSWATHALGO/ALGO/Scoring.h
+index af8430f..2479876 100644
+--- a/src/openswathalgo/include/OpenMS/OPENSWATHALGO/ALGO/Scoring.h
++++ b/src/openswathalgo/include/OpenMS/OPENSWATHALGO/ALGO/Scoring.h
+@@ -118,6 +118,27 @@ public:
+     /// Find best peak in an cross-correlation (highest apex)
+     OPENSWATHALGO_DLLAPI XCorrArrayType::const_iterator xcorrArrayGetMaxPeak(const XCorrArrayType & array);
+ 
++    /**
++      @brief The maximum of the normalised cross-correlation, WITHOUT materialising it.
++
++      Returns (delay, value) at the peak — the only two numbers MRMScoring actually keeps.
++
++      Every caller in this codebase follows normalizedCrossCorrelationPost() immediately with
++      xcorrArrayGetMaxPeak() and then stores only |delay| and value; the array itself is read once,
++      on the next line, and never again. Building it costs a heap allocation and 2*maxdelay+1
++      pair<int,double> writes per transition PAIR, i.e. ~O(10^8) allocations over a proteome-scale
++      run, for data that is discarded. This computes the same maximum in the same loop and allocates
++      nothing.
++
++      Numerically identical to xcorrArrayGetMaxPeak(normalizedCrossCorrelationPost(...)): the same
++      dot products in the same order, and the same first-wins tie rule (strict >), so the reported
++      delay for tied maxima matches.
++    */
++    OPENSWATHALGO_DLLAPI std::pair<int, double> normalizedCrossCorrelationMaxPost(
++        const std::vector<double>& normalized_data1,
++        const std::vector<double>& normalized_data2,
++        int maxdelay, int lag);
++
+     /// Standardize a vector (subtract mean, divide by standard deviation)
+     OPENSWATHALGO_DLLAPI void standardize_data(std::vector<double>& data);
+ 
+diff --git a/src/openswathalgo/source/OPENSWATHALGO/ALGO/Scoring.cpp b/src/openswathalgo/source/OPENSWATHALGO/ALGO/Scoring.cpp
+index fa30e2b..c6f10e0 100644
+--- a/src/openswathalgo/source/OPENSWATHALGO/ALGO/Scoring.cpp
++++ b/src/openswathalgo/source/OPENSWATHALGO/ALGO/Scoring.cpp
+@@ -116,6 +116,51 @@ namespace OpenSwath::Scoring
+       return result;
+     }
+ 
++    std::pair<int, double> normalizedCrossCorrelationMaxPost(
++        const std::vector<double>& normalized_data1, const std::vector<double>& normalized_data2,
++        const int maxdelay, const int lag)
++    {
++      OPENSWATH_PRECONDITION(normalized_data1.size() == normalized_data2.size(),
++                             "Both data vectors need to have the same length");
++
++      // Same loop as calculateCrossCorrelation + the /size() of normalizedCrossCorrelationPost +
++      // the scan of xcorrArrayGetMaxPeak, fused. The division is applied to the running best rather
++      // than to every element, which is also why nothing is stored.
++      const int datasize = static_cast<int>(normalized_data1.size());
++      const double* __restrict d1 = normalized_data1.data();
++      const double* __restrict d2 = normalized_data2.data();
++
++      int best_delay = -maxdelay;
++      double best = -std::numeric_limits<double>::max();
++      bool have = false;
++
++      for (int delay = -maxdelay; delay <= maxdelay; delay += lag)
++      {
++        const int start = std::max(0, -delay);
++        const int end = std::min(datasize, datasize - delay);
++        const int len = end - start;
++
++        double sxy = 0.0;
++        if (len > 0)
++        {
++          Eigen::Map<const Eigen::VectorXd> sub1(d1 + start, len);
++          Eigen::Map<const Eigen::VectorXd> sub2(d2 + start + delay, len);
++          sxy = sub1.dot(sub2);
++        }
++        // Strict >, matching xcorrArrayGetMaxPeak, which keeps the FIRST maximum it meets while
++        // walking from -maxdelay upward. A >= here would silently change the reported delay on ties
++        // and with it the coelution score.
++        if (!have || sxy > best)
++        {
++          have = true;
++          best = sxy;
++          best_delay = delay;
++        }
++      }
++      if (datasize == 0) { return {0, 0.0}; }
++      return {best_delay, best / static_cast<double>(datasize)};
++    }
++
+     XCorrArrayType calculateCrossCorrelation(const std::vector<double>& data1,
+                                              const std::vector<double>& data2, const int maxdelay, const int lag)
+     {

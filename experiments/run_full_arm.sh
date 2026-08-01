@@ -24,9 +24,15 @@ declare -A RAWF=(
   [S23]=FKL4341-S23-A-8_K253-09-2_QKL29026AF_Slot1-17_1_1320.d
   [S30]=FKL4341-S30-A-10_K25423-16-1_QKL29028AV_Slot1-19_1_1326.d )
 
+# RT_WIN measured, not guessed. PeptDeep's predicted RT vs this run's observed RT
+# (shared peptides against the DIA-NN empirical library) gives residual sd ~810s
+# and 95th pct ~1720s even after a nonlinear OSW-like calibration -- so covering
+# 95% of peptides needs a ~3440s FULL window. The 2064s DIA-NN used would clip
+# ~20% here, because DIA-NN iteratively recalibrates and narrows its window while
+# OpenSWATH gets one global CiRT calibration. 3600s = +/-30 min, ~95% coverage.
 run_one () {
   local t=$1
-  IM_WIN=0.047 MZ_WIN=30 MZ_WIN_MS1=30 RT_WIN=2064 THREADS=48 OUTER=25 \
+  IM_WIN=0.047 MZ_WIN=30 MZ_WIN_MS1=30 RT_WIN=3600 THREADS=48 OUTER=25 \
     "$RUNSH" "$RAW/${RAWF[$t]}" "$F/library.tsv" "$F/osw/$t" > "$F/osw/$t.runlog" 2>&1
 }
 
@@ -43,6 +49,16 @@ $OMS/OpenSwathDecoyGenerator -in "$F/assay.tsv" -out "$F/library.tsv" \
   -method shuffle -switchKR true -min_decoy_fraction 0.1 > "$F/decoy.log" 2>&1 \
   || { echo "FATAL: decoy generator (see decoy.log)"; exit 3; }
 echo "[$(date +%T)] library ready: $(du -h $F/library.tsv | cut -f1)"
+
+# RT calibration gate. With no -tr_irt, OpenSWATH anchors RT on CiRT peptides it
+# finds IN the main library and uses their library RT -- which is what lets a
+# PeptDeep 0-1 scale work at all. Too few anchors => the transform is garbage and
+# every extraction window lands in the wrong place.
+awk -F"\t" 'NR>1{print $7}' /home/kohlbach/openms3/share/OpenMS/CHEMISTRY/cirtkit.tsv \
+  | sort -u > "$F/cirt.seq"
+NC=$(awk -F"\t" 'NR>1{print $7}' "$F/library.tsv" | sort -u | grep -Fxf "$F/cirt.seq" | wc -l)
+echo "[$(date +%T)] CiRT anchors present in library: $NC / $(wc -l < "$F/cirt.seq")"
+[ "$NC" -lt 20 ] && echo "[$(date +%T)] WARNING: few CiRT anchors -- RT calibration may be unreliable"
 
 # S08 first as a fail-fast probe: PeptDeep's 0-1 RT scale relies on OpenSWATH
 # self-anchoring RT on CiRT peptides in the library. If that breaks, IDs collapse
