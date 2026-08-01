@@ -387,6 +387,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
   group_lookup.reserve(n);
   std::vector<std::vector<std::size_t>> group_rows;
   std::vector<int> group_label;
+  std::vector<long long> group_id;                 // the precursor id behind each group index
   for (std::size_t i = 0; i < n; ++i)
   {
     auto inserted = group_lookup.emplace(group[i], group_rows.size());
@@ -394,6 +395,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
     {
       group_rows.emplace_back();
       group_label.push_back(labels[i] == 1 ? 1 : 0);
+      group_id.push_back(group[i]);
     }
     const std::size_t g = inserted.first->second;
     group_rows[g].push_back(i);
@@ -412,6 +414,16 @@ inline ScoredGroups scoreSemiSupervisedLDA(
   {
     (group_label[g] == 1 ? target_groups : decoy_groups).push_back(g);
   }
+  // Order these by the precursor's IDENTITY before shuffling. A group's index is its
+  // first-occurrence position in row order, and row order is whatever the parallel extraction
+  // happened to produce -- so a seeded shuffle of indices still put the same precursor in a
+  // different fold on every run, training a different model and reporting a different ID count.
+  // Measured spread on byte-identical input: 6487 / 6565 / 6433 (+/-1%), which is larger than
+  // most of the effects being A/B tested. Sorting by id first costs one sort and makes the fold
+  // assignment a function of the data alone; the shuffle still balances fold sizes exactly.
+  const auto by_id = [&](std::size_t a, std::size_t b) { return group_id[a] < group_id[b]; };
+  std::sort(target_groups.begin(), target_groups.end(), by_id);
+  std::sort(decoy_groups.begin(), decoy_groups.end(), by_id);
   std::mt19937 rng(params.seed);
   std::shuffle(target_groups.begin(), target_groups.end(), rng);
   std::shuffle(decoy_groups.begin(), decoy_groups.end(), rng);

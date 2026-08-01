@@ -59,6 +59,37 @@ int main()
   odia::LDAParams p;  // defaults
   odia::ScoredGroups s = odia::scoreSemiSupervisedLDA(feats, labels, group, p);
 
+  // ---- row order must not change the result ----
+  // Fold assignment used a group's first-occurrence POSITION, and row order is whatever the
+  // parallel extraction produced -- so identical input gave 6487 / 6565 / 6433 IDs across three
+  // real runs. Permute the rows, score again, and require the per-row d-scores to match exactly.
+  {
+    std::vector<std::size_t> perm(feats.size());
+    for (std::size_t i = 0; i < perm.size(); ++i) { perm[i] = i; }
+    std::mt19937 prng(999);
+    std::shuffle(perm.begin(), perm.end(), prng);
+
+    std::vector<std::vector<double>> f2(feats.size());
+    std::vector<int> l2(feats.size());
+    std::vector<long long> g2(feats.size());
+    for (std::size_t i = 0; i < perm.size(); ++i)
+    {
+      f2[i] = feats[perm[i]]; l2[i] = labels[perm[i]]; g2[i] = group[perm[i]];
+    }
+    const odia::ScoredGroups s2 = odia::scoreSemiSupervisedLDA(f2, l2, g2, p);
+    double worst = 0.0;
+    for (std::size_t i = 0; i < perm.size(); ++i)
+    {
+      worst = std::max(worst, std::fabs(s2.dscore[i] - s.dscore[perm[i]]));
+    }
+    std::fprintf(stderr, "permuted-row d-score max |delta| = %.3e\n", worst);
+    if (worst > 1e-9)
+    {
+      std::fprintf(stderr, "FAIL: row order changed the scores (max delta %.3e)\n", worst);
+      return 1;
+    }
+  }
+
   // ---- basic contract ----
   if (s.dscore.size() != feats.size() || s.qvalue.size() != feats.size())
   {
