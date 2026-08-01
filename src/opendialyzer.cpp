@@ -1323,7 +1323,12 @@ protected:
     // axis. With that fixed the same path reaches 6,522 -- WITHOUT any MS1 scores. So the MS1
     // columns were never shown to hurt; they were blamed for a deficit another bug caused.
     //
-    // Default stays 'false' because the alternative is unmeasured, not because it is known worse.
+    // MEASURED 2026-08-01, controlled A/B on the Astral benchmark, both arms on one node:
+    //     MS2 scope   (24 features)  6,437 IDs
+    //     MS1+MS2     (36 features)  6,506 IDs      +69, against a noise floor of +/-83
+    // i.e. NO MEASURABLE EFFECT. The MS1 sub-scores neither help nor hurt. Default stays 'false'
+    // because 12 more features cost compute for nothing -- which is the right conclusion for a
+    // reason the original comment got wrong.
     // -ms1_scores true hands the classifier ~12 more features (isotope correlation/overlap, mass
     // deviation, MS1 xcorr shape/coelution): a real precursor has the right isotope envelope at MS1,
     // which is information the MS2-only scope discards. The GBT treats missing as its own category

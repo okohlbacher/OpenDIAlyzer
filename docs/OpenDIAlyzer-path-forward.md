@@ -135,3 +135,47 @@ Not to be attempted before Phase 0.3 exists: any before/after on a shared node m
   benefit without the null.
 - **`ChromatogramStore` integration ahead of Phase 0.2.** Its headline saving is computed from the
   refuted decomposition.
+
+---
+
+## Results, 2026-08-01 (all against a measured noise floor of 6,487 +/- 83)
+
+| # | change | IDs | verdict |
+|---|---|---:|---|
+| — | baseline (loader fix only) | 6,437 | control |
+| **1.2** | `-ms1_scores` (24 -> 36 features) | **6,506** | **+69: inside the noise. No effect.** |
+| 1.1 | mass-cal RT direction fixed, window applied | 6,468 | -154 vs 6,622: outside noise, a LOSS |
+| — | 20 ppm prefilter screen | 6,195 | -327: measured dead |
+
+### 1.2 settled, and the original reasoning was wrong
+
+The exclusion of the 12 MS1 sub-scores was justified in code by: *"sqlite (29 sub-scores) gave
+6,607 identifications, this path (35-36 sub-scores) gave 4,913 -- 26% fewer for having MORE
+features"*, concluding they were sparse noise the fit wasted capacity on.
+
+That 4,913 was the `library_rt`-defective path. With that fixed the same path reaches 6,522 **with no
+MS1 scores at all**, and a controlled A/B now shows the MS1 features are worth **+69 IDs against a
++/-83 noise floor** -- i.e. nothing. They never caused the deficit and they do not fix it.
+
+Default stays `false`: 12 more features cost compute for no return. Right conclusion, wrong reason,
+now corrected in the source comment.
+
+### Performance results
+
+| change | effect |
+|---|---|
+| loader: `resolveRaw` + exact `reserve` | library_load 144.8 s -> 133.9 s (**7.5%**); IDs unchanged |
+| `-readOptions cacheWorkingInMemory` | **+10% wall, +13% peak RSS.** Extraction occupancy 38.9 -> 97.8 cores, but 2.4x the CPU for 3% less extraction wall |
+| `MALLOC_ARENA_MAX=4` | **>2x slower** for -4.5% memory |
+| parallelising the compact reader | **1.14x and no more** -- memory-latency bound |
+
+### The pattern worth keeping
+
+Everything that worked came from reading code or instrumenting: `library_rt` (+33% IDs), the
+mass-calibration RT direction (both call sites), the fragmentation attribution (83-88% of peak), the
+hardcoded `kNCE`/`kInstrument`, `OPENMS_TMPDIR`, and the accessor-level `shared_ptr`/`std::string`
+churn.
+
+Everything that tried to add parallelism or capacity to existing work regressed or gained nothing:
+20 ppm screening, `MALLOC_ARENA_MAX`, `cacheWorkingInMemory`, three parallel-reader attempts, and
+`reserve()` (predicted 24 GB, measured 0).
