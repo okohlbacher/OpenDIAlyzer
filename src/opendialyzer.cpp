@@ -385,7 +385,11 @@ protected:
     registerDoubleOption_("rt_fit_loess_span", "<frac>", 0.3,
                           "LOESS neighbourhood as a fraction of anchors for the RT recalibration "
                           "fit. 0 = use the historical binned-median fit instead.", false, true);
-    registerDoubleOption_("rt_calib_min_yield_pct", "<pct>", 10.0,
+    registerDoubleOption_("rt_calib_max_widen", "<factor>", 3.0,
+                          "How far the calibration-estimated pass-1 RT window may exceed "
+                          "-rt_extraction_window. 1.0 restores the old narrow-only behaviour, which "
+                          "could not express an estimate saying the window was too narrow.", false);
+    registerDoubleOption_("rt_calib_min_yield_pct", "<pct>", 1.0,
                           "Minimum calibration anchor yield (percent of candidates that produced a "
                           "usable anchor) before the estimated RT window is trusted. Below this the "
                           "configured -rt_extraction_window is kept. The estimate is also never "
@@ -396,7 +400,12 @@ protected:
                           "surviving anchors and understates the tail for unseen precursors; set this "
                           "to ~2x the library's predicted-RT residual p95. 0 = no floor.", false, true);
     registerIntOption_("max_concurrent_swaths", "<n>", -1, "Cap SWATH windows extracted concurrently (-1 = auto).", false);
-    registerDoubleOption_("rt_extraction_window_recal", "<s>", 240.0, "Pass-2 (narrow) RT window in seconds, after recalibration.", false);
+    registerDoubleOption_("rt_extraction_window_recal", "<s>", 600.0,
+                          "Pass-2 (narrow) RT window in seconds, after recalibration. Measured on the "
+                          "Astral benchmark: 240/400/600/900 s gave 6552/6695/6930/6835 IDs, so 600 is "
+                          "the optimum and 240 was clipping -- at 240 the residual p99 (113-115 s) sat "
+                          "pressed against the +/-120 s boundary, and widening decompressed it to 163 s.",
+                          false);
     // FDR-safe by symmetry (every precursor, both classes, uses its OWN pass-1 apex), but
     // default OFF until confirmed with decoy/entrapment diagnostics on real data. This is the
     // key lever to recover the narrow-pass collapse (predicted-RT residual p95 ~342s >> window).
@@ -4187,8 +4196,15 @@ protected:
       // parameter was worth 39% of the result, and the widening was never gated.
       const double min_yield = getDoubleOption_("rt_calib_min_yield_pct");
       const bool yield_ok = (calib_yield_pct_ < 0.0) || (calib_yield_pct_ >= min_yield);
+      // Bounded widening, not narrow-only. The old rule accepted the calibration's estimate only
+      // if it was NARROWER than the configured window, so an estimate saying "you are too narrow"
+      // was unrepresentable. On this benchmark the estimate was 1435 s against a configured 600 s
+      // and was rejected on both that rule and the yield gate; passing it explicitly gained 122 IDs
+      // (6430 -> 6552). Bounded so a wild estimate still cannot explode the candidate count.
+      const double widen_cap = getDoubleOption_("rt_extraction_window")
+                             * getDoubleOption_("rt_calib_max_widen");
       if (!narrow && use_estimated_window && calib_rt_window > 0.0 && yield_ok
-          && calib_rt_window <= getDoubleOption_("rt_extraction_window"))
+          && calib_rt_window <= widen_cap)
       {
         const double floor_win = getDoubleOption_("rt_extraction_window_min");
         const double est = calib_rt_window;
