@@ -70,6 +70,7 @@ add_executable(odia-prefilter-model-test src/odia_prefilter_model_test.cpp)
 add_executable(odia-nn-test src/odia_nn_test.cpp)
 add_executable(odia-anchor-training-test src/odia_anchor_training_test.cpp)
 add_executable(odia-ablate src/odia_ablate.cpp)
+add_executable(odia-nn-diag src/odia_nn_diag.cpp)
 
 # The semi-supervised loop on a REAL score matrix (44,568 peak groups x 29 sub-scores extracted
 # from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
@@ -92,6 +93,7 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(odia-nn-test             PRIVATE OpenMP::OpenMP_CXX)
   target_link_libraries(odia-anchor-training-test PRIVATE OpenMP::OpenMP_CXX)
   target_link_libraries(odia-ablate              PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(odia-nn-diag             PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # The GBT's determinism guarantee is "the threaded result equals the serial one". That is only a
