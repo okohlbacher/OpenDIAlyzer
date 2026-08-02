@@ -53,18 +53,26 @@ def main(ev_path, ref_path):
             rows.append(f)
     print(f"evidence rows: {len(rows)}")
 
-    # The dump keys on compound id; the reference list is SEQUENCE_CHARGE. The evidence carries the
-    # sequence but not the charge, so match on sequence and report the ambiguity rather than hiding
-    # it -- a sequence with two charge states counts once here.
-    ref_seq = {k.rsplit("_", 1)[0] for k in ref}
-    print(f"reference distinct sequences: {len(ref_seq)}")
+    # Match on STRIPPED-SEQUENCE + CHARGE. The dump's id is MODSEQ_CHARGE
+    # (".(UniMod:1)AEYFQHWGQGTLVTVSS_2") while the reference list is stripped sequence + charge, so
+    # matching on the sequence column alone conflates charge states -- an earlier version of this
+    # script did exactly that and reported the same peptide as both kept and lost.
+    import re
+    unimod = re.compile(r"[.(]UniMod:\d+\)?|[().]")
+
+    def key_of(compound_id):
+        if "_" not in compound_id:
+            return None
+        seq, _, chg = compound_id.rpartition("_")
+        return f"{unimod.sub('', seq)}_{chg}"
 
     lost, kept, buckets = 0, 0, collections.Counter()
     ms1_rescue, spectra_rule, examples = 0, 0, []
     for f in rows:
         if f[idx["decoy"]] == "1":
             continue
-        if f[idx["sequence"]] not in ref_seq:
+        k = key_of(f[idx["id"]]) if "id" in idx else None
+        if k is None or k not in ref:
             continue
         if f[idx["survived"]] == "1":
             kept += 1
@@ -84,6 +92,10 @@ def main(ev_path, ref_path):
             buckets[f"hits == {hits} (far under)"] += 1
         else:
             buckets["hits == 0 (no fragment evidence at all)"] += 1
+            # NOTE: the filter SHORT-CIRCUITS -- ms2_best_fragment_hits is only recorded once the
+            # threshold is met, so at the default min_fragments=4 every failure reports 0 whether it
+            # had three hits or none. Run the dump with -prefilter_min_fragments 1 to make the
+            # sub-threshold counts real; otherwise this bucket is uninformative by construction.
         if hits < 4 and ms1 > 0:
             ms1_rescue += 1
         if len(examples) < 5:
