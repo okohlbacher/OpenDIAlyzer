@@ -128,6 +128,52 @@ LINEARLY SEPARABLE. It establishes the direction (updates matter, ~3x cheaper vi
 than via more epochs) but not the magnitude for real sub-scores. Re-tune on the benchmark fixture
 once the ablation has a working baseline.
 
+## 11. THE NETWORK DOES NOT WORK ON REAL SUB-SCORES — the top item now
+
+`nn` returns 0 identifications where `gbt` returns 6,421, and the cause is upstream of everything
+the five mechanisms do: the seed model never produces 26 confident positives, so all 9
+fold-iterations skip. Measured on held-out groups with `odia-nn-diag`:
+
+| model | held-out AUC | targets above 99th pct of decoys |
+|---|---:|---:|
+| one-feature bootstrap | 0.5118 | 1.53% |
+| GBT | 0.5250 | 1.99% |
+| NN (defaults) | 0.5159 | **1.38%** |
+
+**At the top of the ranking the network is worse than the single feature it was seeded from**, and
+its logits sit in [-0.15, 0.12]. AUCs near 0.5 are expected — most target candidates are genuinely
+false — so the whole contest is decided in the last percentile, which is what the third column
+measures and what an AUC hides.
+
+Refuted already (do not re-try): heavy-tail saturation (clip3/tanh/asinh move AUC <0.002);
+underfitting from a low learning rate (lr 0.5 and 2.0 are WORSE); histogram binning (see below).
+
+Hypotheses still open, cheapest first:
+1. **Twelve nets averaged from near-identical starts.** Each member barely moves from Xavier init in
+   one epoch, and averaging 12 such nets shrinks the logit range further. Test: report the AUC of a
+   SINGLE member against the ensemble.
+2. **Depth.** 5 tanh layers on 24 features, one epoch. Test 1-2 hidden layers.
+3. **The loss is wrong for the objective.** Logistic loss optimises the whole distribution; the FDR
+   only cares about the top percentile. A ranking loss on the top-k may be the real answer.
+4. **Class weighting.** `w_neg = n_pos/n_neg` is ~1.0 at the seed step (all targets vs all decoys),
+   so it is not the imbalance — but the positives are ~98% noise, which is a different problem
+   from imbalance and may need a robust loss.
+
+## 12. THE SCORE FIXTURE IS WRITTEN CLASS-ORDERED — hazard, not yet a known bug
+
+`-score_fixture` emits all decoy rows before all target rows (measured: first 200k rows 100% decoy,
+last 200k 100% target), because it walks the FeatureMap in its natural order. Anything downstream
+that is order-dependent therefore has the label available as a positional signal.
+
+This already caused one false finding tonight — a rank transform that broke ties by sort position
+reported a held-out GBT AUC of 0.9811 instead of 0.5250, purely by reading the file layout, and it
+survived a group-wise held-out split because the leak was inside the feature rather than across the
+split.
+
+`OswRows::canonicalize()` exists to defend against exactly this class of problem in the production
+path. **Check whether the fixture dump happens before or after it**, and either canonicalise before
+dumping or interleave the classes.
+
 ## 8. Carried over, unrelated to tonight
 
 * Report upstream: needless deep copy of every `Feature` inside `omp critical (osw_write_out)`.
