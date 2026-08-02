@@ -164,20 +164,121 @@ protected:
                           "precursors before scoring, wide only costs the screen some specificity. "
                           "Try 2-3x -mz_extraction_window.", false, true);
     registerIntOption_("prefilter_min_fragments", "<n>", 3,
-                       "Distinct library fragments (from the top-6 by predicted intensity) that must "
-                       "match in ONE spectrum for -prefilter_evidence=ms2.\n"
-                       "MEASURED, on the Astral benchmark: the enrichment of true identifications by "
-                       "match depth is 730/1000 at 6 hits, 174 at 5, 10.9 at 4, 1.19 at 3, 0.39 at 2 "
-                       "-- a 600x range flattened into one bit by any threshold. Setting 4 keeps "
-                       "120,513 targets and 78% of a reference tool's IDs; setting 3 adds 1,084 more "
-                       "true positives AND 913,591 near-certain noise candidates, and measured "
-                       "6930 -> 5580 IDs at q<0.01.\n"
-                       "The default is 3 deliberately: the loss is a SCORING failure, not a "
-                       "prefilter one. If peak-group co-elution scoring separated those 1,084 from "
-                       "the noise, the wider net would win. Keeping 4 hides that behind a filter "
-                       "that is doing the discrimination the scorer should be doing. Set 4 to "
-                       "restore the higher measured ID count.",
-                       false, true);
+                       "MS2 evidence threshold: distinct library fragments (from the top-6 by "
+                       "predicted intensity) that must match in one spectrum for a precursor to "
+                       "survive -prefilter. MEASURED enrichment of true IDs by match depth: 730 per "
+                       "1000 targets at 6 hits, 174 at 5, 10.9 at 4, 1.19 at 3, 0.39 at 2 -- a 600x "
+                       "range that any threshold flattens to one bit. 4 keeps 120,513 targets and "
+                       "78% of a reference tool's IDs; 3 adds 1,084 more real IDs AND 913,591 noise "
+                       "candidates, measuring 6930 -> 5580 at q<0.01. The default is 3 deliberately: "
+                       "that net loss is a SCORING failure, since those 1,084 are identifiable, and "
+                       "4 hides it behind a filter doing the scorer's job. Set 4 to restore the "
+                       "higher ID count.", false, true);
+    // The MS2 null scales as p^(min_fragments) in the per-fragment coincidence rate p, and p is
+    // linear in the number of peaks retained per spectrum -- so this is the highest-leverage knob
+    // for selectivity (1000 -> 300 cuts the 4-fragment null by ~(10/3)^4 ~ 120x).
+    registerIntOption_("prefilter_top_peaks", "<n>", 1000,
+                       "Most intense peaks kept per spectrum when screening for -prefilter "
+                       "evidence. Lower = more selective.", false, true);
+    // The one criterion that actually discriminates. m/z matching alone, maximised over every
+    // spectrum in the run, gives a precursor ~3889 independent chances at a coincidence on this
+    // gradient -- measured target:decoy enrichment 1.02x, i.e. none. Requiring the evidence to
+    // RECUR costs a real precursor almost nothing (DIA-NN measures FWHM.Scans = 2.53 here) and
+    // makes an isolated coincidence fail.
+    registerIntOption_("prefilter_min_spectra", "<n>", 1,
+                       "Number of spectra in which -prefilter_min_fragments must be met. 1 = best "
+                       "single spectrum anywhere in the run (not discriminating). >1 requires the "
+                       "evidence to recur across cycles.", false, true);
+    // --- data-driven m/z window (see inferMassAccuracyPpm_) --------------------------------
+    // Bootstrap width. Deliberately WIDE: the anchors are known-present iRT/CiRT peptides sought
+    // with isotope, co-elution and SWATH-window constraints, and the noise-match budget scales with
+    // the NUMBER OF QUERIES, so a window that is fatal across 7.15M library targets is safe across
+    // a few hundred anchors. Do not raise much beyond this -- past ~50 ppm even constrained
+    // matching admits too many coincidences.
+    registerFlag_("mem_components", "PROBE: walk the feature map to attribute memory by component. "
+                                   "Serial, and it constructs a vector<string> per subordinate plus a "
+                                   "lookup per meta value -- ~150M allocations against a fragmented "
+                                   "180 GB heap, measured at >=41 s. Off by default: it is a diagnostic, "
+                                   "not part of the search.");
+    registerStringOption_("rt_features", "true|false", "false",
+                          "Add two RT-derived scoring features: normalised position in the gradient "
+                          "and a sqrt-compressed RT deviation. DIA-NN feeds both to its network "
+                          "(diann.cpp:7742-7776) and learns an RT-dependent tolerance instead of a "
+                          "hard threshold, which is what our 14x octile spread in calibration "
+                          "quality calls for. OFF by default: gradient position is label-INDEPENDENT "
+                          "only if decoy predicted RTs mirror target ones, and DIA-NN withholds the "
+                          "position feature from its LINEAR classifier, so this needs measuring "
+                          "before it is trusted.", false, true);
+    setValidStrings_("rt_features", {"true", "false"});
+    registerStringOption_("compact_library", "true|false", "false",
+                          "Load the library through CompactLibrary and materialise a targeted "
+                          "experiment with SYNTHETIC ids. Measured: the library holds 32.65 GB RSS "
+                          "of which only 7.26 GB is live -- the rest is fragmentation driven by "
+                          "~471M per-row std::string allocations for ids longer than the 15-char "
+                          "SSO buffer. Synthetic base-36 ids stay inside SSO and allocate nothing. "
+                          "Real ids are restored before the library is written out. DEFAULT OFF: "
+                          "enabling it made the prefilter support ZERO precursors ('prefilter "
+                          "supported no precursors', exit 6) on the Astral benchmark -- the library "
+                          "loads (7,149,966 peptides, 78,569,077 transitions) and then no target "
+                          "matches. Not diagnosed yet; do not enable without checking that.",
+                          false, true);
+    setValidStrings_("compact_library", {"true", "false"});
+    registerStringOption_("compact_probe", "<lib.oswpq>", "", "PROBE: load this library into the "
+                          "compact representation (src/odia_library.h) and report what it costs, "
+                          "then exit. For comparing against the LightTargetedExperiment path on the "
+                          "same file.", false, true);
+    registerStringOption_("compact_probe_fasta", "<fasta>", "", "FASTA for -compact_probe. With it, "
+                          "a peptide that occurs in its protein costs (protein, offset, length) and "
+                          "no characters of its own; without it, sequences are interned instead.",
+                          false, true);
+    registerFlag_("ms1_scores", "Give the classifier the MS1-level sub-scores (var_ms1_*: isotope "
+                  "correlation/overlap, mass deviation, MS1 xcorr shape/coelution) alongside the MS2 "
+                  "ones. Off by default -- not because it is known worse, but because the evidence "
+                  "that originally excluded them was confounded by the library_rt defect and the "
+                  "alternative has not been measured since. In-memory (parquet) scoring only; the "
+                  "sqlite path reads FEATURE_MS2 and cannot see them.", true);
+    registerDoubleOption_("mz_calib_bootstrap_ppm", "<ppm>", 50.0,
+                          "Wide window used only to COLLECT calibration anchor errors, before any "
+                          "window is inferred. 0 disables m/z inference.", false, true);
+    registerIntOption_("mz_calib_max_anchors", "<n>", 2000,
+                       "Precursors sampled for m/z calibration. A scalar offset+width needs "
+                       "hundreds, not thousands; this is what keeps calibration inside its time "
+                       "budget.", false, true);
+    registerIntOption_("mz_calib_min_anchors", "<n>", 200,
+                       "Minimum anchor ERRORS before a window may be inferred at all. Below this "
+                       "the scale estimate is too noisy to act on.", false, true);
+    registerDoubleOption_("mz_calib_sigma_multiple", "<k>", 3.0,
+                          "Window = k x robust sigma. k=3 covers ~99% of a Gaussian error "
+                          "distribution. NB the reviewed supplement's 70th percentile is ~1 sigma, "
+                          "i.e. it clips ~32% of true signal by construction; OpenMS's own "
+                          "SwathMapMassCorrection instead uses the 99th percentile x 1.3.", false, true);
+    registerDoubleOption_("mz_calib_floor_ppm", "<ppm>", 2.0,
+                          "Never infer a window below this. Guards against a high-S/N anchor set "
+                          "producing a window tighter than the instrument can actually deliver.", false, true);
+    registerDoubleOption_("mz_calib_min_peakedness", "<ratio>", 3.0,
+                          "Reject the inference unless residual density near zero exceeds density "
+                          "at the window edge by this factor. Uniform (all-noise) residuals give "
+                          "~1; a real error distribution gives >>1.", false, true);
+    // --- semi-supervised LDA -----------------------------------------------------------------
+    // Measured on the SAME .osw (2.07M peak groups, 10 ppm): pyprophet reports 4,302 target
+    // precursors at 1% FDR where this LDA reported 2,957 -- a 45% gap on IDENTICAL features, so it
+    // is the model, not the data. Line-by-line against pyprophet 3.0.15 the substantive differences
+    // are iteration count and, more importantly, the FDR used to pick the FIRST training set:
+    // pyprophet uses ss_initial_fdr=0.15 then ss_iteration_fdr=0.05, whereas this used 0.05
+    // throughout. These are exposed so the gap can be closed empirically rather than guessed at.
+    registerIntOption_("lda_folds", "<n>", 3,
+                       "Cross-validation folds (by precursor) for the in-process LDA. pyprophet "
+                       "instead resamples 50/50 for 10 iterations.", false, true);
+    registerIntOption_("lda_iterations", "<n>", 3,
+                       "Semi-supervised iterations per fold. pyprophet default is 10.", false, true);
+    registerDoubleOption_("lda_train_fdr_initial", "<q>", 0.15,
+                          "FDR for selecting the FIRST training set, before any discriminant "
+                          "exists. Too strict here and too few positives are selected to fit one, "
+                          "the iteration is skipped, and scoring silently falls back to a single "
+                          "feature. pyprophet's ss_initial_fdr is 0.15.", false, true);
+    registerDoubleOption_("lda_train_fdr", "<q>", 0.05,
+                          "FDR for training-set selection in later iterations "
+                          "(pyprophet ss_iteration_fdr = 0.05).", false, true);
     registerStringOption_("library_cache", "true|false", "true",
                           "Cache a parsed TSV library as parquet ('<library>.oswpq') beside it and "
                           "reuse it while it is not older than the TSV. The TSV parse is "
