@@ -484,11 +484,19 @@ inline ScoredGroups scoreSemiSupervisedLDA(
   // folds x (threads/folds) uses the machine without oversubscribing it. The GBT's result does not
   // depend on this number (odia_gbt_test T8), so it is purely a speed knob.
   GBTParams gbt_params = params.gbt;
+  NNParams nn_params = params.nn;
 #ifdef _OPENMP
-  if (params.classifier == LDAParams::Classifier::GBT)
+  // BOTH inner-parallel learners need the active-level raised, not just the GBT. With it set for
+  // the GBT alone, the network's chunk loop ran as a team of ONE inside the fold loop: measured
+  // 435% CPU on a 224-core node, i.e. the 3 folds and nothing else. Splitting as
+  // folds x (threads/folds) uses the machine without oversubscribing it, and neither learner's
+  // result depends on the number (odia_gbt_test T8; odia_nn_test thread invariance).
+  if (params.classifier == LDAParams::Classifier::GBT || params.classifier == LDAParams::Classifier::NN)
   {
     omp_set_max_active_levels(2);
-    gbt_params.n_threads = std::max(1, omp_get_max_threads() / std::max(1, folds));
+    const int inner = std::max(1, omp_get_max_threads() / std::max(1, folds));
+    gbt_params.n_threads = inner;
+    nn_params.n_threads = inner;
   }
 #endif
 
@@ -607,7 +615,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
                            const std::vector<char>& mask) -> bool {
       if (use_nn)
       {
-        NNParams np = params.nn;
+        NNParams np = nn_params;
         np.mask = mask;
         if (params.bag_fraction >= 1.0)
         {
@@ -616,6 +624,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
           nn_members.assign(1, std::move(e));
           return true;
         }
+        if (!(params.bag_fraction > 0.0)) { return false; }   // an empty bag is not a trained model
         AnchorTrainingParams ap;
         ap.nn = np;
         ap.bag_fraction = params.bag_fraction;
@@ -639,6 +648,12 @@ inline ScoredGroups scoreSemiSupervisedLDA(
     double best_difference = 1.0;
     for (std::size_t j = 0; j < m; ++j)
     {
+      // The seed mask applies HERE TOO, not only to the fit. This bootstrap picks one feature, and
+      // that single-feature direction is what ranks each group to choose its seed row. Searching a
+      // masked column would let the excluded feature choose the training examples, and zeroing its
+      // value at fit time cannot undo which rows it selected -- the leak mechanism 1 exists to
+      // close, reopened one step upstream. Found by adversarial review, not by a test.
+      if (!params.seed_mask.empty() && j < params.seed_mask.size() && !params.seed_mask[j]) { continue; }
       double sum[2] = {0.0, 0.0};
       double sum_sq[2] = {0.0, 0.0};
       std::size_t class_n[2] = {0, 0};
@@ -719,7 +734,13 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       //
       // params.seed_mask applies HERE and only here (mechanism 1) -- the seed picks the anchors,
       // so it is the seed that must not see the calibrated features.
-      fit_learner(seed_pos, seed_neg, params.seed_mask);
+      if (!fit_learner(seed_pos, seed_neg, params.seed_mask))
+      {
+        // A failed seed is the cold start this block exists to prevent. Recording it means the
+        // caller's "fitted 0 iterations" warning can fire instead of the run silently ranking by
+        // the one-feature bootstrap while claiming a learned model.
+        ++n_skipped;
+      }
     }
 
     std::vector<std::size_t> prev_positives;   // mechanism 5's state, sorted
@@ -767,7 +788,10 @@ inline ScoredGroups scoreSemiSupervisedLDA(
         ++n_skipped;
         continue;
       }
-      ++n_trained;
+      // n_trained is incremented AFTER the fit succeeds, further down -- not here. Counting it at
+      // selection time reported a trained iteration for a fit that then failed (an empty bag from
+      // bag_fraction <= 0, a singular covariance), and the scores in that case come from the
+      // previous model or the one-feature fallback.
 
       // The positive class above is one row per precursor -- `candidate.best_row`, the highest
       // scoring peak group. Taking ALL decoy rows as negatives would therefore make the two classes
@@ -799,8 +823,9 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       if (negative_rows.size() < 2) { continue; }
 
       // A failed fit leaves the previous model in place, exactly as a failed Cholesky leaves the
-      // previous w -- the iteration is skipped, not replaced with something degenerate.
-      fit_learner(positive_rows, negative_rows, {});
+      // previous w -- the iteration is skipped, not replaced with something degenerate. And it is
+      // COUNTED as skipped, so a run whose every iteration failed cannot report itself as trained.
+      if (fit_learner(positive_rows, negative_rows, {})) { ++n_trained; } else { ++n_skipped; }
 
       // Mechanism 5. Watch the positive SET, not the score. A model collapsing onto a subset of
       // its seed shows a SHRINKING positive set while its identification count rises, so a rule
@@ -836,10 +861,24 @@ inline ScoredGroups scoreSemiSupervisedLDA(
     }
 
     // This model has seen no row from the groups scored.
+    //
+    // Parallel over groups: each iteration writes result.dscore at indices belonging to ITS OWN
+    // group and reads only the (now fixed) model, so there is no reduction, no shared accumulator,
+    // and no ordering question -- the output is bit-identical to the serial loop at any thread
+    // count. Worth doing because for the NN this is one forward pass per row through 12 nets, and
+    // it was the serial tail of an otherwise parallel routine.
+    std::vector<std::size_t> score_groups;
+    score_groups.reserve(group_count / static_cast<std::size_t>(folds) + 1);
     for (std::size_t g = 0; g < group_count; ++g)
     {
-      if (group_fold[g] != fold) { continue; }
-      for (const std::size_t row : group_rows[g])
+      if (group_fold[g] == fold) { score_groups.push_back(g); }
+    }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (score_groups.size() > 1024)
+#endif
+    for (long long k = 0; k < static_cast<long long>(score_groups.size()); ++k)
+    {
+      for (const std::size_t row : group_rows[score_groups[static_cast<std::size_t>(k)]])
       {
         result.dscore[row] = score_row(row);
       }

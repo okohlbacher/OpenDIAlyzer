@@ -85,6 +85,13 @@ if(OpenMP_CXX_FOUND)
   target_link_libraries(odia-lda-adversarial-test PRIVATE OpenMP::OpenMP_CXX)
   target_link_libraries(odia-lda-realdata-test   PRIVATE OpenMP::OpenMP_CXX)
   target_link_libraries(odia-gbt-test            PRIVATE OpenMP::OpenMP_CXX)
+  # The NN test asserts BIT-IDENTICAL results across 1/2/7/16/64 threads. Unlinked, _OPENMP is
+  # undefined, every pragma vanishes, and it runs five identical serial fits -- the precise failure
+  # this block was written to prevent, reproduced one target lower. odia-ablate needs it to finish
+  # this century.
+  target_link_libraries(odia-nn-test             PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(odia-anchor-training-test PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(odia-ablate              PRIVATE OpenMP::OpenMP_CXX)
 endif()
 
 # The GBT's determinism guarantee is "the threaded result equals the serial one". That is only a

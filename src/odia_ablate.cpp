@@ -61,6 +61,32 @@ bool load(const std::string& path, Fixture& f)
   f.X.reserve(n);
   f.label.reserve(n);
   f.group.reserve(n);
+
+  // Two fixture generations exist and both are legitimate input: the original
+  // testdata/lda_fixture.txt is `group label f0..fN`, and -score_fixture writes
+  // `group label traml_id f0..fN`. Detect by COUNTING TOKENS on the first data row against the
+  // declared width rather than by guessing from the header -- a guess that is wrong shifts every
+  // feature by one column and still parses, which is the worst possible outcome.
+  bool has_traml = false;
+  {
+    const std::streampos mark = in.tellg();
+    std::string probe;
+    while (std::getline(in, probe) && probe.empty()) {}
+    std::istringstream ps(probe);
+    std::size_t tok = 0;
+    std::string t;
+    while (ps >> t) { ++tok; }
+    if (tok == m + 3) { has_traml = true; }
+    else if (tok != m + 2)
+    {
+      std::fprintf(stderr, "odia-ablate: header declares %zu features but the first row has %zu "
+                           "tokens (expected %zu or %zu)\n", m, tok, m + 2, m + 3);
+      return false;
+    }
+    in.clear();
+    in.seekg(mark);
+  }
+
   std::string line;
   while (std::getline(in, line))
   {
@@ -68,8 +94,9 @@ bool load(const std::string& path, Fixture& f)
     std::istringstream ss(line);
     long long g = 0;
     int l = 0;
-    std::string tid;
-    ss >> g >> l >> tid;
+    std::string tid = "-";
+    ss >> g >> l;
+    if (has_traml) { ss >> tid; }
     // A short row used to zero-fill in silence, which desyncs every column after it AND makes the
     // name-derived feature mask (mechanism 1) point at the wrong columns. Fail on the first one.
     std::vector<double> x(m);
@@ -111,11 +138,15 @@ std::size_t idsAt(const Fixture& f, const odia::ScoredGroups& s, double q)
   return n;
 }
 
-/// Decoy-null health. A classifier that separates target from decoy for a REAL reason leaves the
-/// decoy score distribution looking like a null; one that has learnt the label leaves a null that
-/// has drifted. Reported as the standardised gap between the two class medians -- large is not
-/// automatically good, and a big gap next to a big identification jump is the signature of an arm
-/// that has broken the null rather than improved the model.
+/// Standardised separation between the class medians, in decoy standard deviations.
+///
+/// WHAT IT IS NOT: a test of null validity. Genuine discrimination and label leakage BOTH increase
+/// it, so it cannot tell them apart, and an earlier version of this comment claimed it could.
+/// Read it as a scale check on the score -- an arm whose gap collapses to ~0 has stopped
+/// discriminating, and an arm whose gap explodes while its identification count also jumps is
+/// worth suspecting -- but the only real test of the null is an EXTERNAL standard: an entrapment
+/// set, or a second run. NaN is returned for a degenerate distribution rather than 0.0, because a
+/// 0.0 there is indistinguishable from a healthy-but-uninformative arm.
 double medianGap(const Fixture& f, const odia::ScoredGroups& s)
 {
   std::vector<double> t, d;
@@ -126,7 +157,7 @@ double medianGap(const Fixture& f, const odia::ScoredGroups& s)
     if (it == best.end() || s.dscore[i] > s.dscore[it->second]) { best[f.group[i]] = i; }
   }
   for (const auto& kv : best) { (f.label[kv.second] == 1 ? t : d).push_back(s.dscore[kv.second]); }
-  if (t.size() < 3 || d.size() < 3) { return 0.0; }
+  if (t.size() < 3 || d.size() < 3) { return std::nan(""); }
   auto med = [](std::vector<double>& v) {
     std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
     return v[v.size() / 2];
@@ -138,7 +169,7 @@ double medianGap(const Fixture& f, const odia::ScoredGroups& s)
   for (double v : d) { var += (v - mean) * (v - mean); }
   const double sd = std::sqrt(var / static_cast<double>(d.size()));
   const double mt = med(t), md = med(d);
-  return sd > 0.0 ? (mt - md) / sd : 0.0;
+  return (sd > 0.0 && std::isfinite(sd)) ? (mt - md) / sd : std::nan("");
 }
 
 /// Mask hiding every RT-derived sub-score: mechanism 1's input.
@@ -186,20 +217,37 @@ int main(int argc, char** argv)
   std::string rt_listed;
   const std::vector<char> mask = rtMask(f.names, rt_listed);
 
-  // Group-level class balance, not row-level. Target-decoy FDR divides decoy groups by target
-  // groups, so a fixture with more decoy groups than target ones cannot reach 1% however good the
-  // classifier is -- and every arm then reports 0, which looks exactly like a broken harness. It
-  // is not one, so the balance is printed before the table rather than left to be inferred.
+  // Group-level class balance, and the FINITE-DECOY FLOOR it implies.
+  //
+  // An earlier version of this said that more decoy groups than target ones makes 1% unreachable.
+  // That is backwards, and adversarial review caught it. The estimator is
+  //     q = (decoys_above + 1)/Ndec  /  (targets_above/Ntar)
+  // which ratio-normalises both classes, so at perfect separation the q-value of the k-th target
+  // is Ntar / (Ndec * k). Reaching q < 0.01 therefore needs k > 100 * Ntar/Ndec targets ranked
+  // above every decoy -- and MORE decoys make that floor LOWER, not higher. What the balance
+  // actually tells you is how many clean targets an arm must find before any of them can be
+  // reported at all, which is worth printing; "unreachable" was simply wrong.
   std::map<long long, int> glab;
   for (std::size_t i = 0; i < f.X.size(); ++i) { glab[f.group[i]] = f.label[i]; }
   std::size_t gt = 0, gd = 0;
   for (const auto& kv : glab) { (kv.second == 1 ? gt : gd)++; }
   std::printf("fixture %s: %zu rows, %zu cols, %zu groups, %zu target rows\n", argv[1], f.X.size(),
               f.X.empty() ? 0 : f.X[0].size(), groups.size(), n_t);
-  std::printf("group balance: %zu target, %zu decoy (%.2f decoy per target)%s\n", gt, gd,
-              gt ? static_cast<double>(gd) / static_cast<double>(gt) : 0.0,
-              gd > gt ? "  <-- more decoys than targets: 1% FDR is unreachable by construction"
-                      : "");
+  const long long floor_k =
+    gd ? static_cast<long long>(std::ceil(100.0 * static_cast<double>(gt) / static_cast<double>(gd)))
+       : -1;
+  std::printf("group balance: %zu target, %zu decoy (%.2f decoy per target)\n", gt, gd,
+              gt ? static_cast<double>(gd) / static_cast<double>(gt) : 0.0);
+  if (floor_k > 0)
+  {
+    std::printf("finite-decoy floor: at perfect separation the %lldth-ranked target is the first "
+                "to reach q<0.01\n", floor_k);
+  }
+  else
+  {
+    std::printf("finite-decoy floor: NO DECOYS -- q-values are meaningless here, every arm below "
+                "is uninterpretable\n");
+  }
   std::printf("RT-derived columns hidden by mechanism 1: %s\n",
               rt_listed.empty() ? "(none found -- mechanism 1 is a no-op on this fixture)"
                                 : rt_listed.c_str());
@@ -242,8 +290,15 @@ int main(int argc, char** argv)
   add("nn_m4_nocv", "M4 REMOVED: every group trains the model that scores it (FDR-INVALID)", C::NN,
       [](odia::LDAParams& p) { p.disable_cv = true; });
 
-  add("nn_m5_compstop", "M5: stop when the positive SET stabilises or shrinks", C::NN,
-      [](odia::LDAParams& p) { p.stop_on_composition = true; p.n_iter = 8; });
+  // MATCHED PAIR. Both M5 arms raise n_iter from 3 to 8 so the rule has something to stop, which
+  // means an M5-vs-default comparison confounds "the rule fired" with "five more iterations ran".
+  // The control below is n_iter=8 with the rule OFF, so the difference between the two is the rule
+  // alone. Without it the arm measures two changes and attributes them to one.
+  add("nn_iter8_ctrl", "control for M5: n_iter=8, rule OFF (isolates the extra iterations)", C::NN,
+      [](odia::LDAParams& p) { p.n_iter = 8; });
+
+  add("nn_m5_compstop", "M5: stop when the positive SET stabilises or shrinks (vs nn_iter8_ctrl)",
+      C::NN, [](odia::LDAParams& p) { p.stop_on_composition = true; p.n_iter = 8; });
 
   // ---- everything that is meant to be on -------------------------------------------------------
   add("nn_all", "M1+M3+M5 together (M2 and M4 are on by default)", C::NN,
@@ -263,6 +318,20 @@ int main(int argc, char** argv)
   if (argc > 2)
   {
     std::set<std::string> want(argv + 2, argv + argc);
+    std::set<std::string> known;
+    for (const Arm& a : arms) { known.insert(a.name); }
+    for (const std::string& w : want)
+    {
+      if (!known.count(w))
+      {
+        // A typo used to erase every arm and exit 0 -- an empty table that reads as "nothing to
+        // report" rather than "you asked for an arm that does not exist".
+        std::fprintf(stderr, "odia-ablate: unknown arm '%s'. Known:", w.c_str());
+        for (const std::string& k : known) { std::fprintf(stderr, " %s", k.c_str()); }
+        std::fprintf(stderr, "\n");
+        return 2;
+      }
+    }
     arms.erase(std::remove_if(arms.begin(), arms.end(),
                               [&](const Arm& a) { return !want.count(a.name); }),
                arms.end());
@@ -288,8 +357,12 @@ int main(int argc, char** argv)
     {
       std::snprintf(delta, sizeof(delta), "%+8lld", static_cast<long long>(i1) - ref);
     }
-    std::printf("%-18s %8zu %8zu %8s %7.2f %3d/%-2d  %s\n", a.name.c_str(), i1, i5, delta,
-                medianGap(f, s), s.n_iterations_trained, s.n_iterations_skipped, a.what.c_str());
+    const double gap = medianGap(f, s);
+    char gaps[16];
+    if (std::isfinite(gap)) { std::snprintf(gaps, sizeof(gaps), "%7.2f", gap); }
+    else                    { std::snprintf(gaps, sizeof(gaps), "%7s", "degen"); }
+    std::printf("%-18s %8zu %8zu %8s %7s %3d/%-2d  %s\n", a.name.c_str(), i1, i5, delta, gaps,
+                s.n_iterations_trained, s.n_iterations_skipped, a.what.c_str());
     std::fflush(stdout);
   }
   if (all_zero)

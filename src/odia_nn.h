@@ -277,14 +277,20 @@ public:
     rows.insert(rows.end(), neg.begin(), neg.end());
     std::vector<double> y(rows.size(), 1.0), w(rows.size(), w_pos);
     for (std::size_t k = pos.size(); k < rows.size(); ++k) { y[k] = 0.0; w[k] = w_neg; }
-    // Fixed order, independent of how the caller assembled pos/neg.
-    std::sort(rows.begin(), rows.end());
+    // Fixed order, independent of how the caller assembled pos/neg. This SORTS THE VECTORS THAT
+    // ARE ACTUALLY PASSED to trainOne -- the previous version sorted a local `rows` that was then
+    // discarded while the unsorted pos/neg went to training, so the normalisation was dead code
+    // and two callers with the same training SET but a different order got different weights
+    // (order changes chunk membership, which changes the floating-point sums).
+    std::vector<std::size_t> spos(pos), sneg(neg);
+    std::sort(spos.begin(), spos.end());
+    std::sort(sneg.begin(), sneg.end());
 
     for (int n = 0; n < p.n_nets; ++n)
     {
       nets_[static_cast<std::size_t>(n)].init(n_in_, p.hidden, static_cast<std::uint64_t>(n),
                                               p.seed, p.mask);
-      trainOne(nets_[static_cast<std::size_t>(n)], X, pos, neg, w_neg, p);
+      trainOne(nets_[static_cast<std::size_t>(n)], X, spos, sneg, w_neg, p);
     }
     trained_ = true;
     return true;

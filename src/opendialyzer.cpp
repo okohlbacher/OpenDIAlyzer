@@ -1507,6 +1507,21 @@ protected:
       for (int j = 0; j < nc; ++j) { if (keep[j]) { nr.push_back(row[j]); } }
       row = std::move(nr);
     }
+    // NAMES MOVE WITH THE COLUMNS. They did not, and the consequence was silent: anything that
+    // selects a feature BY NAME -- the seed mask especially -- would resolve the name to a
+    // post-drop index it no longer owned and mask a different sub-score, or none, while reporting
+    // that it had masked the right one.
+    if (R.names.size() == static_cast<std::size_t>(nc))
+    {
+      std::vector<std::string> nn;
+      nn.reserve(R.names.size());
+      for (int j = 0; j < nc; ++j) { if (keep[j]) { nn.push_back(R.names[static_cast<std::size_t>(j)]); } }
+      R.names.swap(nn);
+    }
+    else
+    {
+      R.names.clear();   // cannot be trusted; better absent than misaligned
+    }
   }
 
   // Score rows straight out of the in-memory FeatureMap, so a run never has to write its features
@@ -2316,7 +2331,10 @@ protected:
       o << R.feats.size() << " " << R.feats[0].size();
       for (const auto& nm : R.names) { o << " " << nm; }
       o << "\n";
-      o << std::setprecision(9);
+      // max_digits10, not 9: at 9 significant digits a double does not round-trip, so the offline
+      // ablation would score a SLIGHTLY DIFFERENT matrix from the one the pipeline scored and the
+      // difference would be invisible.
+      o << std::setprecision(std::numeric_limits<double>::max_digits10);
       for (std::size_t i = 0; i < R.feats.size(); ++i)
       {
         o << R.group[i] << " " << R.labels[i] << " "
@@ -2326,6 +2344,13 @@ protected:
           if (std::isfinite(v)) { o << " " << v; } else { o << " nan"; }
         }
         o << "\n";
+      }
+      o.flush();
+      if (!o)
+      {
+        OPENMS_LOG_ERROR << "OpenDIAlyzer: failed writing score fixture " << fx
+                         << " (disk full or unwritable path); the file is incomplete." << std::endl;
+        return 6;
       }
       OPENMS_LOG_INFO << "OpenDIAlyzer: wrote score fixture " << fx << " (" << R.feats.size()
                       << " rows x " << R.feats[0].size() << " cols)" << std::endl;
