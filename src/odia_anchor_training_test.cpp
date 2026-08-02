@@ -106,6 +106,30 @@ int main()
   std::printf("  bagged accuracy: %.3f\n", double(right) / XX.size());
   assert(double(right) / XX.size() > 0.75);
 
+  // ---- the iteration cap must actually fire ----------------------------------------------------
+  // iterations_run was never incremented, so `iterations_run < max_iterations` read 0 < 4 forever
+  // and the one stopping condition independent of the data was dead. Drive it to the cap.
+  {
+    AnchorTrainingParams p;
+    p.max_iterations = 3;
+    p.stop_jaccard = 1.01;                 // unreachable, so ONLY the cap can stop this
+    AnchorTrainingReport rep;
+    std::vector<std::size_t> prev, curr;
+    int rounds = 0;
+    for (std::size_t i = 0; i < 40; ++i) { curr.push_back(i); }
+    while (rounds < 20)
+    {
+      ++rounds;
+      curr.push_back(1000 + rounds);       // strictly growing, never stabilises
+      if (!anchorIterationShouldContinue(prev, curr, p, rep)) { break; }
+      prev = curr;
+    }
+    std::printf("  iteration cap: stopped after %d rounds (max %d), iterations_run=%d\n", rounds,
+                p.max_iterations, rep.iterations_run);
+    assert(rounds <= p.max_iterations + 1);
+    assert(rep.iterations_run > 0);
+  }
+
   std::printf("odia_anchor_training_test OK\n");
   return 0;
 }

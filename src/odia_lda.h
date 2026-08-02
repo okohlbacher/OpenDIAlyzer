@@ -114,6 +114,13 @@ struct LDAParams
   /// identifications cannot see a collapse -- they rise throughout one.
   bool stop_on_composition = false;
   double stop_jaccard = 0.98;
+  /// DIAGNOSTIC ONLY, and FDR-INVALID when true: every group trains the model that scores it.
+  ///
+  /// It exists because `n_folds = 1` cannot express this -- the fold count is clamped to >= 2 a few
+  /// lines into the routine, so an ablation arm that set n_folds=1 silently ran 2-fold CV and
+  /// "demonstrated" nothing while claiming to demonstrate that cross-validation is load-bearing.
+  /// A flag that says what it does cannot be defeated by a clamp.
+  bool disable_cv = false;
   bool normalize_folds = true;  ///< Rescale each fold's held-out scores to its own decoy null
                             ///< (mean 0, sd 1) before pooling. Each fold has its OWN weight vector,
                             ///< with its own arbitrary scale and offset, so the raw scores are not
@@ -497,7 +504,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
     train_groups.reserve(group_count);
     for (std::size_t g = 0; g < group_count; ++g)
     {
-      if (group_fold[g] == fold) { continue; }
+      if (!params.disable_cv && group_fold[g] == fold) { continue; }
       train_groups.push_back(g);
       train_rows.insert(train_rows.end(), group_rows[g].begin(), group_rows[g].end());
     }
@@ -798,20 +805,33 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       // Mechanism 5. Watch the positive SET, not the score. A model collapsing onto a subset of
       // its seed shows a SHRINKING positive set while its identification count rises, so a rule
       // reading the score is blind to exactly the failure worth catching.
-      if (params.stop_on_composition)
+      if (params.stop_on_composition && iteration >= 1)
       {
+        // FROM ITERATION 1 ONWARD, NOT FROM 0. Iteration 0 selects positives at
+        // train_fdr_initial (0.15) and every later iteration at train_fdr (0.05) -- a 3x stricter
+        // cut. Comparing across that change makes a HEALTHY run look collapsed at the first
+        // opportunity: the set is smaller because the threshold moved, not because the model
+        // narrowed. With the rule armed that way it broke out after a single iteration every time,
+        // so the mechanism meant to DETECT a collapse instead silently truncated training.
+        // Only sets selected at the SAME threshold are comparable.
         std::vector<std::size_t> curr = positive_rows;
         std::sort(curr.begin(), curr.end());
-        if (!prev_positives.empty())
-        {
-          const double j = jaccardOverlap(prev_positives, curr);
-          if (curr.size() < prev_positives.size() || j >= params.stop_jaccard)
-          {
-            prev_positives.swap(curr);
-            break;
-          }
-        }
+        AnchorTrainingParams ap;
+        ap.stop_jaccard = params.stop_jaccard;
+        ap.max_iterations = params.n_iter;
+        AnchorTrainingReport rep;
+        rep.iterations_run = iteration;
+        // The production path CALLS the tested helper rather than reimplementing it. The inline
+        // copy that used to live here was the untested twin of a tested function, which is how the
+        // threshold bug above survived its own unit test.
+        const bool go = anchorIterationShouldContinue(prev_positives, curr, ap, rep);
         prev_positives.swap(curr);
+        if (!go) { break; }
+      }
+      else if (params.stop_on_composition)
+      {
+        prev_positives = positive_rows;
+        std::sort(prev_positives.begin(), prev_positives.end());
       }
     }
 

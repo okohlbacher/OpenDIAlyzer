@@ -58,6 +58,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #ifdef _OPENMP
@@ -135,9 +137,11 @@ struct NNParams
   std::uint64_t seed = 42;
   int n_threads = 0;
   /// Optional input mask, one entry per feature; empty means "use everything". A 0 entry zeroes
-  /// that input in the FORWARD pass, so the feature can neither influence the output nor receive
-  /// gradient (dW = delta * x = 0). This is mechanism 1 of odia_anchor_training.h: the seed fit
-  /// must not see the features the anchors will be used to calibrate.
+  /// that input in the FORWARD pass, so the feature cannot influence the output and its incoming
+  /// weights receive no DATA gradient (dW = delta * x = 0). They still receive L2 decay, which
+  /// pulls them toward zero -- harmless, and in the intended direction, but "frozen" would be the
+  /// wrong word. This is mechanism 1 of odia_anchor_training.h: the seed fit must not see the
+  /// features the anchors will be used to calibrate.
   ///
   /// A mask rather than a narrower matrix because the mask travels WITH the fitted model -- a
   /// model trained without a feature must also be SCORED without it, and an ensemble whose
@@ -169,7 +173,15 @@ public:
   void init(int n_in, const std::vector<int>& hidden, std::uint64_t net, std::uint64_t seed,
             const std::vector<char>& mask = {})
   {
-    mask_ = (static_cast<int>(mask.size()) == n_in) ? mask : std::vector<char>();
+    // A mask of the wrong width used to be dropped silently, so mechanism 1 reported itself as ON
+    // while doing nothing. Silence is the worst outcome here: the arm's label says the feature is
+    // hidden and the number says otherwise, with no way to tell from the output.
+    if (!mask.empty() && static_cast<int>(mask.size()) != n_in)
+    {
+      throw std::invalid_argument("odia::MLP::init: mask has " + std::to_string(mask.size()) +
+                                  " entries but the model has " + std::to_string(n_in) + " inputs");
+    }
+    mask_ = mask;
     dims_.clear();
     dims_.push_back(n_in);
     for (int h : hidden) { dims_.push_back(h); }

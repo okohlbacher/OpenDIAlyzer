@@ -223,6 +223,10 @@ inline bool anchorIterationShouldContinue(const std::vector<std::size_t>& prev,
                                           const AnchorTrainingParams& p,
                                           AnchorTrainingReport& rep)
 {
+  // Incremented HERE, by the function that reads it. It was previously only ever set by callers,
+  // so `iterations_run < max_iterations` read 0 < 4 forever and the iteration cap never fired --
+  // the one stopping condition that does not depend on the data was dead.
+  ++rep.iterations_run;
   rep.positive_counts.push_back(curr.size());
   if (prev.empty()) { rep.jaccard.push_back(0.0); return rep.iterations_run < p.max_iterations; }
 

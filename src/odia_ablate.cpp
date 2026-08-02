@@ -70,11 +70,18 @@ bool load(const std::string& path, Fixture& f)
     int l = 0;
     std::string tid;
     ss >> g >> l >> tid;
+    // A short row used to zero-fill in silence, which desyncs every column after it AND makes the
+    // name-derived feature mask (mechanism 1) point at the wrong columns. Fail on the first one.
     std::vector<double> x(m);
     for (std::size_t j = 0; j < m; ++j)
     {
       std::string tok;
-      ss >> tok;
+      if (!(ss >> tok))
+      {
+        std::fprintf(stderr, "odia-ablate: row %zu has %zu of %zu columns -- truncated fixture\n",
+                     f.X.size() + 1, j, m);
+        return false;
+      }
       x[j] = (tok == "nan" || tok == "-nan") ? std::nan("") : std::strtod(tok.c_str(), nullptr);
     }
     f.group.push_back(g);
@@ -229,8 +236,11 @@ int main(int argc, char** argv)
   add("nn_m3_bag70", "M3: each member trains on 70% of precursor groups", C::NN,
       [](odia::LDAParams& p) { p.bag_fraction = 0.70; });
 
-  add("nn_m4_nocv", "M4 REMOVED: 1 fold -- rows scored by a model that SAW them", C::NN,
-      [](odia::LDAParams& p) { p.n_folds = 1; });
+  // NOT n_folds=1: that is clamped to 2 inside the scorer, so the arm ran ordinary 2-fold CV and
+  // reported it as "no cross-validation". Found by adversarial review; the flag below cannot be
+  // silently neutralised the same way.
+  add("nn_m4_nocv", "M4 REMOVED: every group trains the model that scores it (FDR-INVALID)", C::NN,
+      [](odia::LDAParams& p) { p.disable_cv = true; });
 
   add("nn_m5_compstop", "M5: stop when the positive SET stabilises or shrinks", C::NN,
       [](odia::LDAParams& p) { p.stop_on_composition = true; p.n_iter = 8; });
