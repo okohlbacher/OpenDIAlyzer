@@ -130,8 +130,26 @@ struct NNParams
   std::vector<int> hidden = {32, 16, 16, 8, 8};  ///< DIA-NN's shape is 5 tanh layers; widths here
                                                  ///< are scaled to a 35-60 input rather than 73
   int n_nets = 12;            ///< ensemble size, as DIA-NN
-  int epochs = 1;             ///< ONE epoch per semi-supervised iteration, as DIA-NN. The ensemble
-                              ///< and the outer iteration do the work, not long training.
+  int epochs = 1;             ///< passes over the data per semi-supervised iteration, as DIA-NN
+  /// Rows per gradient STEP. This is the parameter that actually trains the model, and getting it
+  /// wrong is why the first NN run on the benchmark returned 0 identifications with every
+  /// iteration skipped.
+  ///
+  /// The original implementation was full-batch, on the reasoning that "at one epoch the ensemble
+  /// supplies the variance that minibatching would". That conflates variance with the NUMBER OF
+  /// UPDATES. Full-batch at epochs=1 is exactly ONE gradient step: from Xavier init, at lr 0.05,
+  /// the weights barely move, the output is near-constant, no q-value clears the training cut, and
+  /// all 9 fold-iterations skip for want of confident positives. Averaging twelve untrained nets
+  /// gives an untrained net.
+  ///
+  /// DIA-NN's "one epoch" is one epoch of MINIBATCH descent -- n_rows/batch updates, not one. That
+  /// is the part worth copying. At 4096 a 2.4M-row fold takes ~590 steps per epoch for the same
+  /// forward/backward work as a single full-batch step.
+  ///
+  /// Batches are contiguous slices of the SORTED row list taken in index order, so there is no
+  /// shuffling to make order-independent -- the determinism argument that motivated full-batch is
+  /// preserved without paying for it in updates. 0 means full batch.
+  int batch_size = 4096;
   double lr = 0.05;
   double l2 = 1e-5;
   std::uint64_t seed = 42;
@@ -309,11 +327,11 @@ public:
   int inputWidth() const { return n_in_; }
 
 private:
-  /// One net, `epochs` passes of full-batch gradient descent on the logistic loss.
+  /// One net, `epochs` passes of MINIBATCH gradient descent on the logistic loss.
   ///
-  /// Full-batch, not minibatch: a minibatch order is one more thing that has to be made
-  /// order-independent, and at one epoch the ensemble supplies the variance that minibatching
-  /// would.
+  /// Batches are contiguous slices of the sorted row list in index order: deterministic, no
+  /// shuffle, and thread-count invariant because each batch's gradient uses the same fixed-chunk
+  /// reduction as before. See NNParams::batch_size for why full-batch was wrong.
   static void trainOne(MLP& net, const std::vector<std::vector<double>>& X,
                        const std::vector<std::size_t>& pos, const std::vector<std::size_t>& neg,
                        double w_neg, const NNParams& p)
@@ -351,17 +369,28 @@ private:
     constexpr std::size_t kChunks = 512;
     const std::size_t n_chunks = std::min<std::size_t>(kChunks, n_rows);
 
+    const std::size_t batch = (p.batch_size > 0)
+                                ? std::min<std::size_t>(static_cast<std::size_t>(p.batch_size), n_rows)
+                                : n_rows;
+    std::vector<double> part;
+    std::vector<double> gsum(np, 0.0);
+
     for (int ep = 0; ep < p.epochs; ++ep)
     {
-      std::vector<double> part(n_chunks * np, 0.0);
+     for (std::size_t b0 = 0; b0 < n_rows; b0 += batch)
+     {
+      const std::size_t b1 = std::min(n_rows, b0 + batch);
+      const std::size_t bn = b1 - b0;
+      const std::size_t n_chunks_b = std::min(n_chunks, bn);
+      part.assign(n_chunks_b * np, 0.0);
 
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic, 1) num_threads(p.n_threads > 0 ? p.n_threads : omp_get_max_threads())
 #endif
-      for (long long c = 0; c < static_cast<long long>(n_chunks); ++c)
+      for (long long c = 0; c < static_cast<long long>(n_chunks_b); ++c)
       {
-        const std::size_t lo = n_rows * static_cast<std::size_t>(c) / n_chunks;
-        const std::size_t hi = n_rows * static_cast<std::size_t>(c + 1) / n_chunks;
+        const std::size_t lo = b0 + bn * static_cast<std::size_t>(c) / n_chunks_b;
+        const std::size_t hi = b0 + bn * static_cast<std::size_t>(c + 1) / n_chunks_b;
         double* g = part.data() + static_cast<std::size_t>(c) * np;
         std::vector<std::vector<double>> act, delta;
         for (std::size_t k = lo; k < hi; ++k)
@@ -405,16 +434,16 @@ private:
         }
       }
 
-      // Chunk reduction in INDEX order -- serial and cheap (512 * 1.8k adds), and the thing that
-      // makes the whole loop thread-count invariant.
-      std::vector<double> gsum(np, 0.0);
-      for (std::size_t c = 0; c < n_chunks; ++c)
+      // Chunk reduction in INDEX order -- serial and cheap, and the thing that makes the whole
+      // loop thread-count invariant.
+      std::fill(gsum.begin(), gsum.end(), 0.0);
+      for (std::size_t c = 0; c < n_chunks_b; ++c)
       {
         const double* g = part.data() + c * np;
         for (std::size_t k = 0; k < np; ++k) { gsum[k] += g[k]; }
       }
 
-      const double n = static_cast<double>(n_rows);
+      const double n = static_cast<double>(bn);
       for (std::size_t l = 0; l < W.size(); ++l)
       {
         for (std::size_t k = 0; k < W[l].size(); ++k)
@@ -423,6 +452,7 @@ private:
         }
         for (std::size_t k = 0; k < B[l].size(); ++k) { B[l][k] -= p.lr * (gsum[bo[l] + k] / n); }
       }
+     }
     }
   }
 

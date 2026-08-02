@@ -115,6 +115,47 @@ int main()
     assert(worst == 0.0);
   }
 
+  // ---- THE DEFAULTS MUST TRAIN --------------------------------------------------------------
+  // The test above uses epochs=400, lr=0.5 to show the CAPACITY exists. That is not the same claim
+  // as "the configuration we ship learns anything", and the gap between the two is precisely how a
+  // full-batch implementation reached the benchmark: at epochs=1, full-batch is ONE gradient step,
+  // the output stayed near-constant, and the run reported 0 identifications with all 9
+  // fold-iterations skipped for want of confident positives -- while this file printed OK.
+  //
+  // So: default NNParams, a linearly separable problem, and an accuracy floor. Anything that makes
+  // the shipped defaults stop learning now fails here instead of on the cluster 40 minutes in.
+  {
+    std::mt19937 rng(99);
+    std::normal_distribution<double> g(0.0, 1.0);
+    std::vector<std::vector<double>> D;
+    std::vector<std::size_t> dpos, dneg;
+    const std::size_t kN = 20000;
+    for (std::size_t i = 0; i < kN; ++i)
+    {
+      const bool positive = (i % 2 == 0);
+      std::vector<double> row(8);
+      for (double& v : row) { v = g(rng); }
+      if (positive) { row[0] += 1.5; row[3] += 1.0; }
+      D.push_back(row);
+      (positive ? dpos : dneg).push_back(i);
+    }
+    NNParams dp;                                   // DEFAULTS. Deliberately not tuned here.
+    NNEnsemble e;
+    assert(e.fit(D, dpos, dneg, dp));
+    std::size_t correct = 0;
+    for (std::size_t i = 0; i < kN; ++i)
+    {
+      const bool predicted_positive = e.score(D[i]) > 0.0;
+      if (predicted_positive == (i % 2 == 0)) { ++correct; }
+    }
+    const double acc = static_cast<double>(correct) / static_cast<double>(kN);
+    std::printf("  DEFAULT params (epochs=%d, batch=%d, lr=%.3g) accuracy: %.3f\n", dp.epochs,
+                dp.batch_size, dp.lr, acc);
+    // 0.70 is far below what this problem allows; it is a floor against "did not train at all",
+    // not a quality bar. One full-batch step scores ~0.5 here.
+    assert(acc > 0.70);
+  }
+
   std::printf("odia_nn_test OK\n");
   return 0;
 }
