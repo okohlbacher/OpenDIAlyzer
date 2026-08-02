@@ -36,6 +36,7 @@
 #define ODIA_LDA_H
 
 #include "odia_gbt.h"
+#include "odia_anchor_training.h"
 
 #include <algorithm>
 #include <cmath>
@@ -90,9 +91,29 @@ struct LDAParams
   /// data LDA 0.981 vs GBT 0.986 AUC (no penalty for the extra capacity), on an interaction LDA
   /// 0.514 -- chance -- vs GBT 0.926. Everything else (folds, training-set selection, fold
   /// normalisation, q-values) is identical, so the two are directly comparable.
-  enum class Classifier { LDA, GBT };
+  ///
+  /// NN adds a third: an ensemble of small tanh MLPs, the shape DIA-NN uses. It can express the
+  /// same interactions the GBT can, plus smooth ones a tree approximates in steps.
+  enum class Classifier { LDA, GBT, NN };
   Classifier classifier = Classifier::LDA;
   GBTParams gbt;            ///< only consulted when classifier == GBT
+  NNParams nn;              ///< only consulted when classifier == NN
+
+  // ---- the anti-circularity mechanisms of odia_anchor_training.h, each toggleable ALONE ---------
+  // They are separable on purpose. Bundled, an improvement and a regression cancel and the net
+  // result is "no effect"; separately, each one's contribution is attributable.
+
+  /// Mechanism 1. Feature mask for the SEED fit only (empty = no exclusion). The seed selects the
+  /// anchors; if it selects them using the very features they will be used to calibrate, the
+  /// correction is biased toward the uncorrected state.
+  std::vector<char> seed_mask;
+  /// Mechanism 3. Share of precursor GROUPS each ensemble member trains on (1.0 = off, which is
+  /// DIA-NN's arrangement: members differ only in weight init, so they share one seed bias).
+  double bag_fraction = 1.0;
+  /// Mechanism 5. Stop when the positive SET stops changing, or when it SHRINKS. Counting
+  /// identifications cannot see a collapse -- they rise throughout one.
+  bool stop_on_composition = false;
+  double stop_jaccard = 0.98;
   bool normalize_folds = true;  ///< Rescale each fold's held-out scores to its own decoy null
                             ///< (mean 0, sd 1) before pooling. Each fold has its OWN weight vector,
                             ///< with its own arbitrary scale and offset, so the raw scores are not
@@ -560,14 +581,52 @@ inline ScoredGroups scoreSemiSupervisedLDA(
     // the surrounding machinery -- training-set selection, fold normalisation, q-values -- is
     // literally the same code for both.
     GBT gbt;
+    std::vector<NNEnsemble> nn_members;      // one per bag; size 1 when bagging is off
     const bool use_gbt = (params.classifier == LDAParams::Classifier::GBT);
+    const bool use_nn = (params.classifier == LDAParams::Classifier::NN);
+
 
     // Initial direction: the signed feature with the largest absolute Welch
     // two-sample t statistic between all target and decoy training rows.
     std::vector<double> w(m, 0.0);
     auto score_row = [&](std::size_t row) -> double {
+      if (use_nn && !nn_members.empty()) { return baggedScore(nn_members, z[row]); }
       return (use_gbt && gbt.trained()) ? gbt.score(z[row]) : lda_detail::dot(w, z[row]);
     };
+    // Fit whichever learner this run selected, on the given rows. `mask` is honoured by the NN
+    // only -- for a tree, a feature the fit never split on is already inert at scoring time, and
+    // for LDA a zero weight is likewise inert, so neither needs one.
+    auto fit_learner = [&](const std::vector<std::size_t>& pos, const std::vector<std::size_t>& neg,
+                           const std::vector<char>& mask) -> bool {
+      if (use_nn)
+      {
+        NNParams np = params.nn;
+        np.mask = mask;
+        if (params.bag_fraction >= 1.0)
+        {
+          NNEnsemble e;
+          if (!e.fit(z, pos, neg, np)) { return false; }
+          nn_members.assign(1, std::move(e));
+          return true;
+        }
+        AnchorTrainingParams ap;
+        ap.nn = np;
+        ap.bag_fraction = params.bag_fraction;
+        ap.min_anchors = 1;                  // the outer loop already refuses to fit on nothing
+        ap.seed = params.seed;
+        auto members = trainBaggedOnAnchors(z, pos, neg, group, ap);
+        if (members.empty()) { return false; }
+        nn_members = std::move(members);
+        return true;
+      }
+      if (use_gbt) { GBT g; if (!g.fit(z, pos, neg, gbt_params)) { return false; }
+                     gbt = std::move(g); return true; }
+      std::vector<double> next_w;
+      if (!fit_lda(pos, neg, next_w)) { return false; }
+      w.swap(next_w);
+      return true;
+    };
+
     std::size_t best_feature = 0;
     double best_abs_t = -1.0;
     double best_difference = 1.0;
@@ -644,24 +703,19 @@ inline ScoredGroups scoreSemiSupervisedLDA(
         }
         (group_label[g] == 1 ? seed_pos : seed_neg).push_back(best_row);
       }
-      if (use_gbt)
-      {
-        // The seed must use the SAME learner as the loop. Seeding a GBT run with an LDA fit
-        // reintroduces exactly the cold start this block exists to prevent, one level up: on data
-        // whose signal is an interaction, the LDA seed is at chance by construction, so iteration 0
-        // selects no positives, the GBT never fits, and the run silently falls back to ranking by a
-        // hyperplane that cannot see the signal. Caught by odia_gbt_test T7, which reported 0 IDs
-        // for BOTH classifiers before this.
-        GBT seed;
-        if (seed.fit(z, seed_pos, seed_neg, gbt_params)) { gbt = std::move(seed); }
-      }
-      else
-      {
-        std::vector<double> seed_w;
-        if (fit_lda(seed_pos, seed_neg, seed_w)) { w.swap(seed_w); }
-      }
+      // The seed must use the SAME learner as the loop. Seeding a GBT run with an LDA fit
+      // reintroduces exactly the cold start this block exists to prevent, one level up: on data
+      // whose signal is an interaction, the LDA seed is at chance by construction, so iteration 0
+      // selects no positives, the GBT never fits, and the run silently falls back to ranking by a
+      // hyperplane that cannot see the signal. Caught by odia_gbt_test T7, which reported 0 IDs
+      // for BOTH classifiers before this.
+      //
+      // params.seed_mask applies HERE and only here (mechanism 1) -- the seed picks the anchors,
+      // so it is the seed that must not see the calibrated features.
+      fit_learner(seed_pos, seed_neg, params.seed_mask);
     }
 
+    std::vector<std::size_t> prev_positives;   // mechanism 5's state, sorted
     for (int iteration = 0; iteration < std::max(0, params.n_iter); ++iteration)
     {
       // Reduce training scores to the best candidate row per precursor, then
@@ -737,17 +791,27 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       }
       if (negative_rows.size() < 2) { continue; }
 
-      if (use_gbt)
+      // A failed fit leaves the previous model in place, exactly as a failed Cholesky leaves the
+      // previous w -- the iteration is skipped, not replaced with something degenerate.
+      fit_learner(positive_rows, negative_rows, {});
+
+      // Mechanism 5. Watch the positive SET, not the score. A model collapsing onto a subset of
+      // its seed shows a SHRINKING positive set while its identification count rises, so a rule
+      // reading the score is blind to exactly the failure worth catching.
+      if (params.stop_on_composition)
       {
-        // A failed GBT fit leaves the previous ensemble in place, exactly as a failed Cholesky
-        // leaves the previous w -- the iteration is skipped, not replaced with something degenerate.
-        GBT next;
-        if (next.fit(z, positive_rows, negative_rows, gbt_params)) { gbt = std::move(next); }
-      }
-      else
-      {
-        std::vector<double> next_w;
-        if (fit_lda(positive_rows, negative_rows, next_w)) { w.swap(next_w); }
+        std::vector<std::size_t> curr = positive_rows;
+        std::sort(curr.begin(), curr.end());
+        if (!prev_positives.empty())
+        {
+          const double j = jaccardOverlap(prev_positives, curr);
+          if (curr.size() < prev_positives.size() || j >= params.stop_jaccard)
+          {
+            prev_positives.swap(curr);
+            break;
+          }
+        }
+        prev_positives.swap(curr);
       }
     }
 

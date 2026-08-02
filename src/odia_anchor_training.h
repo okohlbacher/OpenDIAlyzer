@@ -157,10 +157,11 @@ inline double anchorDisagreement(const std::vector<NNEnsemble>& members,
 ///
 /// Returns one trained ensemble per member. They are NOT averaged here -- the caller averages, and
 /// can first inspect their disagreement, which is the point of bagging them separately.
+template <typename GroupT>
 inline std::vector<NNEnsemble> trainBaggedOnAnchors(const std::vector<std::vector<double>>& X,
                                                     const std::vector<std::size_t>& positives,
                                                     const std::vector<std::size_t>& negatives,
-                                                    const std::vector<std::int64_t>& group,
+                                                    const std::vector<GroupT>& group,
                                                     const AnchorTrainingParams& p)
 {
   std::vector<NNEnsemble> members;
@@ -175,7 +176,7 @@ inline std::vector<NNEnsemble> trainBaggedOnAnchors(const std::vector<std::vecto
     neg_bag.reserve(negatives.size());
     for (std::size_t r : positives)
     {
-      if (inBag(static_cast<std::uint64_t>(m), group[r], p.seed, p.bag_fraction))
+      if (inBag(static_cast<std::uint64_t>(m), static_cast<std::int64_t>(group[r]), p.seed, p.bag_fraction))
       {
         pos_bag.push_back(r);
       }
@@ -185,7 +186,8 @@ inline std::vector<NNEnsemble> trainBaggedOnAnchors(const std::vector<std::vecto
     // by a different factor.
     for (std::size_t r : negatives)
     {
-      if (inBag(static_cast<std::uint64_t>(m), group[r], p.seed ^ 0xABCDEFull, p.bag_fraction))
+      if (inBag(static_cast<std::uint64_t>(m), static_cast<std::int64_t>(group[r]),
+                p.seed ^ 0xABCDEFull, p.bag_fraction))
       {
         neg_bag.push_back(r);
       }

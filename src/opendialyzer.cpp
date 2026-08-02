@@ -482,7 +482,31 @@ protected:
     registerStringOption_("classifier", "lda|gbt", "lda",
                           "Semi-supervised learner: lda (linear, default) or gbt (histogram "
                           "gradient-boosted trees; captures sub-score interactions).", false);
-    setValidStrings_("classifier", {"lda", "gbt"});
+    setValidStrings_("classifier", {"lda", "gbt", "nn"});
+
+    // The anti-circularity mechanisms of odia_anchor_training.h, exposed SEPARATELY so each one's
+    // contribution is attributable. Bundled, an improvement and a regression cancel to "no effect".
+    // Defaults reproduce the DIA-NN arrangement, so -classifier nn alone is the honest baseline for
+    // the ablation and every other flag is measured against it.
+    registerDoubleOption_("nn_bag_fraction", "<frac>", 1.0,
+                          "Mechanism 3. Share of precursor groups each ensemble member trains on. "
+                          "1.0 = off (DIA-NN: members differ only in weight init, so they share one "
+                          "seed bias that averaging cannot remove).", false);
+    registerFlag_("nn_seed_exclude_rt", "Mechanism 1. Hide the RT-agreement sub-scores from the SEED "
+                  "fit only. The seed picks the anchors, and anchors selected by the agreement they "
+                  "exist to measure bias the correction toward the uncorrected state.");
+    registerFlag_("nn_stop_on_composition", "Mechanism 5. Stop iterating when the positive SET stops "
+                  "changing or SHRINKS, rather than after a fixed count. A shrinking positive set is "
+                  "a model collapsing onto its seed -- identification counts RISE throughout, so a "
+                  "rule that watches the score cannot see it.");
+    // Dump the exact feature matrix the classifier is about to see. Extraction is identical across
+    // classifier variants and costs ~15 minutes; the classifier costs seconds. Dumping once and
+    // rescoring offline makes an ablation cheap AND better controlled -- every arm gets a
+    // bit-identical input, so a difference cannot be an extraction fluctuation.
+    registerStringOption_("score_fixture", "<file>", "",
+                          "Write the classifier's input matrix (group, label, sub-scores) to this "
+                          "file and continue. Line 1 is 'nrows ncols name...'; one row follows per "
+                          "peak group. Consumed by odia-ablate.", false, true);
     registerFlag_("selftest", "Run the recalibration-fit self-check and exit (no data needed).");
   }
 
@@ -1264,6 +1288,7 @@ protected:
     std::vector<long long> feature_id;
     std::vector<double> library_rt, exp_rt;
     std::vector<std::string> traml_id;        // PRECURSOR.TRAML_ID (== library compound.id)
+    std::vector<std::string> names;           // feats column names, in column order
 
     /// Put the rows in an order that depends on the DATA, not on the order extraction produced them.
     ///
@@ -1385,6 +1410,7 @@ protected:
       }
       sqlite3_finalize(ps);
     }
+    R.names = vcols;
     OPENMS_LOG_INFO << "OpenDIAlyzer: sqlite scoring found " << vcols.size()
                     << " VAR_ sub-scores in FEATURE_MS2." << std::endl;
     if (vcols.empty()) { sqlite3_close(db); return R; }
@@ -1558,6 +1584,7 @@ protected:
                                                            + " var_ms1_* excluded, -ms1_scores to include")
                     << ") across " << probe << " probed features (of " << fmap.size() << ")." << std::endl;
     if (vkeys.empty()) { return R; }
+    R.names = vkeys;
 
     R.feats.reserve(fmap.size());
     std::size_t skip_nogid = 0, skip_unmapped = 0, skip_baddecoy = 0;
@@ -2252,8 +2279,57 @@ protected:
     p.n_iter = getIntOption_("lda_iterations");
     p.train_fdr_initial = getDoubleOption_("lda_train_fdr_initial");
     p.train_fdr = getDoubleOption_("lda_train_fdr");
-    p.classifier = (getStringOption_("classifier") == "gbt") ? odia::LDAParams::Classifier::GBT
-                                                             : odia::LDAParams::Classifier::LDA;
+    const std::string clf = getStringOption_("classifier");
+    p.classifier = clf == "gbt" ? odia::LDAParams::Classifier::GBT
+                 : clf == "nn"  ? odia::LDAParams::Classifier::NN
+                                : odia::LDAParams::Classifier::LDA;
+    p.bag_fraction = getDoubleOption_("nn_bag_fraction");
+    p.stop_on_composition = getFlag_("nn_stop_on_composition");
+    if (getFlag_("nn_seed_exclude_rt"))
+    {
+      // Built by NAME rather than by index: the column set depends on -ms1_scores and on which
+      // sub-scores the run actually produced, so a hard-coded index would silently mask the wrong
+      // feature. Logged for the same reason -- a mask that matched nothing is otherwise invisible.
+      p.seed_mask.assign(R.names.size(), 1);
+      std::string masked;
+      for (std::size_t j = 0; j < R.names.size(); ++j)
+      {
+        std::string up = R.names[j];
+        std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+        if (up.find("_RT") != std::string::npos || up.find("RT_") != std::string::npos)
+        {
+          p.seed_mask[j] = 0;
+          masked += (masked.empty() ? "" : ", ") + R.names[j];
+        }
+      }
+      OPENMS_LOG_INFO << "OpenDIAlyzer: seed fit excludes " << (masked.empty() ? "(none)" : masked)
+                      << std::endl;
+      if (masked.empty()) { p.seed_mask.clear(); }
+    }
+    if (!getStringOption_("score_fixture").empty())
+    {
+      const std::string fx = getStringOption_("score_fixture");
+      std::ofstream o(fx);
+      // Column 3 is the precursor's TraML id. Without an identity per row the fixture can be
+      // compared to a reference COUNT but not to a reference ID LIST -- and two runs reaching the
+      // same count while identifying different peptides is exactly the case worth catching.
+      o << R.feats.size() << " " << R.feats[0].size();
+      for (const auto& nm : R.names) { o << " " << nm; }
+      o << "\n";
+      o << std::setprecision(9);
+      for (std::size_t i = 0; i < R.feats.size(); ++i)
+      {
+        o << R.group[i] << " " << R.labels[i] << " "
+          << (i < R.traml_id.size() && !R.traml_id[i].empty() ? R.traml_id[i] : std::string("-"));
+        for (const double v : R.feats[i])
+        {
+          if (std::isfinite(v)) { o << " " << v; } else { o << " nan"; }
+        }
+        o << "\n";
+      }
+      OPENMS_LOG_INFO << "OpenDIAlyzer: wrote score fixture " << fx << " (" << R.feats.size()
+                      << " rows x " << R.feats[0].size() << " cols)" << std::endl;
+    }
     odia::ScoredGroups s;
     { PhaseTimer pt(p.classifier == odia::LDAParams::Classifier::GBT ? "classifier_fit_gbt"
                                                                      : "classifier_fit_lda");

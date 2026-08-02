@@ -88,6 +88,33 @@ int main()
   assert(none.score(X[0]) == 0.0);
   std::printf("  untrained ensemble scores 0: OK\n");
 
+  // ---- thread-count invariance -----------------------------------------------------------------
+  // The reason trainOne partitions into a FIXED 512 chunks rather than one per thread. Floating-
+  // point addition is not associative, so a gradient summed over a thread-dependent partition is a
+  // thread-dependent model. This is the test that would have caught the same bug in the GBT
+  // histogram reduction, and it must be BIT-exact, not approximate: a tolerance here would pass
+  // while the model quietly depended on the machine it ran on.
+  {
+    NNParams tp = p;
+    tp.n_threads = 1;
+    NNEnsemble one;
+    assert(one.fit(X, pos, neg, tp));
+    double worst = 0.0;
+    for (int t : {2, 7, 16, 64})
+    {
+      NNParams mp = p;
+      mp.n_threads = t;
+      NNEnsemble many;
+      assert(many.fit(X, pos, neg, mp));
+      for (const auto& row : X)
+      {
+        worst = std::max(worst, std::fabs(one.score(row) - many.score(row)));
+      }
+    }
+    std::printf("  thread-count invariance (1 vs 2/7/16/64): max |delta| %.3e\n", worst);
+    assert(worst == 0.0);
+  }
+
   std::printf("odia_nn_test OK\n");
   return 0;
 }

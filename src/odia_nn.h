@@ -134,6 +134,15 @@ struct NNParams
   double l2 = 1e-5;
   std::uint64_t seed = 42;
   int n_threads = 0;
+  /// Optional input mask, one entry per feature; empty means "use everything". A 0 entry zeroes
+  /// that input in the FORWARD pass, so the feature can neither influence the output nor receive
+  /// gradient (dW = delta * x = 0). This is mechanism 1 of odia_anchor_training.h: the seed fit
+  /// must not see the features the anchors will be used to calibrate.
+  ///
+  /// A mask rather than a narrower matrix because the mask travels WITH the fitted model -- a
+  /// model trained without a feature must also be SCORED without it, and an ensemble whose
+  /// members were fitted under different masks still shares one X.
+  std::vector<char> mask;
 };
 
 /// Counter-based weight init. A hash of the coordinates, NOT a sequential RNG: a draw order that
@@ -157,8 +166,10 @@ inline double nnInitWeight(std::uint64_t net, std::uint64_t layer, std::uint64_t
 class MLP
 {
 public:
-  void init(int n_in, const std::vector<int>& hidden, std::uint64_t net, std::uint64_t seed)
+  void init(int n_in, const std::vector<int>& hidden, std::uint64_t net, std::uint64_t seed,
+            const std::vector<char>& mask = {})
   {
+    mask_ = (static_cast<int>(mask.size()) == n_in) ? mask : std::vector<char>();
     dims_.clear();
     dims_.push_back(n_in);
     for (int h : hidden) { dims_.push_back(h); }
@@ -189,6 +200,10 @@ public:
   {
     act.resize(dims_.size());
     act[0].assign(x, x + dims_[0]);
+    if (!mask_.empty())
+    {
+      for (int i = 0; i < dims_[0]; ++i) { if (!mask_[static_cast<std::size_t>(i)]) { act[0][i] = 0.0; } }
+    }
     for (std::size_t l = 0; l + 1 < dims_.size(); ++l)
     {
       const int fi = dims_[l], fo = dims_[l + 1];
@@ -219,6 +234,7 @@ public:
 private:
   std::vector<int> dims_;
   std::vector<std::vector<double>> W_, b_;
+  std::vector<char> mask_;
 };
 
 /// Ensemble of MLPs, averaged. Each member differs only in its init hash, so the ensemble is
@@ -255,7 +271,7 @@ public:
     for (int n = 0; n < p.n_nets; ++n)
     {
       nets_[static_cast<std::size_t>(n)].init(n_in_, p.hidden, static_cast<std::uint64_t>(n),
-                                              p.seed);
+                                              p.seed, p.mask);
       trainOne(nets_[static_cast<std::size_t>(n)], X, pos, neg, w_neg, p);
     }
     trained_ = true;
@@ -288,19 +304,53 @@ private:
     auto& B = net.biases();
     const auto& dims = net.dims();
 
+    // Flat parameter layout, so one gradient buffer per chunk is ONE allocation rather than a
+    // vector-of-vectors per layer. At 512 chunks the difference is 3072 allocations an epoch.
+    std::vector<std::size_t> wo(W.size()), bo(B.size());
+    std::size_t np = 0;
+    for (std::size_t l = 0; l < W.size(); ++l) { wo[l] = np; np += W[l].size(); }
+    for (std::size_t l = 0; l < B.size(); ++l) { bo[l] = np; np += B[l].size(); }
+
+    // One flat row list: positives first, then negatives, each in the caller's sorted order.
+    std::vector<std::size_t> rows;
+    rows.reserve(pos.size() + neg.size());
+    rows.insert(rows.end(), pos.begin(), pos.end());
+    rows.insert(rows.end(), neg.begin(), neg.end());
+    const std::size_t n_pos = pos.size(), n_rows = rows.size();
+    if (n_rows == 0) { return; }
+
+    // A FIXED chunk count, deliberately independent of the thread count.
+    //
+    // Floating-point addition is not associative, so a partial sum depends on WHICH rows went into
+    // it. Partitioning by thread count would therefore make the trained weights a function of how
+    // many threads happened to be available -- the exact class of bug that cost this project weeks
+    // in the GBT histogram reduction, where `lo = n_rows*c/nchunk` had the same shape. Fixing the
+    // partition at 512 and summing the chunks in INDEX order makes the result bit-identical on 1
+    // thread and on 224, which is the property the determinism tests check.
+    //
+    // 512 rather than 64: with 224 threads a chunk count near the thread count leaves the tail
+    // badly balanced, and the buffer is only 512 * ~1.8k doubles = 7 MB.
+    constexpr std::size_t kChunks = 512;
+    const std::size_t n_chunks = std::min<std::size_t>(kChunks, n_rows);
+
     for (int ep = 0; ep < p.epochs; ++ep)
     {
-      std::vector<std::vector<double>> gW(W.size()), gB(B.size());
-      for (std::size_t l = 0; l < W.size(); ++l)
-      {
-        gW[l].assign(W[l].size(), 0.0);
-        gB[l].assign(B[l].size(), 0.0);
-      }
+      std::vector<double> part(n_chunks * np, 0.0);
 
-      const auto accumulate = [&](const std::vector<std::size_t>& idx, double label, double weight) {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(p.n_threads > 0 ? p.n_threads : omp_get_max_threads())
+#endif
+      for (long long c = 0; c < static_cast<long long>(n_chunks); ++c)
+      {
+        const std::size_t lo = n_rows * static_cast<std::size_t>(c) / n_chunks;
+        const std::size_t hi = n_rows * static_cast<std::size_t>(c + 1) / n_chunks;
+        double* g = part.data() + static_cast<std::size_t>(c) * np;
         std::vector<std::vector<double>> act, delta;
-        for (std::size_t r : idx)
+        for (std::size_t k = lo; k < hi; ++k)
         {
+          const std::size_t r = rows[k];
+          const double label = (k < n_pos) ? 1.0 : 0.0;
+          const double weight = (k < n_pos) ? 1.0 : w_neg;
           const double logit = net.forward(X[r].data(), act);
           const double pr = 1.0 / (1.0 + std::exp(-logit));
           delta.assign(dims.size(), {});
@@ -311,10 +361,11 @@ private:
             for (int j = 0; j < fo; ++j)
             {
               const double d = delta[l + 1][static_cast<std::size_t>(j)];
-              gB[l][static_cast<std::size_t>(j)] += d;
+              g[bo[l] + static_cast<std::size_t>(j)] += d;
               for (int i = 0; i < fi; ++i)
               {
-                gW[l][static_cast<std::size_t>(i) * fo + j] += d * act[l][static_cast<std::size_t>(i)];
+                g[wo[l] + static_cast<std::size_t>(i) * fo + j] +=
+                  d * act[l][static_cast<std::size_t>(i)];
               }
             }
             if (l > 0)
@@ -334,23 +385,29 @@ private:
             }
           }
         }
-      };
-      // Positives then negatives, each in the caller's (sorted) order -- a fixed traversal, so the
-      // floating-point accumulation order does not depend on scheduling.
-      accumulate(pos, 1.0, 1.0);
-      accumulate(neg, 0.0, w_neg);
+      }
 
-      const double n = static_cast<double>(pos.size() + neg.size());
+      // Chunk reduction in INDEX order -- serial and cheap (512 * 1.8k adds), and the thing that
+      // makes the whole loop thread-count invariant.
+      std::vector<double> gsum(np, 0.0);
+      for (std::size_t c = 0; c < n_chunks; ++c)
+      {
+        const double* g = part.data() + c * np;
+        for (std::size_t k = 0; k < np; ++k) { gsum[k] += g[k]; }
+      }
+
+      const double n = static_cast<double>(n_rows);
       for (std::size_t l = 0; l < W.size(); ++l)
       {
         for (std::size_t k = 0; k < W[l].size(); ++k)
         {
-          W[l][k] -= p.lr * (gW[l][k] / n + p.l2 * W[l][k]);
+          W[l][k] -= p.lr * (gsum[wo[l] + k] / n + p.l2 * W[l][k]);
         }
-        for (std::size_t k = 0; k < B[l].size(); ++k) { B[l][k] -= p.lr * (gB[l][k] / n); }
+        for (std::size_t k = 0; k < B[l].size(); ++k) { B[l][k] -= p.lr * (gsum[bo[l] + k] / n); }
       }
     }
   }
+
 
   std::vector<MLP> nets_;
   NNParams params_;

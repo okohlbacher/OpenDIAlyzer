@@ -69,6 +69,7 @@ add_executable(odia-features-test src/odia_features_test.cpp)
 add_executable(odia-prefilter-model-test src/odia_prefilter_model_test.cpp)
 add_executable(odia-nn-test src/odia_nn_test.cpp)
 add_executable(odia-anchor-training-test src/odia_anchor_training_test.cpp)
+add_executable(odia-ablate src/odia_ablate.cpp)
 
 # The semi-supervised loop on a REAL score matrix (44,568 peak groups x 29 sub-scores extracted
 # from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
