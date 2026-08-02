@@ -721,6 +721,8 @@ protected:
   /// Synthetic ids are what make the load cheap; they must not escape into the written bundle.
   mutable odia::CompactLibrary compact_lib_;
   mutable bool compact_lib_used_ = false;
+  /// Per-candidate prefilter evidence, retained so -prefilter_out can report the LOSSES.
+  mutable std::vector<TransitionListEvidenceFilter::PrecursorEvidence> prefilter_evidence_;
 
   /// Load an .oswpq library through CompactLibrary and materialise a targeted experiment whose
   /// compound ids are synthetic (base-36, <=14 chars, inside the SSO buffer).
@@ -3085,6 +3087,11 @@ protected:
     TransitionListEvidenceFilter::Result res;
     { PhaseTimer pt("prefilter/scan_targets");
       res = filt.filter(swath_maps, transition_exp, cp_ms1, cp, pasef_, getIntOption_("threads")); }
+    // Keep the per-candidate evidence. Dumping only SURVIVORS answers "what got through" but not
+    // "why did the rest not", and the second is the question: 923 of a reference tool's IDs are
+    // deleted here, and relaxing the threshold makes identifications WORSE (6930 -> 5580 at 3-of-6),
+    // so the useful thing to know is how far the losses miss and on which criterion.
+    prefilter_evidence_ = res.evidence;
 
     // Decoy status lives on the TRANSITION (getDecoy()), not on LightCompound, so derive it per
     // peptide ref first -- the evidence split below needs it.
@@ -4140,14 +4147,29 @@ protected:
         }
         std::ofstream os(pf_out);
         if (!os) { OPENMS_LOG_ERROR << "OpenDIAlyzer: cannot write " << pf_out << std::endl; return CANNOT_WRITE_OUTPUT_FILE; }
-        os << "id\tsequence\tdecoy\n";
-        for (const auto& c : transition_exp.getCompounds())
+        std::set<std::string> survived;
+        for (const auto& c : transition_exp.getCompounds()) { survived.insert(c.id); }
+
+        // EVERY candidate, with the evidence the decision was made on -- survivors and losses alike.
+        os << "id\tsequence\tdecoy\tsurvived\tsupported_ms2\tms2_best_fragment_hits"
+              "\tms2_hit_count\tms2_qualifying_spectra\tms1_hit_count\tms1_max_intensity"
+              "\tprecursor_mz\n";
+        for (const auto& e : prefilter_evidence_)
         {
-          os << c.id << '\t' << c.sequence << '\t' << (dec.count(c.id) ? 1 : 0) << '\n';
+          os << e.compound_id << '\t' << e.sequence << '\t' << (dec.count(e.compound_id) ? 1 : 0)
+             << '\t' << (survived.count(e.compound_id) ? 1 : 0)
+             << '\t' << (e.supported_ms2 ? 1 : 0)
+             << '\t' << e.ms2_best_fragment_hits
+             << '\t' << e.ms2_hit_count
+             << '\t' << e.ms2_qualifying_spectra
+             << '\t' << e.ms1_hit_count
+             << '\t' << e.ms1_max_intensity
+             << '\t' << e.precursor_mz << '\n';
         }
-        OPENMS_LOG_INFO << "OpenDIAlyzer: wrote " << transition_exp.getCompounds().size()
-                        << " surviving precursors to " << pf_out << " (-prefilter_out set, exiting "
-                        << "before extraction)." << std::endl;
+        OPENMS_LOG_INFO << "OpenDIAlyzer: wrote evidence for " << prefilter_evidence_.size()
+                        << " candidates (" << transition_exp.getCompounds().size()
+                        << " survived) to " << pf_out << " (-prefilter_out set, exiting before "
+                        << "extraction)." << std::endl;
         return EXECUTION_OK;
       }
     }
