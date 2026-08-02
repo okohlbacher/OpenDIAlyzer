@@ -38,7 +38,13 @@ not where IDs are lost.**
 Cost of the widest: peak RSS 89.9 -> 92.9 GB, extraction 961 -> 993 s. Negligible. The
 counter-hypothesis (extra candidates cost more in FDR than they return) is refuted over this range.
 
-`recal900` and `recal1435` were queued to find the turnover and had not finished at handoff.
+**The turnover is found: `recal900` gives 6835, BELOW 600 s's 6930.** So ~600 s is near-optimal for
+this run and the curve is 6552 -> 6695 -> 6930 -> 6835 across 240/400/600/900 s. Peak RSS climbs
+89.9 -> 91.0 -> 92.9 -> 99.6 GB. `recal1435` was still queued at handoff and should confirm the
+decline continues.
+
+This is a single-run optimum on one instrument and one library; whether ~600 s or the ratio
+(600 s pass 2 against a 1435 s pass 1, i.e. ~0.42) transfers is untested.
 
 ### 1.3 Pass 2 was clipping the residual distribution
 
