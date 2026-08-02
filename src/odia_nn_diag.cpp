@@ -162,11 +162,25 @@ int main(int argc, char** argv)
 
   report("bootstrap (1 feature)", [&](const std::vector<double>& x) { return sign * x[best_j]; });
 
-  // INPUT TRANSFORMS. The standardised features reach 27 sigma -- these sub-scores are extremely
-  // heavy-tailed. A tree is invariant to any monotone transform of a feature, so the GBT does not
-  // care; a tanh network does, because one 27-sigma input saturates the first layer and the
-  // gradient through it dies. If that is the difference, a squashing or rank transform closes it
-  // and no amount of learning-rate tuning will.
+  // INPUT TRANSFORMS -- the heavy-tail hypothesis, REFUTED TWICE.
+  //
+  // The standardised features reach 27 sigma, so a tanh net should saturate where a tree (invariant
+  // to monotone transforms) does not. Squashing them ought to help. It does not:
+  //
+  //     transform   top-1% recall, 5-layer net (untrainable)   2-layer net (trainable)
+  //     none                        1.38%                        2.09%
+  //     clip3                       1.62%                        1.97%
+  //     asinh                       1.37%                        2.03%
+  //     rank                        1.16%                        1.92%
+  //
+  // The first refutation was made with the FIVE-LAYER net, which we later found could not train at
+  // all -- and a net that learns nothing is unaffected by its inputs whatever they are, so that
+  // refutation was worthless as evidence even though its conclusion was right. Re-run with the
+  // 2-layer net it holds, and harder: every transform is WORSE than none. The extreme values are
+  // real evidence -- a 27-sigma sub-score is a strong signal -- and compressing them discards it.
+  //
+  // Keep this block. Re-testing a refutation after fixing the instrument that produced it is the
+  // point, and the next hypothesis will want the same treatment.
   const char* tf_name = std::getenv("ODIA_NN_TF");
   const std::string tf = tf_name ? tf_name : "none";
   if (tf == "clip3")
@@ -239,6 +253,9 @@ int main(int argc, char** argv)
   { hid += (i ? "-" : "") + std::to_string(np.hidden[i]); }
   std::snprintf(tag, sizeof(tag), "NN lr%.3g e%d b%d h%s", np.lr, np.epochs, np.batch_size, hid.c_str());
 
+  if (const char* nets = std::getenv("ODIA_NN_NETS")) { np.n_nets = std::atoi(nets); }
+  std::snprintf(tag, sizeof(tag), "NN lr%.3g e%d b%d n%d h%s", np.lr, np.epochs, np.batch_size,
+                np.n_nets, hid.c_str());
   odia::NNEnsemble e;
   if (e.fit(Z, pos, neg, np)) { report(tag, [&](const std::vector<double>& x) { return e.score(x); }); }
   else { std::printf("  %-22s FIT FAILED\n", tag); }
