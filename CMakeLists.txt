@@ -170,6 +170,9 @@ add_test(NAME odia-gbt COMMAND odia-gbt-test)
 add_test(NAME odia-seqstore COMMAND odia-seqstore-test)
 add_test(NAME odia-library COMMAND odia-library-test)
 add_test(NAME odia-gbt-serial COMMAND odia-gbt-test-serial)
+# Built but never RUN by ctest until now, so a broken minibatch implementation left the suite green.
+add_test(NAME odia-nn COMMAND odia-nn-test)
+add_test(NAME odia-anchor-training COMMAND odia-anchor-training-test)
 add_test(NAME odia-lda-realdata
          COMMAND odia-lda-realdata-test "${CMAKE_CURRENT_SOURCE_DIR}/testdata/lda_fixture.txt")
 set_tests_properties(odia-lda-realdata PROPERTIES SKIP_RETURN_CODE 77)

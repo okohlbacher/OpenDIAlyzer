@@ -396,9 +396,15 @@ private:
     constexpr std::size_t kChunks = 512;
     const std::size_t n_chunks = std::min<std::size_t>(kChunks, n_rows);
 
-    const std::size_t batch = (p.batch_size > 0)
-                                ? std::min<std::size_t>(static_cast<std::size_t>(p.batch_size), n_rows)
-                                : n_rows;
+    // A MINIMUM NUMBER OF UPDATES, not just a batch size. A bag or a small fold can be smaller
+    // than batch_size, and then ceil(n_rows/batch) is 1 -- straight back into the single-step
+    // failure this whole change exists to remove, silently and only for the small fits. Bagging
+    // makes that reachable in production (a 70% bag of a small anchor set). Shrinking the batch
+    // for small inputs guarantees >= 16 steps whenever there are enough rows to have them.
+    std::size_t batch = (p.batch_size > 0)
+                          ? std::min<std::size_t>(static_cast<std::size_t>(p.batch_size), n_rows)
+                          : n_rows;
+    if (p.batch_size > 0 && n_rows >= 16) { batch = std::min(batch, std::max<std::size_t>(1, n_rows / 16)); }
     const std::size_t n_batches = (n_rows + batch - 1) / batch;
     std::vector<double> part;
     std::vector<double> gsum(np, 0.0);
@@ -483,11 +489,17 @@ private:
       }
 
       const double n = static_cast<double>(bn);
+      // L2 IS SCALED BY THIS BATCH'S SHARE OF THE DATA. The decay is applied once per batch, so
+      // without the scaling its total strength per epoch multiplies by the NUMBER OF BATCHES --
+      // going from full-batch to batch=256 silently increased regularisation ~2400x on a 600k-row
+      // fold. Scaling by bn/n_rows makes one epoch apply l2 once, whatever the batch size, so
+      // batch_size stays a pure speed/step-count knob and does not move the fit.
+      const double l2_share = p.l2 * n / static_cast<double>(n_rows);
       for (std::size_t l = 0; l < W.size(); ++l)
       {
         for (std::size_t k = 0; k < W[l].size(); ++k)
         {
-          W[l][k] -= p.lr * (gsum[wo[l] + k] / n + p.l2 * W[l][k]);
+          W[l][k] -= p.lr * (gsum[wo[l] + k] / n + l2_share * W[l][k]);
         }
         for (std::size_t k = 0; k < B[l].size(); ++k) { B[l][k] -= p.lr * (gsum[bo[l] + k] / n); }
       }
