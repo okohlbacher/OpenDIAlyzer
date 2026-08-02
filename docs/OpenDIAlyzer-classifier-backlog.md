@@ -1,0 +1,117 @@
+# Classifier / anti-circularity backlog
+
+Open items from the night of 2026-08-02, after two adversarial review passes (kimi, codex) over
+commits `3956706` → `f9307b3` → `8955640`. Everything listed here was **confirmed against the
+source** and deliberately *not* fixed yet, with the reason given.
+
+Fixed already, for reference: M5 threshold mismatch, fake no-CV arm, dead iteration cap, silent
+mask discard (`f9307b3`); mechanism-1 seed-row leak, name/column desync, unlinked OpenMP in the
+NN test, failed-fit accounting, dead sort in `NNEnsemble::fit`, backwards FDR-floor message,
+overstated `medianGap`, fixture precision, unknown-arm silence (`8955640`).
+
+---
+
+## 1. M5 compares peak ROWS, not precursor identities — MEDIUM
+
+`src/odia_lda.h`, the `stop_on_composition` block.
+
+The positive set is compared as a set of **best-row indices**. When a precursor's best peak group
+changes between iterations — which is a normal, healthy thing for the model to do — the row index
+changes, so one precursor leaving and re-entering looks like a removal *plus* an addition. Jaccard
+is depressed and the shrink test can fire on a set that did not actually lose a single precursor.
+
+**Fix:** compare `group[best_row]`, not `best_row`. The rule is *about* precursors; it currently
+measures peaks.
+
+**Why not tonight:** it changes what the stop rule measures, so it needs its own test (a fixture
+where the best peak swaps but the precursor set is constant must report Jaccard 1.0) and a re-run
+of the M5 arms. Both M5 arms are in the running ablation under the current semantics; changing it
+mid-flight would make the table incomparable.
+
+## 2. M5 commits the fit before testing for collapse, and skips can bypass the detector — MEDIUM
+
+Same block. Two structural problems:
+
+* The new model is installed by `fit_learner()` *before* the composition test runs, so on the
+  iteration where a collapse is detected the collapsed model is already the live one. The rule
+  stops further damage but does not roll back.
+* The `continue` paths above it (`positive_rows.size() < m + 2`, `negative_rows.size() < 2`) exit
+  the iteration before the composition test, so the most severe shrinkage — the kind that starves
+  the fit entirely — never reaches the detector.
+
+**Fix:** evaluate composition *before* committing, keep the last non-collapsed model, and run the
+test on the skip paths too.
+
+## 3. Fold normalisation is a label-dependent transform of the test set — MEDIUM, deepest item here
+
+`src/odia_lda.h`, `normalize_folds`.
+
+Each fold's held-out scores are standardised to *that fold's own decoy* mean and SD, and those same
+decoys are then pooled to compute q-values. The standardising statistics are therefore computed
+from the labels of the very rows the null is built on. With few decoys in a fold the effect is
+stark: two decoys are forced to ±1/√2 while an exchangeable null target is unbounded — so target
+and decoy are no longer exchangeable, which is the assumption target-decoy FDR rests on.
+
+This is not new tonight; it predates the NN work and affects LDA and GBT equally. It is also the
+item most likely to be quietly costing calibration accuracy.
+
+**Fix directions:** label-blind calibration (standardise on all held-out rows, not decoys only), or
+cross-fitted statistics, or pool fold-local valid statistics rather than rescaling. Needs an
+entrapment measurement to choose between them — see item 5.
+
+**Why not tonight:** it changes every arm's q-values, so it must not land in the middle of an
+ablation, and the choice between fixes is an empirical question this project cannot answer without
+item 5.
+
+## 4. Harness reports 6,421 where the pipeline reports 6,433 — LOW, but unexplained
+
+Same fixture, same classifier, same parameters; 12 precursors (0.19%) differ.
+
+Most likely best-per-group tie-breaking: `odia_ablate.cpp:idsAt()` keeps the first maximum in row
+order, and `bestPerGroup_()` in the tool may resolve equal d-scores differently. Harmless for the
+ablation (it cancels across arms) but it is an unexplained difference between two things that
+should be identical, and those have a history in this project of turning out to matter.
+
+**Fix:** make `idsAt()` use the same tie-break as `bestPerGroup_()`, then assert equality.
+
+## 5. External null validation — the one that gates items 2 and 3
+
+Every internal diagnostic here is necessary and none is sufficient: `medianGap()` rises for genuine
+discrimination *and* for label leakage, and it cannot distinguish them. The scheme's own header
+says so — a uniformly biased seed is invisible to all five mechanisms.
+
+The entrapment library is **already built** (177,763 promoted decoys). Running it gives an external
+answer to "is the reported 1% actually 1%", which is what decides whether the fold-normalisation
+change in item 3 helps or merely moves numbers.
+
+**Do this first tomorrow.** It is the only measurement that can adjudicate the rest.
+
+## 6. Bagging preserves the class ratio in expectation only — LOW (wording, possibly design)
+
+`src/odia_anchor_training.h:trainBaggedOnAnchors`.
+
+Positives and negatives are independent threshold samples at the same rate, so the retained ratio
+matches only in expectation, not exactly; and XORing a constant into the seed is *domain
+separation*, not probabilistic independence. Neither is wrong in effect — the per-bag class
+weighting in `NNEnsemble::fit` compensates — but the comment claims more than the code delivers.
+
+**Fix:** either say "equal expected sampling rate", or sample a fixed stratified count per class.
+
+## 7. NN scoring is still the serial tail
+
+Training is now parallel and thread-count invariant; the *scoring* loops inside each semi-supervised
+iteration (ranking, negative selection) remain serial per fold, and for the NN each call is a
+forward pass through 12 nets. The final per-fold scoring loop was parallelised in `8955640`; the
+in-iteration ones were not, because they feed `ranked`, whose order is load-bearing for
+determinism.
+
+**Fix:** pre-size the output and index by position rather than pushing back, exactly as the final
+loop now does.
+
+## 8. Carried over, unrelated to tonight
+
+* Report upstream: needless deep copy of every `Feature` inside `omp critical (osw_write_out)`.
+* Report upstream: native string IDs used as join keys where indices would do (see also
+  `docs/OSWPQ-parquet-library-format-spec.md` §7.2).
+* `-compact_library true` still yields zero prefilter support, undiagnosed.
+* `library_intensity` float32 change not contributed upstream.
