@@ -1108,9 +1108,30 @@ protected:
   // Rewrite each library precursor's RT through `t`. The ChromatogramExtractor centers
   // the RT window on compound.rt DIRECTLY (the trafo argument to performExtraction is not
   // used for the coordinate path), so we pre-scale the library RT into run seconds here.
-  static void rescaleLibraryRT_(OpenSwath::LightTargetedExperiment& exp, const TransformationDescription& t)
+  /// Map the library's ORIGINAL RT into run seconds. `orig` is the library RT as loaded, captured
+  /// once before any pass runs.
+  ///
+  /// This used to read `c.rt` -- the CURRENT value -- and so composed across passes. Pass 1 gave
+  /// rt := t1(rt_orig), putting the library in run seconds; pass 2 then gave rt := t2(t1(rt_orig)).
+  /// But t2 comes from recalibrate_, which fits library_rt -> exp_rt using library_rt out of
+  /// precursor_index_, i.e. the ORIGINAL units. Feeding it run seconds evaluates the transform far
+  /// outside its fitted domain, so every pass-2 window lands nowhere.
+  ///
+  /// That is why -rt_calibration bootstrap and none both returned 0 IDs while pass 1 was healthy:
+  /// bootstrap's pass-1 p95 anchor residual was 112.86 s, BETTER than cirt's 117.24 s. cirt was
+  /// never affected because use_native_trafo skips this function entirely.
+  static void rescaleLibraryRT_(OpenSwath::LightTargetedExperiment& exp,
+                                const TransformationDescription& t,
+                                const std::vector<double>& orig)
   {
-    for (auto& c : exp.compounds) { c.rt = t.apply(c.rt); }
+    if (orig.size() != exp.compounds.size())
+    {
+      OPENMS_LOG_ERROR << "OpenDIAlyzer: library RT snapshot size " << orig.size() << " != "
+                       << exp.compounds.size() << " compounds; refusing to rescale (RT would "
+                          "compose across passes)" << std::endl;
+      return;
+    }
+    for (std::size_t i = 0; i < exp.compounds.size(); ++i) { exp.compounds[i].rt = t.apply(orig[i]); }
   }
 
   // Empirical library (DIA-NN-style): replace the PREDICTED RT of precursors identified in
@@ -4125,6 +4146,12 @@ protected:
     identity.fitModel("identity");
     const bool use_empirical = getStringOption_("empirical_rt") != "false";
     std::map<std::string, double> empirical_rt;               // TRAML_ID -> observed apex RT (pass-1 IDs)
+    // The library RT as loaded. Every pass maps from THIS, never from the previous pass's output --
+    // see rescaleLibraryRT_. Matches what precursor_index_ snapshotted, so the transform
+    // recalibrate_ fits is applied over the domain it was fitted on.
+    std::vector<double> library_rt_orig;
+    library_rt_orig.reserve(transition_exp.compounds.size());
+    for (const auto& c : transition_exp.compounds) { library_rt_orig.push_back(c.rt); }
     for (int p = 1; p <= passes; ++p)
     {
       // Two ways to place the RT window:
@@ -4133,7 +4160,7 @@ protected:
       //      the extraction window AND the NORM_RT score are then computed the same way.
       //  (b) fallback (bootstrap / none): no trustworthy transform, so pre-scale compound.rt
       //      into run seconds and extract with identity.
-      if (!use_native_trafo) { rescaleLibraryRT_(transition_exp, pass_map); }
+      if (!use_native_trafo) { rescaleLibraryRT_(transition_exp, pass_map, library_rt_orig); }
       const bool narrow = (p > 1);
       // Empirical library on recalibrated passes: overwrite RT of pass-1-identified
       // precursors with their measured apex RT (centres their window on the measured pass-1 apex).
