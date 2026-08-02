@@ -161,3 +161,39 @@ place.
 - **Batching changes the FDR.** If per-batch score distributions differ enough that a global
   q-value over the union is not comparable to today's, the ID counts are not comparable either and
   the +923 claim needs restating.
+
+---
+
+## 6. Upstream: native IDs are indices wearing string costumes
+
+`MRMFeatureFinderScoring` uses `getNativeID()` purely as a **join key** between transitions,
+chromatograms and features:
+
+```cpp
+detecting_transitions.push_back(tr_it->getNativeID());              // :310, vector<std::string>
+transition_group_detection = transition_group.subset(detecting_transitions);   // :319
+idmrmfeature.getFeature(native_id).getIntensity()                   // :383, string-keyed lookup
+```
+
+Nothing reads it as a name. A transition index would serve identically.
+
+What the string form costs:
+
+| | |
+|---|---|
+| `getNativeID()` returns `std::string` **by value** | one copy per call |
+| `detecting_transitions` rebuilt **per transition group** | ~4.6M string constructions per pass (423,079 precursors x ~11 transitions) |
+| `getFeature(native_id)` | string hash + compare rather than an array index |
+
+**The memory half is already solved on our side.** ODIA's synthetic ids are <=8 characters and stay
+inside libstdc++'s SSO buffer, so none of those constructions reach the heap. That is what makes the
+compact path viable at all.
+
+**The CPU half remains and is unmeasured.** String hashing and copying inside the scoring inner
+loop, which sits within ~990 s of extraction. Plausible, not established -- worth profiling before
+claiming it matters.
+
+**The fix is upstream.** `MRMTransitionGroup::subset()` and `getFeature()` take string keys as part
+of their public interface. Converting them to index-based lookup is an OpenMS change and CLEAN-ROOM
+keeps OpenMS unvendored, so this is a report, not a patch. Same category as the per-Feature deep
+copy inside the `osw_write_out` critical section.
