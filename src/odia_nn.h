@@ -127,10 +127,34 @@ inline std::vector<std::string> imFeatureNames()
 
 struct NNParams
 {
-  std::vector<int> hidden = {32, 16, 16, 8, 8};  ///< DIA-NN's shape is 5 tanh layers; widths here
-                                                 ///< are scaled to a 35-60 input rather than 73
+  /// TWO hidden layers, not DIA-NN's five.
+  ///
+  /// Copying the depth was a mistake, and it is the reason the network returned 0 identifications
+  /// on the benchmark. Five tanh layers do not train in the handful of epochs this loop allows:
+  /// the gradient reaching the first layer is the product of five tanh derivatives, all <= 1, so
+  /// the net barely leaves its initialisation and the ensemble averages twelve barely-moved nets.
+  /// The symptom is visible in the logit range -- [-0.15, 0.12] at five layers against
+  /// [-0.49, 1.12] at two.
+  ///
+  /// Measured on held-out groups of a real 1.1M-row fixture, by targets clearing the 99th
+  /// percentile of decoys (the regime a 1% FDR lives in; overall AUC hides it):
+  ///
+  ///     h=32,16,16,8,8  e1   1.38%      <- the shape copied from DIA-NN
+  ///     h=16            e1   1.59%
+  ///     h=32,16         e1   1.83%
+  ///     h=64,32         e5   1.98%
+  ///     h=64,32  lr0.2  e5   2.09%      <- here
+  ///     GBT (reference)      1.99%
+  ///
+  /// DIA-NN presumably makes five layers work with far more updates than this loop grants; with
+  /// this budget, depth costs rather than pays. TUNED ON ONE SUBSAMPLE of one dataset -- it beats
+  /// the GBT on that subsample's held-out groups by 5%, which is a starting point and not a
+  /// validated default.
+  std::vector<int> hidden = {64, 32};
   int n_nets = 12;            ///< ensemble size, as DIA-NN
-  int epochs = 1;             ///< passes over the data per semi-supervised iteration, as DIA-NN
+  int epochs = 5;             ///< passes over the data per semi-supervised iteration. 5x the cost
+                              ///< of 1 for +0.11 percentage points of top-1% recall (1.98 -> 2.09);
+                              ///< see hidden{} for the curve this came from.
   /// Rows per gradient STEP. This is the parameter that actually trains the model, and getting it
   /// wrong is why the first NN run on the benchmark returned 0 identifications with every
   /// iteration skipped.
@@ -177,7 +201,8 @@ struct NNParams
   /// the former costs 62 s, the latter 24 s). The curve is flat below 256, so 256 it is -- it also
   /// leaves more work per parallel region than 128 or 64 do.
   int batch_size = 256;
-  double lr = 0.05;
+  double lr = 0.2;            ///< measured optimum at hidden={64,32}, epochs=5; 0.05 gives 1.98%
+                              ///< and 0.5 overshoots. Interacts with depth -- retune if that moves.
   double l2 = 1e-5;
   std::uint64_t seed = 42;
   int n_threads = 0;
