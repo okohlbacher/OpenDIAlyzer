@@ -97,16 +97,33 @@ weighting in `NNEnsemble::fit` compensates — but the comment claims more than 
 
 **Fix:** either say "equal expected sampling rate", or sample a fixed stratified count per class.
 
-## 7. NN scoring is still the serial tail
+## 7. NN scoring is still the serial tail — DONE (`8f6a44c`, `5c03c12`)
 
-Training is now parallel and thread-count invariant; the *scoring* loops inside each semi-supervised
-iteration (ranking, negative selection) remain serial per fold, and for the NN each call is a
-forward pass through 12 nets. The final per-fold scoring loop was parallelised in `8955640`; the
-in-iteration ones were not, because they feed `ranked`, whose order is load-bearing for
-determinism.
+All three per-group scans now share one parallel helper with a pre-sized output written by
+position; the duplicated decoy re-scan is gone; and the nested thread budget (`max_threads/folds`)
+is applied by every inner region rather than by training alone, which was leaving 3 folds x 180
+threads on 224 cores.
 
-**Fix:** pre-size the output and index by position rather than pushing back, exactly as the final
-loop now does.
+Still open underneath it: measured CPU went 435% -> 699% with the scans parallelised but before the
+oversubscription fix. **The post-fix number has not been measured yet** — check it on the next run
+before assuming the fix worked.
+
+## 9. Guard against `assert()` in tests generally — NEW
+
+`de38a1b` fixed `odia_nn_test`, where `assert(e.fit(...))` under `-DNDEBUG` deleted the call being
+tested. The other test files in `src/` use `assert` the same way and were not audited. Any of them
+that puts a side-effecting call inside `assert` is inert in the Release build that runs on the
+cluster.
+
+**Fix:** grep for `assert(` containing `(` calls with side effects across `src/*_test.cpp`, and
+either move the call out or switch the file to an always-compiled CHECK.
+
+## 10. Batch-size tuning came from a synthetic — NEW
+
+`batch_size = 256` was chosen from a measured curve on a 7k/600k Gaussian synthetic that is
+LINEARLY SEPARABLE. It establishes the direction (updates matter, ~3x cheaper via smaller batches
+than via more epochs) but not the magnitude for real sub-scores. Re-tune on the benchmark fixture
+once the ablation has a working baseline.
 
 ## 8. Carried over, unrelated to tonight
 
