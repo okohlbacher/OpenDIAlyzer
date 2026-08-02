@@ -146,10 +146,37 @@ struct NNParams
   /// is the part worth copying. At 4096 a 2.4M-row fold takes ~590 steps per epoch for the same
   /// forward/backward work as a single full-batch step.
   ///
-  /// Batches are contiguous slices of the SORTED row list taken in index order, so there is no
-  /// shuffling to make order-independent -- the determinism argument that motivated full-batch is
-  /// preserved without paying for it in updates. 0 means full batch.
-  int batch_size = 4096;
+  /// Batches are STRATIFIED: batch b takes positives [n_pos*b/B, n_pos*(b+1)/B) and negatives
+  /// [n_neg*b/B, n_neg*(b+1)/B), so every batch carries the whole set's class ratio. Both slices
+  /// are contiguous ranges of a sorted list taken in index order, so there is still no shuffle to
+  /// make order-independent -- the determinism argument that motivated full-batch is preserved.
+  ///
+  /// NOT contiguous slices of a positives-then-negatives list, which was the first attempt. At the
+  /// benchmark's imbalance (~7k positives against ~2.4M negatives) that puts every positive in the
+  /// first two batches and leaves ~580 consecutive PURE-NEGATIVE steps. It does not collapse the
+  /// model -- w_neg scales those gradients down ~85x -- but it wastes them: measured on a
+  /// 7k/600k synthetic, contiguous batching separated 0.906 of positives against 0.410 of
+  /// negatives at threshold 0, with positive scores compressed into [-0.31, 0.35]. Effectively two
+  /// informative steps out of 148.
+  ///
+  /// 256 is chosen from a measured curve, not a convention. On a 7k/600k synthetic at the
+  /// benchmark's imbalance, holding everything else fixed:
+  ///
+  ///     batch  epochs  updates   AUC     top-1% recall   wall
+  ///      4096       1      148   0.8544      0.148        20.4 s
+  ///       512       1     1186   0.8952      0.247        23.8 s
+  ///       256       1     2371   0.8977      0.261        23.7 s
+  ///       128       1     4742   0.8985      0.268        23.8 s
+  ///        64       1     9485   0.8975      0.269        23.9 s
+  ///      1024       4     2371   0.8978      0.262        62.3 s
+  ///
+  /// Two things fall out. UPDATES are what buy accuracy -- 4096/1 and 256/1 do identical
+  /// forward/backward work and differ by 0.043 AUC and 76% in top-1% recall. And buying updates
+  /// with a smaller batch is ~3x cheaper than buying them with more epochs, because one epoch is
+  /// one pass over the data whichever way you slice it (1024/4 and 256/1 take the same 2371 steps;
+  /// the former costs 62 s, the latter 24 s). The curve is flat below 256, so 256 it is -- it also
+  /// leaves more work per parallel region than 128 or 64 do.
+  int batch_size = 256;
   double lr = 0.05;
   double l2 = 1e-5;
   std::uint64_t seed = 42;
@@ -372,15 +399,27 @@ private:
     const std::size_t batch = (p.batch_size > 0)
                                 ? std::min<std::size_t>(static_cast<std::size_t>(p.batch_size), n_rows)
                                 : n_rows;
+    const std::size_t n_batches = (n_rows + batch - 1) / batch;
     std::vector<double> part;
     std::vector<double> gsum(np, 0.0);
+    std::vector<std::size_t> brows;      // this batch's rows: its positive slice then its negative one
+    brows.reserve(batch + 2);
 
     for (int ep = 0; ep < p.epochs; ++ep)
     {
-     for (std::size_t b0 = 0; b0 < n_rows; b0 += batch)
+     for (std::size_t b = 0; b < n_batches; ++b)
      {
-      const std::size_t b1 = std::min(n_rows, b0 + batch);
-      const std::size_t bn = b1 - b0;
+      // Stratified slice. Integer arithmetic on b/n_batches, so the union over b is exactly the
+      // whole set with no row used twice and none dropped.
+      const std::size_t p0 = n_pos * b / n_batches, p1 = n_pos * (b + 1) / n_batches;
+      const std::size_t g0 = (n_rows - n_pos) * b / n_batches;
+      const std::size_t g1 = (n_rows - n_pos) * (b + 1) / n_batches;
+      brows.clear();
+      for (std::size_t k = p0; k < p1; ++k) { brows.push_back(rows[k]); }
+      for (std::size_t k = g0; k < g1; ++k) { brows.push_back(rows[n_pos + k]); }
+      const std::size_t bn = brows.size();
+      if (bn == 0) { continue; }
+      const std::size_t n_batch_pos = p1 - p0;
       const std::size_t n_chunks_b = std::min(n_chunks, bn);
       part.assign(n_chunks_b * np, 0.0);
 
@@ -389,15 +428,15 @@ private:
 #endif
       for (long long c = 0; c < static_cast<long long>(n_chunks_b); ++c)
       {
-        const std::size_t lo = b0 + bn * static_cast<std::size_t>(c) / n_chunks_b;
-        const std::size_t hi = b0 + bn * static_cast<std::size_t>(c + 1) / n_chunks_b;
+        const std::size_t lo = bn * static_cast<std::size_t>(c) / n_chunks_b;
+        const std::size_t hi = bn * static_cast<std::size_t>(c + 1) / n_chunks_b;
         double* g = part.data() + static_cast<std::size_t>(c) * np;
         std::vector<std::vector<double>> act, delta;
         for (std::size_t k = lo; k < hi; ++k)
         {
-          const std::size_t r = rows[k];
-          const double label = (k < n_pos) ? 1.0 : 0.0;
-          const double weight = (k < n_pos) ? 1.0 : w_neg;
+          const std::size_t r = brows[k];
+          const double label = (k < n_batch_pos) ? 1.0 : 0.0;
+          const double weight = (k < n_batch_pos) ? 1.0 : w_neg;
           const double logit = net.forward(X[r].data(), act);
           const double pr = 1.0 / (1.0 + std::exp(-logit));
           delta.assign(dims.size(), {});
