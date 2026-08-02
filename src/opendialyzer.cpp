@@ -192,6 +192,14 @@ protected:
                                    "lookup per meta value -- ~150M allocations against a fragmented "
                                    "180 GB heap, measured at >=41 s. Off by default: it is a diagnostic, "
                                    "not part of the search.");
+    registerStringOption_("compact_library", "true|false", "true",
+                          "Load the library through CompactLibrary and materialise a targeted "
+                          "experiment with SYNTHETIC ids. Measured: the library holds 32.65 GB RSS "
+                          "of which only 7.26 GB is live -- the rest is fragmentation driven by "
+                          "~471M per-row std::string allocations for ids longer than the 15-char "
+                          "SSO buffer. Synthetic base-36 ids stay inside SSO and allocate nothing. "
+                          "Real ids are restored before the library is written out.", false, true);
+    setValidStrings_("compact_library", {"true", "false"});
     registerStringOption_("compact_probe", "<lib.oswpq>", "", "PROBE: load this library into the "
                           "compact representation (src/odia_library.h) and report what it costs, "
                           "then exit. For comparing against the LightTargetedExperiment path on the "
@@ -694,6 +702,60 @@ protected:
     }
   };
 
+  /// The compact library, kept alive so the REAL compound ids can be restored before output.
+  /// Synthetic ids are what make the load cheap; they must not escape into the written bundle.
+  mutable odia::CompactLibrary compact_lib_;
+  mutable bool compact_lib_used_ = false;
+
+  /// Load an .oswpq library through CompactLibrary and materialise a targeted experiment whose
+  /// compound ids are synthetic (base-36, <=14 chars, inside the SSO buffer).
+  ///
+  /// Measured motivation: after the ordinary load, mallinfo2 reports in_use 7.26 GB against an RSS
+  /// of 32.68 GB. The live library is a fifth of what the process holds; the rest is arena
+  /// fragmentation from ~471M per-row std::string allocations, because real transition and peptide
+  /// ids exceed libstdc++'s 15-character SSO buffer and each one hits the heap.
+  ///
+  /// Returns false on any shortfall so the caller falls back to the ordinary reader -- a library
+  /// that cannot be loaded compactly must still load.
+  bool loadCompactOswpq_(const std::string& tr, OpenSwath::LightTargetedExperiment& exp) const
+  {
+    try
+    {
+      compact_lib_ = odia::CompactLibrary();
+      if (!loadCompactFromParquet_(tr, /*fasta*/ std::string(), compact_lib_)) { return false; }
+      materializeFromCompact_(compact_lib_, exp);
+      compact_lib_used_ = true;
+      OPENMS_LOG_INFO << "OpenDIAlyzer[compact] library loaded compactly: "
+                      << compact_lib_.peptideCount() << " peptides, "
+                      << compact_lib_.transitionCount() << " transitions; ids are synthetic and "
+                      << "restored before output." << std::endl;
+      return true;
+    }
+    catch (const std::exception& e)
+    {
+      OPENMS_LOG_WARN << "OpenDIAlyzer[compact] compact load failed (" << e.what()
+                      << "); falling back to the ordinary reader." << std::endl;
+      compact_lib_used_ = false;
+      return false;
+    }
+  }
+
+  /// Put the library's real ids back on the compounds. Called once, immediately before the bundle
+  /// is written: everything upstream (prefilter decoy pairing, precursor_index_) is consistent with
+  /// the synthetic ids, and only the OUTPUT needs the originals so downstream tools can join.
+  void restoreRealIds_(OpenSwath::LightTargetedExperiment& exp) const
+  {
+    if (!compact_lib_used_) { return; }
+    std::size_t restored = 0;
+    for (std::size_t i = 0; i < exp.compounds.size() && i < compact_lib_.peptideCount(); ++i)
+    {
+      const auto id = compact_lib_.originalId(odia::CompactLibrary::Peptide(std::uint32_t(i)));
+      if (!id.empty()) { exp.compounds[i].id = std::string(id); ++restored; }
+    }
+    OPENMS_LOG_INFO << "OpenDIAlyzer[compact] restored " << restored << " real compound ids for output."
+                    << std::endl;
+  }
+
   OpenSwath::LightTargetedExperiment loadLibrary_(const std::string& tr)
   {
     OpenSwath::LightTargetedExperiment exp;
@@ -758,6 +820,10 @@ protected:
     }
     else if (t == FileTypes::OSWPQ)
     {
+      if (getStringOption_("compact_library") != "false" && loadCompactOswpq_(tr, exp))
+      {
+        return exp;
+      }
       TransitionParquetFile().convertParquetToTargetedExperiment(tr, exp);
     }
     else
@@ -3626,9 +3692,14 @@ protected:
   /// FASTA. With one supplied, a peptide costs (protein, offset, length) and no characters;
   /// without, sequences are interned -- still no per-string malloc and no duplication, but every
   /// distinct peptide keeps its own characters. Reporting both is the point.
-  ExitCodes compactProbe_(const std::string& lib, const std::string& fasta)
+  /// Load an .oswpq library into a CompactLibrary. `fasta`, when given, is indexed first so peptide
+  /// sequences can be stored as spans into the proteome instead of as characters of their own;
+  /// without it every sequence is interned, which still removes the per-row id allocations.
+  ///
+  /// Shared by -compact_probe (which reports the cost) and the production load path.
+  bool loadCompactFromParquet_(const std::string& lib, const std::string& fasta,
+                               odia::CompactLibrary& clib) const
   {
-    odia::CompactLibrary clib;
     std::unordered_map<std::string, odia::CompactLibrary::Protein> prot_by_acc;
 
     if (!fasta.empty())
@@ -3828,6 +3899,19 @@ protected:
                       << std::endl;
     }
     clib.finalize();
+    return clib.peptideCount() > 0;
+  }
+
+  /// PROBE: load and report what the compact representation costs. Not the production path --
+  /// that is loadCompactOswpq_, which uses the same loader and then materialises.
+  ExitCodes compactProbe_(const std::string& lib, const std::string& fasta)
+  {
+    odia::CompactLibrary clib;
+    if (!loadCompactFromParquet_(lib, fasta, clib))
+    {
+      OPENMS_LOG_ERROR << "OpenDIAlyzer[compact] probe: library loaded no peptides." << std::endl;
+      return INCOMPATIBLE_INPUT_DATA;
+    }
 
     const auto st = clib.stats();
     const double gb = 1073741824.0;
@@ -4315,6 +4399,7 @@ protected:
       // finalScore_, inside the 183 s that no phase accounted for -- of which retain_features
       // explained only 15.4 s.
       { PhaseTimer pt_pw("write_parquet_bundle");
+        restoreRealIds_(transition_exp);
         pw.write(out, transition_exp, pass_features_, run_id_, in, /*uis*/ false); }
       OPENMS_LOG_INFO << "OpenDIAlyzer: wrote parquet bundle " << out << " ("
                       << pass_features_.size() << " features)." << std::endl;
