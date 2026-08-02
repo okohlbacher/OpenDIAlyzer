@@ -431,11 +431,15 @@ protected:
                           "surviving anchors and understates the tail for unseen precursors; set this "
                           "to ~2x the library's predicted-RT residual p95. 0 = no floor.", false, true);
     registerIntOption_("max_concurrent_swaths", "<n>", -1, "Cap SWATH windows extracted concurrently (-1 = auto).", false);
-    registerDoubleOption_("rt_extraction_window_recal", "<s>", 600.0,
-                          "Pass-2 (narrow) RT window in seconds, after recalibration. Measured on the "
-                          "Astral benchmark: 240/400/600/900 s gave 6552/6695/6930/6835 IDs, so 600 is "
-                          "the optimum and 240 was clipping -- at 240 the residual p99 (113-115 s) sat "
-                          "pressed against the +/-120 s boundary, and widening decompressed it to 163 s.",
+    registerDoubleOption_("rt_extraction_window_recal", "<s>", 864.0,
+                          "Pass-2 (narrow) RT window in seconds, after recalibration. Measured on "
+                          "the Astral benchmark along a x1.2 ladder: 240/400/600/720/864/900 s gave "
+                          "6552/6695/6930/6941/6980/6835 IDs. 864 is the optimum; the earlier "
+                          "conclusion that 600 was optimal came from stopping at the FIRST "
+                          "non-improvement (900), where the correct rule is three consecutive "
+                          "failures -- and 900 is not even on a x1.2 ladder from 600 (720, 864, "
+                          "1037 are). At 240 the residual p99 sat pressed against the +/-120 s "
+                          "boundary; widening decompressed it to 163 s.",
                           false);
     // FDR-safe by symmetry (every precursor, both classes, uses its OWN pass-1 apex), but
     // default OFF until confirmed with decoy/entrapment diagnostics on real data. This is the
