@@ -276,3 +276,94 @@ wide-tolerance anchor sample B1 needs.
 | 6 | Replace CiRT with batched bootstrap over the real library | -425 s, and supplies wide anchors |
 | 7 | Empirical library export + re-search | retires the provenance question and the prefilter's dependence on predicted intensities |
 | 8 | Relax the prefilter (running: `pf_frag3`, `pf_peaks3k`) | 923 precursors, hard ceiling |
+
+---
+
+## 6. Literature findings (deep-research pass, 3-vote adversarial verification)
+
+### 6.1 The biggest caveat: the gap's DIRECTION is not established in the literature
+
+**No quantitative DIA-NN-vs-OpenSWATH precursor-yield number survived verification.** One rejected
+candidate pointed the *other* way -- Gotti et al. (J Proteome Res 2021) had OpenSWATH quantifying
+~13% MORE E. coli proteins than library-mode DIA-NN.
+
+So "DIA-NN finds more on a fixed external library" is **our** measurement on **our** data, not a
+published regularity. The 7,787-ID reference is one run of one tool; treating it as a target to
+close is a local decision, not a documented deficit.
+
+### 6.2 Comparing ID counts at fixed nominal FDR is not a sensitivity comparison
+
+Wen et al. (Nat Methods 22(7), 2025), stated as their motivation: *"if we compare the number of
+proteins detected by a collection of analysis tools, all using a fixed FDR threshold, then the
+liberally biased tool will have a clear (and unfair) advantage."*
+
+**Scope limit that matters for us:** their Table 2 shows DIA-NN's PROTEIN-level control invalid on
+most datasets (FDP ~1.0-3.5% vs 1% nominal) but **PRECURSOR-level control mostly INCONCLUSIVE**
+(FDP 0.7-1.3% vs 1% nominal), demonstrably invalid only on single-cell data. So this does **not**
+show DIA-NN's precursor counts are inflated on bulk data like ours. It shows the comparison is
+unverified in both directions -- which is exactly what H7 said, now with a citation.
+
+This raises entrapment (H6) from "nice to have" to the only thing that settles direction.
+
+### 6.3 CORRECTION to H3: DIA-NN's interference correction does not affect identifications
+
+DIA-NN's well-known interference-correction step is a **post-FDR quantification** module. It does
+not change ID counts. The ID-relevant mechanism is a separate interfering-precursor removal step.
+
+H3 as written in §2 is mis-specified and its priority drops accordingly.
+
+### 6.4 SUPPORTS H2b, with a number: 73 sub-scores against ~23
+
+DIA-NN trains an ensemble of feed-forward neural networks (5 tanh hidden layers, 12 networks by
+default) on **73** LC and MS sub-scores per run. OpenSWATH/PyProphet uses roughly **23** sub-scores
+with a semi-supervised LDA by default.
+
+ODIA is on the OpenSWATH side of that: ~23 `VAR_` columns into GBT. Its own log line reads
+"in-memory scoring found 23 VAR_ sub-scores".
+
+Bounding, from the verification: this is defaults-vs-defaults, PyProphet also supports XGBoost/SVM,
+DIA-NN also implements a linear classifier, and **no source quantifies how much of any yield gap
+this explains**. It is descriptive, not causal. But it makes H2b concrete: the gap in evidence
+available to the classifier is 3x, and that is measurable on our side.
+
+### 6.5 NEW: the two-pass empirical-library re-search is DIA-NN's RECOMMENDED DEFAULT
+
+With predicted libraries, DIA-NN's documented recommendation is a two-pass MBR re-search against an
+empirical library built from the data itself, which its documentation says "may result in much
+improved identification numbers".
+
+This is an entire second search stage that a single-pass pipeline does not have. It was item 7 on
+our list as a provenance workaround; it is in fact the *standard* configuration for the kind of
+library we are using, and it simultaneously retires the prefilter's dependence on predicted
+intensities (H1/H4 coupling).
+
+**Promote to the top of the ID list.**
+
+### 6.6 NEW: DIA-NN's m/z window is per-precursor, not a global tolerance
+
+Mass accuracy, scan window and RT window are auto-inferred; calibration runs as a separate
+wide-tolerance stage (default 100 ppm, auto-tightened); and the matching m/z window is chosen **per
+precursor from the local raw data** rather than as one global ppm setting.
+
+We use a single `-mz_extraction_window 10`. This is the m/z analogue of the RT finding in §1.4 --
+one scalar where the data wants a distribution -- and the same "acceptance downstream of extraction"
+trick may apply.
+
+### 6.7 Decoy method is a yield lever, and ours is the favourable one
+
+DIA-NN's documentation states mass-preserving **shuffled** decoys maximise identification numbers,
+while mass-changing mutated decoys reduce them. ODIA uses shuffled (OpenSWATH convention). H6's
+decoy-quality concern is therefore about null calibration, not about yield being left on the table.
+
+### 6.8 Revised ranking after the literature pass
+
+| # | action | change |
+|---|---|---|
+| 1 | **Empirical library export + re-search (two-pass MBR)** | **promoted** -- DIA-NN's recommended default for predicted libraries, not a workaround |
+| 2 | Entrapment library | **promoted** -- the only way to establish direction, per 6.1/6.2 |
+| 3 | Finish the x1.2 window ladder | unchanged |
+| 4 | Delete the three calibration gates | unchanged |
+| 5 | `pRT` + sqrt `pdRT` features; then close the 23-vs-73 sub-score gap | sharpened by 6.4 |
+| 6 | Per-precursor m/z acceptance | **new**, from 6.6 |
+| 7 | CompactLibrary / batching / prefilter relaxation | unchanged (memory track) |
+| ~~8~~ | ~~Interference correction~~ | **dropped** -- 6.3 shows it is a quantification step |
