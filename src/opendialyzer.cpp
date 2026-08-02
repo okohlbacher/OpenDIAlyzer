@@ -192,6 +192,16 @@ protected:
                                    "lookup per meta value -- ~150M allocations against a fragmented "
                                    "180 GB heap, measured at >=41 s. Off by default: it is a diagnostic, "
                                    "not part of the search.");
+    registerStringOption_("rt_features", "true|false", "false",
+                          "Add two RT-derived scoring features: normalised position in the gradient "
+                          "and a sqrt-compressed RT deviation. DIA-NN feeds both to its network "
+                          "(diann.cpp:7742-7776) and learns an RT-dependent tolerance instead of a "
+                          "hard threshold, which is what our 14x octile spread in calibration "
+                          "quality calls for. OFF by default: gradient position is label-INDEPENDENT "
+                          "only if decoy predicted RTs mirror target ones, and DIA-NN withholds the "
+                          "position feature from its LINEAR classifier, so this needs measuring "
+                          "before it is trusted.", false, true);
+    setValidStrings_("rt_features", {"true", "false"});
     registerStringOption_("compact_library", "true|false", "true",
                           "Load the library through CompactLibrary and materialise a targeted "
                           "experiment with SYNTHETIC ids. Measured: the library holds 32.65 GB RSS "
@@ -1569,6 +1579,33 @@ protected:
       R.library_rt.push_back(it->second.library_rt);
       R.traml_id.push_back(gid);
       R.feats.push_back(std::move(x));
+    }
+    // Two RT-derived features, appended after the loop because both need the run's RT span.
+    //
+    //   position : where in the gradient the peak sits. NEW information -- nothing in the OpenSWATH
+    //              sub-score set encodes it, and it is what lets a classifier learn that a 90 s
+    //              deviation is unremarkable late in the gradient and damning early (measured:
+    //              median |delta_rt| runs 6.8 s in the first octile to 95.9 s in the last).
+    //   deviation: sqrt-compressed, as DIA-NN does. A raw |delta| in seconds is a poor feature for
+    //              a linear model; the compression is not cosmetic.
+    if (!for_anchors && getStringOption_("rt_features") == "true" && !R.exp_rt.empty())
+    {
+      double lo = std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::lowest();
+      for (const double t : R.exp_rt) { if (std::isfinite(t)) { lo = std::min(lo, t); hi = std::max(hi, t); } }
+      const double span = (hi > lo) ? (hi - lo) : 1.0;
+      for (std::size_t i = 0; i < R.feats.size(); ++i)
+      {
+        const double pos = std::isfinite(R.exp_rt[i]) ? (R.exp_rt[i] - lo) / span : 0.5;
+        // delta against the library prediction mapped through the same span; library_rt is in
+        // library units, so normalise both before differencing rather than subtracting seconds
+        // from iRT.
+        const double dev = std::isfinite(R.library_rt[i])
+                         ? std::sqrt(std::min(1.0, std::fabs(pos - R.library_rt[i]))) : 0.0;
+        R.feats[i].push_back(pos);
+        R.feats[i].push_back(dev);
+      }
+      OPENMS_LOG_INFO << "OpenDIAlyzer[scoreload] added RT position + sqrt-deviation features "
+                         "(span " << span << " s)." << std::endl;
     }
     const std::size_t before_mem = R.feats.empty() ? 0 : R.feats[0].size();
     dropUninformativeColumns_(R);
