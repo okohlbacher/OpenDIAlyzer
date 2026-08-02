@@ -13,10 +13,14 @@
 
 using namespace odia;
 
-// assert() is a NO-OP under NDEBUG, and this project's node build is -DCMAKE_BUILD_TYPE=Release.
-// `assert(e.fit(...))` therefore deletes the CALL TO FIT, leaving an untrained ensemble that scores
-// 0.5, and deletes the accuracy check that would have caught it -- printing OK either way. Every
-// check that matters below goes through CHECK(), which is always compiled and sets the exit code.
+// THIS FILE USES NO assert(). assert() is a no-op under NDEBUG, and this project's node build is
+// -DCMAKE_BUILD_TYPE=Release (scripts/openms/setup_node.sh), so `assert(e.fit(...))` deletes THE
+// CALL TO FIT: the ensemble is never trained, scores 0.5, and the accuracy check that would have
+// caught it is deleted too -- the file prints OK in exactly the build that runs on the cluster.
+//
+// CHECK() is always compiled, reports the failing line, and sets the exit code. Anything asserting
+// a property of this code belongs in a CHECK, not an assert -- including the calls whose RETURN
+// VALUE is being tested, because those are the ones an assert silently removes.
 static int g_failures = 0;
 #define CHECK(cond, ...)                                                            \
   do {                                                                              \
@@ -37,11 +41,11 @@ int main()
   FeatureBlocks wb; wb.ms2 = true; wb.ms1 = true;  wb.im = true;
   const auto lay_no = nnFeatureLayout(ms2, ms1, im, nb);
   const auto lay_yes = nnFeatureLayout(ms2, ms1, im, wb);
-  assert(lay_no.size() == 3);
-  assert(lay_yes.size() == 3 + 2 + im.size() * 2);          // each IM score + its presence flag
+  CHECK(lay_no.size() == 3);
+  CHECK(lay_yes.size() == 3 + 2 + im.size() * 2);          // each IM score + its presence flag
   std::size_t flags = 0;
   for (const auto& n : lay_yes) { flags += (n.size() > 9 && n.rfind("__present") == n.size() - 9); }
-  assert(flags == im.size());
+  CHECK(flags == im.size());
   std::printf("  layout: no-IM %zu features, with-IM %zu (%zu presence flags): OK\n",
               lay_no.size(), lay_yes.size(), flags);
 
@@ -49,8 +53,8 @@ int main()
   // Same coordinates -> same weight, regardless of the order they are requested in.
   const double w1 = nnInitWeight(3, 1, 7, 2, 42, 0.5);
   const double w0 = nnInitWeight(0, 0, 0, 0, 42, 0.5);
-  assert(nnInitWeight(3, 1, 7, 2, 42, 0.5) == w1);
-  assert(w0 != w1);
+  CHECK(nnInitWeight(3, 1, 7, 2, 42, 0.5) == w1);
+  CHECK(w0 != w1);
   std::printf("  counter-based init reproducible and coordinate-dependent: OK\n");
 
   // ---- 3. it must LEARN a signal a linear model cannot: an XOR-like interaction ----------------
@@ -73,7 +77,7 @@ int main()
   p.epochs = 400;                 // the real pipeline uses 1 per semi-supervised iteration; here we
   p.lr = 0.5;                     // train to convergence to prove the capacity exists at all
   NNEnsemble net;
-  assert(net.fit(X, pos, neg, p));
+  CHECK(net.fit(X, pos, neg, p));
   std::size_t right = 0;
   for (std::size_t i = 0; i < X.size(); ++i)
   {
@@ -82,23 +86,23 @@ int main()
   }
   const double acc = double(right) / X.size();
   std::printf("  XOR-interaction accuracy: %.3f (a linear discriminant scores ~0.5)\n", acc);
-  assert(acc > 0.85);
+  CHECK(acc > 0.85);
 
   // ---- 4. bit-reproducibility ------------------------------------------------------------------
   NNEnsemble net2;
-  assert(net2.fit(X, pos, neg, p));
+  CHECK(net2.fit(X, pos, neg, p));
   double worst = 0.0;
   for (std::size_t i = 0; i < X.size(); ++i)
   {
     worst = std::max(worst, std::fabs(net.score(X[i]) - net2.score(X[i])));
   }
   std::printf("  refit max |delta|: %.3e\n", worst);
-  assert(worst == 0.0);
+  CHECK(worst == 0.0);
 
   // ---- 5. an untrained ensemble must be inert, not random --------------------------------------
   NNEnsemble none;
-  assert(!none.trained());
-  assert(none.score(X[0]) == 0.0);
+  CHECK(!none.trained());
+  CHECK(none.score(X[0]) == 0.0);
   std::printf("  untrained ensemble scores 0: OK\n");
 
   // ---- thread-count invariance -----------------------------------------------------------------

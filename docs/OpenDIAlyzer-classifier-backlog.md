@@ -108,15 +108,18 @@ Still open underneath it: measured CPU went 435% -> 699% with the scans parallel
 oversubscription fix. **The post-fix number has not been measured yet** — check it on the next run
 before assuming the fix worked.
 
-## 9. Guard against `assert()` in tests generally — NEW
+## 9. `assert()` in tests — AUDITED, `odia_nn_test` fully converted
 
-`de38a1b` fixed `odia_nn_test`, where `assert(e.fit(...))` under `-DNDEBUG` deleted the call being
-tested. The other test files in `src/` use `assert` the same way and were not audited. Any of them
-that puts a side-effecting call inside `assert` is inert in the Release build that runs on the
-cluster.
+Swept every `src/*_test.cpp` for side-effecting calls inside `assert`. **`odia_nn_test.cpp` was the
+only file affected**, and it had two more beyond the one `de38a1b` fixed — the XOR-capacity and
+refit-determinism blocks, whose `fit()` calls also vanished under `-DNDEBUG`. The file now contains
+no `assert` at all; every check is an always-compiled `CHECK` that reports its line and sets the
+exit code. Proved by injecting a failing threshold and confirming a Release build exits 1.
 
-**Fix:** grep for `assert(` containing `(` calls with side effects across `src/*_test.cpp`, and
-either move the call out or switch the file to an always-compiled CHECK.
+No other test file puts a side-effecting call inside an assert. They do still lose their checks
+under `-DNDEBUG`, which is the ordinary cost of assert-based tests and not the same defect — but
+`ctest` runs the Release binaries, so **their assertions are not actually being evaluated on the
+cluster either**. Converting them is mechanical and worth doing.
 
 ## 10. Batch-size tuning came from a synthetic — NEW
 
