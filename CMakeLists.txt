@@ -65,6 +65,7 @@ add_executable(odia-gbt-test src/odia_gbt_test.cpp)
 # structure -- a peptide is a substring of its protein and needs no characters of its own.
 add_executable(odia-seqstore-test src/odia_seqstore_test.cpp)
 add_executable(odia-library-test src/odia_library_test.cpp)
+add_executable(odia-features-test src/odia_features_test.cpp)
 
 # The semi-supervised loop on a REAL score matrix (44,568 peak groups x 29 sub-scores extracted
 # from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
