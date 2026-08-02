@@ -485,6 +485,12 @@ inline ScoredGroups scoreSemiSupervisedLDA(
   // depend on this number (odia_gbt_test T8), so it is purely a speed knob.
   GBTParams gbt_params = params.gbt;
   NNParams nn_params = params.nn;
+  // Threads for the NESTED regions inside the fold loop. Computed once and applied to every one of
+  // them: the training loop already honoured it, but the per-group scans did not, so each of the 3
+  // concurrent folds opened teams of the FULL thread count -- 540 threads on 224 cores at
+  // OMP_NUM_THREADS=180. Oversubscription of that size costs more in scheduling than the
+  // parallelism returns.
+  int inner_threads = 1;
 #ifdef _OPENMP
   // BOTH inner-parallel learners need the active-level raised, not just the GBT. With it set for
   // the GBT alone, the network's chunk loop ran as a team of ONE inside the fold loop: measured
@@ -494,9 +500,9 @@ inline ScoredGroups scoreSemiSupervisedLDA(
   if (params.classifier == LDAParams::Classifier::GBT || params.classifier == LDAParams::Classifier::NN)
   {
     omp_set_max_active_levels(2);
-    const int inner = std::max(1, omp_get_max_threads() / std::max(1, folds));
-    gbt_params.n_threads = inner;
-    nn_params.n_threads = inner;
+    inner_threads = std::max(1, omp_get_max_threads() / std::max(1, folds));
+    gbt_params.n_threads = inner_threads;
+    nn_params.n_threads = inner_threads;
   }
 #endif
 
@@ -659,7 +665,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       out.assign(groups.size(), 0);
       out_score.assign(groups.size(), 0.0);
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (groups.size() > 512)
+#pragma omp parallel for schedule(static) num_threads(inner_threads) if (groups.size() > 512)
 #endif
       for (long long i = 0; i < static_cast<long long>(groups.size()); ++i)
       {
@@ -896,7 +902,7 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       if (group_fold[g] == fold) { score_groups.push_back(g); }
     }
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if (score_groups.size() > 1024)
+#pragma omp parallel for schedule(static) num_threads(inner_threads) if (score_groups.size() > 1024)
 #endif
     for (long long k = 0; k < static_cast<long long>(score_groups.size()); ++k)
     {
