@@ -197,3 +197,100 @@ claiming it matters.
 of their public interface. Converting them to index-based lookup is an OpenMS change and CLEAN-ROOM
 keeps OpenMS unvendored, so this is a report, not a patch. Same category as the per-Feature deep
 copy inside the `osw_write_out` critical section.
+
+---
+
+## 7. Source-level comparison: 30.7 KB vs 0.88 KB per precursor
+
+From a deep-research pass with source-level verification against `diann_1.8.cpp`.
+
+### 7.1 What DIA-NN retains per precursor
+
+```cpp
+class PrecursorEntry {                    // diann_1.8.cpp:2924
+  float scores[pN], decoy_scores[pN];     // :2934,  pN = 110 in the default build
+};
+```
+
+**880 B per precursor**, contiguous and inline: 440 B target + 440 B decoy. **Zero heap
+allocations. Zero string keys.**
+
+Its library storage is separately documented at just under 0.5 GB per 1M precursors (~500 B each) --
+so our 7.15M-precursor library would be ~3.6 GB in DIA-NN's representation against the 7.26 GB of
+live data we hold, and the 32.65 GB of RSS we actually occupy.
+
+### 7.2 What ODIA retains, from our own measured counts
+
+| | per precursor | bytes |
+|---|---:|---:|
+| `Feature` objects (4.89/precursor x 296 B) | 4.89 | 1,448 |
+| subordinates (14.58/feature x 296 B) | 71.3 | 21,111 |
+| meta values (55/feature x ~24 B) | 269 | 6,459 |
+| `MetaInfo` allocation headers | **76 allocations** | 2,439 |
+| **total** | | **30.7 KB** |
+
+**30.7 KB against 0.88 KB is a 35.7x difference in per-precursor scoring state**, and 76 separate
+heap allocations against zero.
+
+This is the single largest structural gap found anywhere in this analysis, and it is not a tuning
+difference -- it is a representation difference. A fixed-width inline float array cannot fragment
+the arena; a recursively-nested `Feature` carrying a string-keyed `flat_map` per subordinate is
+close to a worst case for it.
+
+### 7.3 It also explains the fragmentation, not just the size
+
+Instrumented measurement on our side: live data never exceeds ~33 GB while the glibc arena grows to
+186 GB and never shrinks -- **88% of final RSS is freed-but-unreturnable debris**. With 76
+allocations per precursor across 423,079 precursors, that is ~32M allocations in the feature map
+alone, on top of the ~471M at library load.
+
+Chromatograms, the intuitive suspect, measured at **0.58 GB** and are mmapped (returned to the OS on
+free). XIC encoding is not the lever and never was.
+
+### 7.4 Batching, now source-verified
+
+```
+MinBatch = 2000; MaxBatches = 10000;                        // :138-139
+std::mt19937_64 gen(1); std::shuffle(index...);             // :8999-9005
+entries[pos].batch = index[pos] % Batches;
+void process_precursors(int thread_id, bool free, bool free_fragments, ...)  // :9031
+```
+
+Fixed-seed shuffle, round-robin batch assignment, and explicit `free` / `free_fragments` flags that
+release per-precursor fragment state inside the loop. The batch loop advances until enough
+identifications accumulate.
+
+The synthesis states the consequence in the same terms this document reached independently:
+batching bounds memory **without** bounding recall, because every precursor is eventually searched.
+DIA-NN pays for memory with wall-clock; a prefilter-based design pays with identifications.
+
+### 7.5 Where the literature is silent
+
+- **No peer-reviewed peak-memory-versus-identification-rate benchmark for DIA engines survived
+  verification.** The tradeoff this document is built around is undocumented in the literature.
+- **No independent memory profiling of DIA-NN exists.** The 0.5 GB/1M figure is vendor
+  documentation with no methodology and no statement of whether decoys or fragments are counted.
+- **Allocator substitution:** the only evidence is one adjacent DBMS paper plus our own A/B
+  (189 -> 106 GB, -44%, identical IDs, +21% wall).
+
+### 7.6 Time-sensitivity
+
+The constants above are from **v1.8**. The current release is 2.6.1, and the README documents a
+library-RAM reduction landing in 1.9.2, so `pN`, `MinBatch` and the per-precursor figure may differ
+in 2.x. The *shape* of the design -- inline fixed-width arrays, batching, explicit frees -- is what
+transfers, not the numbers.
+
+### 7.7 What this does to the priority
+
+Item **D (feature representation)** moves from "unquantified" to the largest single lever, ahead of
+CompactLibrary and tcmalloc:
+
+| lever | effect | basis |
+|---|---|---|
+| **D. ODIA-owned scored-feature type** (fixed-width float array, no string keys) | targets 30.7 KB -> order 1 KB per precursor, and ~32M allocations -> 0 | source-verified counterpart |
+| A. library batching | bounds residency; recovers the 923 prefilter losses | source-verified |
+| B. CompactLibrary on the load path | -25 GB of library residency | measured, now default, A/B queued |
+| C. tcmalloc | -44% peak | measured |
+
+D and A are the two that DIA-NN actually relies on. B and C are ours and are worth having, but they
+are mitigations of a representation we would not choose again.
