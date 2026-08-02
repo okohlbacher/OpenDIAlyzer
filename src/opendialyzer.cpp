@@ -202,13 +202,18 @@ protected:
                           "position feature from its LINEAR classifier, so this needs measuring "
                           "before it is trusted.", false, true);
     setValidStrings_("rt_features", {"true", "false"});
-    registerStringOption_("compact_library", "true|false", "true",
+    registerStringOption_("compact_library", "true|false", "false",
                           "Load the library through CompactLibrary and materialise a targeted "
                           "experiment with SYNTHETIC ids. Measured: the library holds 32.65 GB RSS "
                           "of which only 7.26 GB is live -- the rest is fragmentation driven by "
                           "~471M per-row std::string allocations for ids longer than the 15-char "
                           "SSO buffer. Synthetic base-36 ids stay inside SSO and allocate nothing. "
-                          "Real ids are restored before the library is written out.", false, true);
+                          "Real ids are restored before the library is written out. DEFAULT OFF: "
+                          "enabling it made the prefilter support ZERO precursors ('prefilter "
+                          "supported no precursors', exit 6) on the Astral benchmark -- the library "
+                          "loads (7,149,966 peptides, 78,569,077 transitions) and then no target "
+                          "matches. Not diagnosed yet; do not enable without checking that.",
+                          false, true);
     setValidStrings_("compact_library", {"true", "false"});
     registerStringOption_("compact_probe", "<lib.oswpq>", "", "PROBE: load this library into the "
                           "compact representation (src/odia_library.h) and report what it costs, "
