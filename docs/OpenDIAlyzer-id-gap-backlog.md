@@ -190,3 +190,89 @@ and until it exists every number here is relative.
 | 5 | Interference structure in the 740 boundary cases | analysis only | tests H3 without new runs |
 | 6 | Entrapment library | library rebuild | the only ground truth; unblocks H6 and H7 |
 | 7 | RT-segmented windows | design + implementation | bounded; the scalar optimum is already taken |
+
+---
+
+## 5. Integration with the DIA-NN source answers (2026-08-02)
+
+`docs/OpenDIAlyzer-calibration-answers-diann.md` answers the handoff questions from DIA-NN 1.7.12's
+source with line references. It changes the plan substantially, and invalidates one conclusion I
+had already acted on.
+
+### 5.1 The design problem I was solving does not exist
+
+DIA-NN has **none of the three gates**. No peakedness test, no "wider than configured, reject", no
+yield threshold. Both killed adaptive-window designs were trying to build a better accept/reject
+rule for a quantity DIA-NN never accepts or rejects. What it does instead:
+
+1. extract calibration anchors at a **deliberately wide tolerance** -- 100 ppm m/z (`:217`, `:6671`)
+   against a 20 ppm operating width, and RT calibration with **no RT window at all** (`:6583`);
+2. make that affordable by **subsampling precursors** (random batches of 2000, fixed seed `:8999`),
+   stopping once 1000 IDs at q<=0.10 accumulate (`:10371-10392`) -- so the wide pass touches a few
+   thousand precursors, not 423,079;
+3. take the width as a residual quantile with **no acceptance test** (`:9890`);
+4. then **grow it against identification count** until IDs stop improving (`:10450-10464`).
+
+Steps 1-2 are exactly the escape route my v2 review identified as necessary (B1) and dismissed as
+unaffordable. The cost objection dissolves once the wide extraction is over ~2,000 precursors.
+
+### 5.2 The rule both my designs were missing
+
+DIA-NN **trims for the fit but never for the width**. The outlier-refinement pass re-truncates
+anchors and refits the bias model on survivors (`:9838-9841`), but the width quantile then runs over
+**every eligible anchor with no outlier condition** (`:9895-9901`, `:10022-10028`), including those
+excluded from the refit.
+
+v1 and v2 both estimated the width from the same truncated sample they fitted on. That single
+separation -- trim for shape, full sample for width -- is what makes the truncation problem go away,
+and neither adversarial review found it.
+
+### 5.3 A conclusion of mine that was premature
+
+I reported 600 s as the pass-2 optimum because 900 s came back lower (6930 -> 6835) and called it a
+turnover. DIA-NN's ladder is **x1.2 upward, stopping after THREE consecutive non-improvements**,
+capped at 10x. From 600 s the candidates are 720, 864, 1037 -- **900 s is not on the ladder, and one
+failure is not a stop.** `ladder720` / `ladder864` are queued. The shipped default of 600 s may be
+too low.
+
+### 5.4 How this maps onto the measured gap
+
+| gap bucket | n | what the DIA-NN answers imply |
+|---|---:|---|
+| prefilter deleted | 923 | DIA-NN has **no prefilter** -- it batches the full library and stops on ID count. Its top-6-by-predicted-intensity coupling to library provenance is ours alone. The empirical-library route (§6 of the answers) removes both at once. |
+| q 0.01-0.20 | 740 | add `pRT` (normalised gradient position) and **sqrt-compressed** `pdRT` as scoring features (`:7742-7776`); the NN trains on the full vector (`:9353`) and learns an RT-dependent tolerance instead of a hard threshold |
+| q >= 0.20 | 521 | same, plus classifier capacity |
+| never extracted | 197 | extract with a generous scalar window and apply the RT-resolved rule as **post-hoc acceptance** (`:8146`), not as an extraction bound |
+
+### 5.5 RT segmentation is solved without segmenting
+
+C1 was "how do we get per-precursor widths against a scalar API". DIA-NN enforces its window
+**twice**: as a scan-range prefilter (`:7201-7204`) and again as a post-hoc rejection of the winning
+peak (`:8146`). The second is entirely downstream of extraction.
+
+So: extract with a generous scalar window, apply an RT-segmented acceptance rule on candidate peaks
+afterwards. **Zero OpenMS changes, zero extra passes**, clean-room safe. The 14x octile spread
+becomes a spread in acceptance thresholds, and thresholds are applied after extraction.
+
+### 5.6 CiRT should not be on the default path
+
+DIA-NN's `RefCal = false` (`:181`); the reference-peptide path is opt-in and its thresholds are
+*looser*, not tighter -- it is a fallback for when bootstrap cannot start, not a better estimator.
+
+The 1.8% yield is explained: a 500-peptide CiRT set has poor coverage in plasma. A random subsample
+of our own library would yield tens of percent for the same compute. Replacing
+`setup/cirt_calibration` with a batched bootstrap saves ~425 s **and** supplies the uncensored
+wide-tolerance anchor sample B1 needs.
+
+### 5.7 Revised ranking
+
+| # | action | why now |
+|---|---|---|
+| 1 | Finish the x1.2 ladder (720, 864, 1037) | my 600 s default may be too low; queued |
+| 2 | Delete all three gates; too few anchors => **do not apply a window** | +122 IDs measured, free |
+| 3 | Separate trim-for-fit from full-sample-for-width | the rule both designs missed |
+| 4 | RT-segmented **acceptance** downstream of extraction | solves C1 with no OpenMS change |
+| 5 | Add `pRT` + sqrt-compressed `pdRT` scoring features | targets the 1,261 scoring-side misses |
+| 6 | Replace CiRT with batched bootstrap over the real library | -425 s, and supplies wide anchors |
+| 7 | Empirical library export + re-search | retires the provenance question and the prefilter's dependence on predicted intensities |
+| 8 | Relax the prefilter (running: `pf_frag3`, `pf_peaks3k`) | 923 precursors, hard ceiling |
