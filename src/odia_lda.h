@@ -643,6 +643,41 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       return true;
     };
 
+    // Best-scoring row of each training group, computed in parallel.
+    //
+    // All three per-group scans below (seed selection, ranking, negative selection) have this
+    // shape, and for the NN each score_row() is a forward pass through TWELVE nets -- which made
+    // them the serial tail that held the whole routine to 763% CPU on a 224-core node while
+    // training itself was parallel.
+    //
+    // Output is PRE-SIZED and written by position, so nothing is appended and no ordering question
+    // arises: out[i] is group train_groups[i]'s best row whatever order the iterations complete in.
+    // The tie-break is `>` -- the FIRST maximum in the group's own row order wins -- which is what
+    // the serial loops did, so the result is identical, not merely equivalent.
+    auto best_rows_of = [&](const std::vector<std::size_t>& groups,
+                            std::vector<std::size_t>& out, std::vector<double>& out_score) {
+      out.assign(groups.size(), 0);
+      out_score.assign(groups.size(), 0.0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if (groups.size() > 512)
+#endif
+      for (long long i = 0; i < static_cast<long long>(groups.size()); ++i)
+      {
+        const auto& rows_of_g = group_rows[groups[static_cast<std::size_t>(i)]];
+        std::size_t best_row = rows_of_g.front();
+        double best = score_row(best_row);
+        for (const std::size_t row : rows_of_g)
+        {
+          const double sc = score_row(row);
+          if (sc > best) { best = sc; best_row = row; }
+        }
+        out[static_cast<std::size_t>(i)] = best_row;
+        out_score[static_cast<std::size_t>(i)] = best;
+      }
+    };
+    std::vector<std::size_t> bg_row;
+    std::vector<double> bg_score;
+
     std::size_t best_feature = 0;
     double best_abs_t = -1.0;
     double best_difference = 1.0;
@@ -714,16 +749,10 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       std::vector<std::size_t> seed_pos, seed_neg;
       seed_pos.reserve(train_groups.size());
       seed_neg.reserve(train_groups.size());
-      for (const std::size_t g : train_groups)
+      best_rows_of(train_groups, bg_row, bg_score);
+      for (std::size_t i = 0; i < train_groups.size(); ++i)
       {
-        std::size_t best_row = group_rows[g].front();
-        double best = score_row(best_row);
-        for (const std::size_t row : group_rows[g])
-        {
-          const double score = score_row(row);
-          if (score > best) { best = score; best_row = row; }
-        }
-        (group_label[g] == 1 ? seed_pos : seed_neg).push_back(best_row);
+        (group_label[train_groups[i]] == 1 ? seed_pos : seed_neg).push_back(bg_row[i]);
       }
       // The seed must use the SAME learner as the loop. Seeding a GBT run with an LDA fit
       // reintroduces exactly the cold start this block exists to prevent, one level up: on data
@@ -750,20 +779,11 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       // estimate group-level q-values for confident positive selection.
       std::vector<lda_detail::RankedGroup> ranked;
       ranked.reserve(train_groups.size());
-      for (const std::size_t g : train_groups)
+      best_rows_of(train_groups, bg_row, bg_score);
+      for (std::size_t i = 0; i < train_groups.size(); ++i)
       {
-        std::size_t best_row = group_rows[g].front();
-        double best_score = score_row(best_row);
-        for (const std::size_t row : group_rows[g])
-        {
-          const double score = score_row(row);
-          if (score > best_score)
-          {
-            best_score = score;
-            best_row = row;
-          }
-        }
-        ranked.push_back({g, best_row, group_label[g], best_score, 1.0});
+        const std::size_t g = train_groups[i];
+        ranked.push_back({g, bg_row[i], group_label[g], bg_score[i], 1.0});
       }
       lda_detail::assignQValues(ranked, params.use_pi0);
 
@@ -803,22 +823,24 @@ inline ScoredGroups scoreSemiSupervisedLDA(
       // (top peak per precursor) removes the confound; this is what pyprophet does
       // (semi_supervised.py: td_peaks = train.get_top_decoy_peaks()).
       std::vector<std::size_t> negative_rows;
-      for (const std::size_t g : train_groups)
+      if (!params.top_decoys_only)
       {
-        if (group_label[g] == 1) { continue; }
-        if (!params.top_decoys_only)
+        for (const std::size_t g : train_groups)
         {
+          if (group_label[g] == 1) { continue; }
           negative_rows.insert(negative_rows.end(), group_rows[g].begin(), group_rows[g].end());
-          continue;
         }
-        std::size_t best_row = group_rows[g].front();
-        double best_score = score_row(best_row);
-        for (const std::size_t row : group_rows[g])
+      }
+      else
+      {
+        // The ranking scan above already computed every training group's best row with THIS SAME
+        // model -- nothing refits in between -- so re-scanning the decoys was pure duplicated work
+        // on the most expensive operation in the loop. Reuse it.
+        for (std::size_t i = 0; i < train_groups.size(); ++i)
         {
-          const double score = score_row(row);
-          if (score > best_score) { best_score = score; best_row = row; }
+          if (group_label[train_groups[i]] == 1) { continue; }
+          negative_rows.push_back(bg_row[i]);
         }
-        negative_rows.push_back(best_row);
       }
       if (negative_rows.size() < 2) { continue; }
 
