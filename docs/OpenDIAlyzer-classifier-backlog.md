@@ -256,6 +256,48 @@ that reproduce each tool's own reported counts):
 ODIA is not a subset: it finds 859 peptides DIA-NN does not. Re-do the prefilter/loss attribution
 against `diann_ids_correct.txt`; the earlier attribution used the wrong target.
 
+## 15. PASS-2 RE-EXTRACTION: measured, and NOT worth eliminating — CLOSED
+
+The proposal (user's): pass 2 re-extracts the whole library after recalibration, but the underlying
+signal is unchanged — only the RT prediction moved — so slice the pass-1 chromatograms instead of
+re-reading the run.
+
+**The premise is correct.** Adversarial review verified that a slice is *bit-identical* to a
+re-extraction in the vendored extractor. The idea is sound.
+
+**The payoff is not.** Measurement 0 — the extraction/scoring split of pass 2 — from three existing
+runs, no new measurement required:
+
+| run | rt_win | pass-2 wall |
+|---|---:|---:|
+| ms1_on | 600 s | 300.8 s |
+| rtfeat_on | 600 s | 303.7 s |
+| bestknown | 864 s | 337.4 s |
+
+A 44% wider window costs 11.6% more time. Fitting `t = a + b·W` gives b ≈ 0.133 s per second of
+window and a ≈ 222 s, so at 864 s: **extraction ≈ 115 s (34%), scoring ≈ 222 s (66%)**. Removing
+re-extraction entirely saves ~115 s of 1,847 s = **6.2% of wall**, against a plan that claimed 337 s
+/ 18%. Overstated 3x, because the plan attributed the whole phase to extraction.
+
+Caveat, stated because the fit is thin: two window widths, so `b` is poorly determined. The two
+600 s runs agree to 1% (300.8 / 303.7) which is reassuring, and the direction is not in doubt even
+if the coefficient is.
+
+**Also refuted along the way** (all from the review, all confirmed):
+* Option B (rescore without narrowing) — dead. The ID ladder 240/400/600/720/864/900 →
+  6552/6695/6930/6941/6980/6835 is NOT confounded, so the narrower window does real work beyond
+  centring.
+* Option D (reorder the mass calibration before pass 1) — dead, and it rested on **my error**: I
+  claimed a pre-pass mass calibration on CiRT anchors already exists. It does not;
+  `calibrateMassFromPass_` is called only between passes. A CiRT-anchored version would have tens of
+  anchors where the estimator is already rejected as unsupported at 2,000.
+* Option A (retain + slice) — incomplete alone: MS1's window genuinely narrows between passes, so
+  MS1 must be re-extracted regardless.
+
+**Decision: not building it.** 6.2% is not worth a retained chromatogram store (which does not
+exist), a containment fallback, and an MS1 exception — in a project whose worst metric is memory.
+Revisit only if scoring gets much cheaper, which would change the ratio.
+
 ## 8. Carried over, unrelated to tonight
 
 * Report upstream: needless deep copy of every `Feature` inside `omp critical (osw_write_out)`.
