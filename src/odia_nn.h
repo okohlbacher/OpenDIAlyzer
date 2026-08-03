@@ -127,34 +127,33 @@ inline std::vector<std::string> imFeatureNames()
 
 struct NNParams
 {
-  /// TWO hidden layers, not DIA-NN's five.
+  /// DIA-NN's five tanh layers, kept. An earlier commit changed this to {64,32} and claimed the
+  /// depth was why the network scored zero identifications. THAT WAS WRONG, and the error is worth
+  /// recording because it was a textbook confound: five layers were measured at lr 0.05 / 1 epoch
+  /// against two layers at lr 0.2 / 5 epochs, and the architecture got the credit for a TRAINING
+  /// BUDGET difference. A defective initialiser (see nnInitWeight) made it worse by penalising
+  /// narrow layers specifically.
   ///
-  /// Copying the depth was a mistake, and it is the reason the network returned 0 identifications
-  /// on the benchmark. Five tanh layers do not train in the handful of epochs this loop allows:
-  /// the gradient reaching the first layer is the product of five tanh derivatives, all <= 1, so
-  /// the net barely leaves its initialisation and the ensemble averages twelve barely-moved nets.
-  /// The symptom is visible in the logit range -- [-0.15, 0.12] at five layers against
-  /// [-0.49, 1.12] at two.
+  /// With the initialiser fixed and the budget held equal, on held-out groups of a real 1.1M-row
+  /// fixture, by targets clearing the 99th percentile of decoys:
   ///
-  /// Measured on held-out groups of a real 1.1M-row fixture, by targets clearing the 99th
-  /// percentile of decoys (the regime a 1% FDR lives in; overall AUC hides it):
+  ///                       lr 0.05      lr 0.2      lr 0.5
+  ///     5-layer, e1                     1.86%
+  ///     5-layer, e5         1.79%       2.00%       1.98%
+  ///     2-layer, e1                     1.96%
+  ///     2-layer, e5                     2.00%
+  ///     GBT (reference)     1.99%
   ///
-  ///     h=32,16,16,8,8  e1   1.38%      <- the shape copied from DIA-NN
-  ///     h=16            e1   1.59%
-  ///     h=32,16         e1   1.83%
-  ///     h=64,32         e5   1.98%
-  ///     h=64,32  lr0.2  e5   2.09%      <- here
-  ///     GBT (reference)      1.99%
-  ///
-  /// DIA-NN presumably makes five layers work with far more updates than this loop grants; with
-  /// this budget, depth costs rather than pays. TUNED ON ONE SUBSAMPLE of one dataset -- it beats
-  /// the GBT on that subsample's held-out groups by 5%, which is a starting point and not a
-  /// validated default.
-  std::vector<int> hidden = {64, 32};
+  /// Depth: no effect at the optimum -- both shapes reach 2.00%. Learning rate is the largest
+  /// lever (+119 groups from 0.05 to 0.2), epochs second (+81 at five layers). So the five-layer
+  /// shape stays: same result for 1,817 parameters instead of 3,713.
+  std::vector<int> hidden = {32, 16, 16, 8, 8};
   int n_nets = 12;            ///< ensemble size, as DIA-NN
-  int epochs = 5;             ///< passes over the data per semi-supervised iteration. 5x the cost
-                              ///< of 1 for +0.11 percentage points of top-1% recall (1.98 -> 2.09);
-                              ///< see hidden{} for the curve this came from.
+  int epochs = 5;             ///< passes per semi-supervised iteration. At lr 0.2 and five layers,
+                              ///< 1 -> 5 epochs is 1.86% -> 2.00% top-1% recall for 5x the training
+                              ///< cost. A previous comment credited this range to epochs when the
+                              ///< two rows compared actually differed in LEARNING RATE -- the
+                              ///< control was missing and adversarial review caught it.
   /// Rows per gradient STEP. This is the parameter that actually trains the model, and getting it
   /// wrong is why the first NN run on the benchmark returned 0 identifications with every
   /// iteration skipped.
@@ -201,8 +200,10 @@ struct NNParams
   /// the former costs 62 s, the latter 24 s). The curve is flat below 256, so 256 it is -- it also
   /// leaves more work per parallel region than 128 or 64 do.
   int batch_size = 256;
-  double lr = 0.2;            ///< measured optimum at hidden={64,32}, epochs=5; 0.05 gives 1.98%
-                              ///< and 0.5 overshoots. Interacts with depth -- retune if that moves.
+  double lr = 0.2;            ///< THE largest single lever measured: at five layers and 5 epochs,
+                              ///< 0.05 -> 0.2 moves top-1% recall 1.79% -> 2.00%, and 0.5 gives
+                              ///< 1.98% (flat, not broken). The original 0.05 default is the main
+                              ///< reason the network returned zero identifications.
   double l2 = 1e-5;
   std::uint64_t seed = 42;
   int n_threads = 0;
@@ -221,16 +222,42 @@ struct NNParams
 
 /// Counter-based weight init. A hash of the coordinates, NOT a sequential RNG: a draw order that
 /// depends on thread scheduling is exactly the class of bug that cost this project weeks.
+/// SplitMix64's finalizer. Full avalanche: a one-bit input change flips each output bit with
+/// probability ~1/2, which is the property the previous mixer lacked.
+inline std::uint64_t nnMix64(std::uint64_t x)
+{
+  x += 0x9E3779B97F4A7C15ull;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+
 inline double nnInitWeight(std::uint64_t net, std::uint64_t layer, std::uint64_t i,
                            std::uint64_t j, std::uint64_t seed, double scale)
 {
+  // ONE FULL-AVALANCHE MIX PER COORDINATE.
+  //
+  // The previous version used the boost::hash_combine pattern
+  //     h ^= v + K + (h << 6) + (h >> 2);
+  // which does not avalanche: adjacent j values produced strongly correlated weights. Measured by
+  // enumeration over 230k coordinates:
+  //
+  //     corr(j, j+1) = -0.121     corr(j, j+2) = -0.485
+  //     corr(j, j+4) = +0.826     corr(j, j+8) = +0.713
+  //
+  // and one row's first eight weights read
+  //     +0.405 -0.100 -0.605 +0.890 | +0.384 -0.039 -0.544 +0.951
+  // i.e. columns four apart were near-duplicates. Every width-8 layer therefore began with four
+  // pairs of nearly identical units, which is a rank deficiency at initialisation and hits NARROW
+  // layers hardest -- so it confounded the architecture comparison that motivated looking here.
+  //
+  // Found by adversarial review. The existing test only checked reproducibility and that two
+  // coordinates differ, which this passes comfortably; nothing looked at the JOINT distribution.
   std::uint64_t h = seed;
-  for (std::uint64_t v : {net, layer, i, j})
-  {
-    h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-    h *= 0xBF58476D1CE4E5B9ull;
-    h ^= h >> 31;
-  }
+  h = nnMix64(h ^ (net * 0x9E3779B97F4A7C15ull));
+  h = nnMix64(h ^ (layer * 0xC2B2AE3D27D4EB4Full));
+  h = nnMix64(h ^ (i * 0x165667B19E3779F9ull));
+  h = nnMix64(h ^ (j * 0x27D4EB2F165667C5ull));
   // uniform in [-1,1), then scaled -- deterministic for a given coordinate, order-independent
   const double u = static_cast<double>(h >> 11) / static_cast<double>(1ull << 53);
   return (2.0 * u - 1.0) * scale;

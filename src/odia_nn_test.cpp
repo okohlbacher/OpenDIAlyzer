@@ -201,6 +201,50 @@ int main()
     CHECK(acc - acc0 > 0.15);
   }
 
+  // ---- the initialiser must be JOINTLY random, not merely reproducible ------------------------
+  // The previous mixer (boost::hash_combine) passed every check this file had -- reproducible, and
+  // two coordinates differ -- while producing corr(j, j+4) = +0.826 between adjacent output units.
+  // Every width-8 layer began with four pairs of near-duplicate units, a rank deficiency at
+  // initialisation that hits NARROW layers hardest and so confounded an architecture comparison.
+  // Reproducibility is not randomness; nothing here looked at the JOINT distribution until it cost
+  // a wrong conclusion.
+  {
+    double worst = 0.0;
+    int worst_lag = 0;
+    for (const int lag : {1, 2, 3, 4, 8})
+    {
+      std::vector<double> A, B;
+      for (std::uint64_t net = 0; net < 8; ++net)
+      {
+        for (std::uint64_t layer = 0; layer < 4; ++layer)
+        {
+          for (std::uint64_t i = 0; i < 32; ++i)
+          {
+            for (std::uint64_t j = 0; j + lag < 32; ++j)
+            {
+              A.push_back(nnInitWeight(net, layer, i, j, 42, 1.0));
+              B.push_back(nnInitWeight(net, layer, i, j + lag, 42, 1.0));
+            }
+          }
+        }
+      }
+      double ma = 0, mb = 0;
+      for (std::size_t k = 0; k < A.size(); ++k) { ma += A[k]; mb += B[k]; }
+      ma /= A.size(); mb /= B.size();
+      double num = 0, da = 0, db = 0;
+      for (std::size_t k = 0; k < A.size(); ++k)
+      {
+        num += (A[k] - ma) * (B[k] - mb);
+        da += (A[k] - ma) * (A[k] - ma);
+        db += (B[k] - mb) * (B[k] - mb);
+      }
+      const double r = std::fabs(num / std::sqrt(da * db));
+      if (r > worst) { worst = r; worst_lag = lag; }
+    }
+    std::printf("  init autocorrelation: worst |rho| %.4f at lag %d\n", worst, worst_lag);
+    CHECK(worst < 0.05);
+  }
+
   // ---- imbalance, which is the production regime and which no other block here covers ---------
   // Every case above is balanced, so w_neg is exactly 1.0 and the interaction between imbalance,
   // class weighting and batch composition -- the thing that actually decides whether the benchmark
