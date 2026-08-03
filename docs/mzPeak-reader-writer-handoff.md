@@ -29,14 +29,12 @@ toward *diaPASEF* (ion mobility). It says so wherever that bias matters.
 > Verified on this build: **26/26 reader tests pass** (the tag failed 3 on chunked decoding), and
 > OpenDIAlyzer reads a 136 MB `.mzpeak` end to end at **0.60 GB peak RSS**.
 
-**The third row is the important one.** The deployed reader is not any upstream commit. It carries
-local work that was never committed, never pushed, and existed only as a dirty working tree on a
-scratch filesystem until it was captured into this repository. `git log --all -S ion_mobility_array`
-finds **nothing** in upstream history: the per-peak ion-mobility capability is not an upstream
-feature we are behind on, it is a capability that exists only in that patch.
-
-Anyone "upgrading the reader" must therefore rebase that patch, not replace the tree. Doing the
-latter silently removes diaPASEF support.
+**The lesson worth keeping**, now that the specific problem is fixed: for a period this project ran
+a reader that was no upstream commit, carrying unbacked-up work whose loss would have silently
+removed diaPASEF support. Sections 2.1 and 2.2 below are preserved in their original "absent
+upstream" form because they are the specification of what was missing and why — useful to anyone
+implementing the same capability elsewhere, and the record of how the gap was characterised before
+it was closed. Read them as requirements, not as current status.
 
 Format references:
 - Specification: <https://github.com/HUPO-PSI/mzPeak>
@@ -61,10 +59,18 @@ MzPeak::Spectrum::precursors()         // -> isolation windows + selected ions
 MzPeak::Spectrum::mz()                 // const std::vector<double>&
 MzPeak::Spectrum::intensity()          // const std::vector<float>&
 MzPeak::Spectrum::ion_mobility()       // scalar, per spectrum   (older slice layout)
-MzPeak::Spectrum::ion_mobility_array() // PER PEAK              (frame layout)  <-- NOT UPSTREAM
+MzPeak::Spectrum::ion_mobility_array() // PER PEAK (frame layout)  -- trunk 458d067
 SelectedIonInfo::ion_mobility_value
-SelectedIonInfo::ion_mobility_lower_limit / _upper_limit                        //  <-- NOT UPSTREAM
+SelectedIonInfo::ion_mobility_lower_limit / _upper_limit             -- trunk 458d067
 ```
+
+Trunk additionally offers a selection/streaming layer we do NOT yet use, and probably should:
+`Spectra::indices_in_time_range()` (seconds), `Spectra::get_spectra_batch()` (ascending-index reads,
+caller-order results) and `Spectra::extract_ion_chromatogram()` (the only selection helper that
+decodes peaks, and only for spectra surviving the RT/ms-level filters). Note `Spectra` is now
+non-copyable AND non-movable by design — the base class binds a fetch callback to `this`, so a copy
+would dispatch through the original and dangle. One `Spectra` per thread is therefore enforced
+rather than advisory.
 
 Two hard non-functional requirements, both load-bearing:
 
@@ -82,9 +88,9 @@ Two hard non-functional requirements, both load-bearing:
 
 ## 2. Gap list — what is missing, ordered by what blocks us first
 
-### 2.1 PER-PEAK ION MOBILITY — blocking for diaPASEF, absent upstream
+### 2.1 PER-PEAK ION MOBILITY — CLOSED on trunk (`458d067`); kept as the requirement spec
 
-**Status upstream:** does not exist, on any branch, at any commit. `Spectrum` exposes only a scalar
+**Status when written:** did not exist, on any branch, at any commit. `Spectrum` exposes only a scalar
 `ion_mobility()` plus `ion_mobility_type()`.
 
 **Why a scalar is not sufficient.** mzPeak stores a diaPASEF **frame** as ONE spectrum carrying N
@@ -117,9 +123,9 @@ A standard-compliant implementation should extend the enum to cover MS:1002816 (
 mobility terms) rather than rely on the name fallback — but keep the fallback, because writers in
 the wild emit the non-modelled form.
 
-### 2.2 ION-MOBILITY WINDOW LIMITS on selected ions — blocking for diaPASEF, absent upstream
+### 2.2 ION-MOBILITY WINDOW LIMITS on selected ions — CLOSED on trunk (`458d067`)
 
-**Status upstream:** `SelectedIonInfo` has `selected_ion_mz`, `charge_state`, `intensity`,
+**Status when written:** `SelectedIonInfo` has `selected_ion_mz`, `charge_state`, `intensity`,
 `ion_mobility_value`, `ion_mobility_type`, `parameters`. It has **no** mobility bounds.
 
 **What to add:**
@@ -138,7 +144,7 @@ Note the asymmetry to preserve: when the limits are absent but the value is pres
 fall back to the value; when both are absent, fall back to the spectrum scalar. Our adapter already
 encodes that precedence and any replacement must keep it.
 
-### 2.3 SPLIT / FLAT METADATA LAYOUT — upstream now *rejects* it; we *read* it
+### 2.3 SPLIT / FLAT METADATA LAYOUT — CLOSED on trunk (`ea1266e` read, `2c83369` write)
 
 **Status upstream:** commit `b5e7c49` changed behaviour from "read as empty" to "reject loudly", and
 `6dd9d0e` recognises split-metadata facets and parses `column_mapping`. Loud rejection is a genuine
@@ -202,7 +208,7 @@ MS:1003089) → (numpress, MS:1002312/1002314 via vendored ms-numpress).
 whose layout we have not audited against this. If they are chunked, the current reader throws rather
 than mis-decodes — which is the safe failure, but a failure.
 
-### 2.5 BRUKER TDF "ims-compact" — absent upstream, present in the local patch
+### 2.5 BRUKER TDF "ims-compact" — CLOSED on trunk (`b599ba4`)
 
 This is the least standard and most easily missed item.
 
@@ -329,17 +335,22 @@ Both of these cost time and neither is a real requirement:
 
 ---
 
-## 6. Suggested order of work
+## 6. Suggested order of work — REVISED after trunk @ 7f54871
 
-1. **Rebase the local patch** (`patches/mzpeak-per-peak-ion-mobility.patch`) onto
-   `reader-fixes-2026-08-02`, then upstream the parts that are general: per-peak ion mobility (§2.1),
-   the mobility limits (§2.2), and `row_count()` (§2.6). These are not project-specific.
-2. **Determine whether our production files are chunked** (§2.4). This decides whether Phase 6 is
-   urgent or background.
-3. **RDR-4 minimal types**, then the metadata reader (Phase 3/RDR-24) — upstream's own corrected
-   order, and the split-layout work in §2.3 depends on it.
+Items 1–4 of the original list are done upstream. What remains:
+
+1. **Adopt the streaming/selection API.** Our adapter still walks spectra itself; trunk offers
+   `indices_in_time_range()` + `get_spectra_batch()` + `extract_ion_chromatogram()` with lazy decode
+   and ascending-index reads. This is the largest remaining win and it is ours to take, not
+   upstream's to build.
+2. **Report the two build issues upstream** (§5): the `const Iterator&&` defaulted move constructor
+   (two `const`s to delete, gcc rejects it), and the `libzip >= 1.11.4` bound that 1.11.2 satisfies
+   in practice.
+3. **RDR-4 minimal types** and **RDR-11 `row_count()`** (§2.6, §2.7) — the remaining reader items.
 4. **RDR-5 null reconstruction** paired with writer P2, so the two agree by construction.
-5. **T4 reverse-cross conformance** as each gap closes; add the concurrency test.
+5. **T4 reverse-cross conformance**, and add the concurrency test that still does not exist: lazy
+   decode is shared across copies and nothing exercises it multi-threaded, while we call it from
+   224 threads.
 
 Deliberately *not* recommended: reimplementing the format from the paper. The Rust reference is the
 conformance oracle and the C++ roadmap is accurate about its own gaps; both are better inputs than a
