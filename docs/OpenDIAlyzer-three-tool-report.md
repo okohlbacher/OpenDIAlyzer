@@ -1,6 +1,7 @@
 # OpenDIAlyzer vs OpenSwathWorkflow vs DIA-NN — measured comparison and bottleneck analysis
 
-**Data:** one Thermo Astral plasma DIA run (`astral.mzML`, 6.4 GB), ONE shared spectral library of
+**Updated 2026-08-03** with a new best-known ODIA row and a controlled prefilter comparison; see
+footnotes e and f. **Data:** one Thermo Astral plasma DIA run (`astral.mzML`, 6.4 GB), ONE shared spectral library of
 7,149,966 precursors / 78,569,077 transitions (PeptDeep-predicted RT), on an idle 224-core /
 2.2 TB node. All three tools got the same file and the same library.
 
@@ -18,7 +19,9 @@ PeptDeep-predicted library, IBMI `data` node (224 cores, 2.2 TB). All rows are I
 |---|---:|---:|---:|---:|---:|---:|
 | DIA-NN 2.0 | 224 | **349 s** | 8447% | 84.5 | 19.7 GB | **9,261** |
 | DIA-NN 1.7.12 ᵈ | 224 | 614 s | 11947% | **119.5** | 16.2 GB | **8,405** |
-| ODIA — GBT, parquet | 224 | 2,834 s | 2884% | 28.8 | 350.0 GB | 6,798 |
+| **ODIA — GBT, parquet (2026-08-03)** ᵉ | 224 | **1,847 s** | 6362% | 63.6 | **99.0 GB** | **6,980** |
+| ODIA — GBT, parquet (2026-08-01) | 224 | 2,834 s | 2884% | 28.8 | 350.0 GB | 6,798 |
+| ODIA — GBT, prefilter_min_fragments=3 ᶠ | 224 | 7,192 s | 8571% | 85.7 | 544.8 GB | 6,433 |
 | ODIA — LDA, sqlite | 224 | 2,437 s | 2893% | 28.9 | 366.8 GB | 4,367 |
 | OpenSwathWorkflow ᵃ | 24 ᵇ | 6,886 s | 1448% | 14.5 | 153 GB | 3,275 ᶜ |
 
@@ -30,6 +33,17 @@ statement about it.
 makes this a comparison of feature sets. pyprophet was abandoned after three attempts
 (5h23m, 8h33m, 2h50m with 2.5 h of no output while holding ~330 GB).
 ᵈ built from source (CC BY 4.0), 2-line build-only patch for gcc>=8 goto/initialisation strictness.
+ᵉ CURRENT BEST. Measured under node load 332 on 224 cores with two other jobs running, so the wall
+time is PESSIMISTIC. Better than the 2026-08-01 row on all three axes at once: +182 IDs, 35% faster,
+3.5x less memory. Peptides 6,089, proteins 646 (per-accession).
+ᶠ The same build with the prefilter relaxed from 4 to 3 fragments. Listed because it isolates that
+one option's cost: -547 IDs, 3.9x the wall time and 5.5x the peak RSS. Allocator detail after
+extraction, the two configurations side by side:
+    prefilter 4:  in_use  31 GB, retained  64 GB, arena  95 GB
+    prefilter 3:  in_use 174 GB, retained 301 GB, arena 475 GB
+So the "301 GB of glibc fragmentation" this project has been chasing is largely a property of that
+ONE setting -- roughly 913k additional candidates surviving the filter -- and not an inherent cost
+of the pipeline. Any memory analysis quoting the 545 GB figure needs re-basing on the 99 GB one.
 
 ### The DIA-NN numbers here are NOT the ones quoted earlier in this project
 
