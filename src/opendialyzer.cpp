@@ -4614,6 +4614,44 @@ protected:
           t.invert();
           native_trafo = t;
         }
+        // DIAGNOSTIC: how far does recalibration actually MOVE each precursor?
+        //
+        // This decides whether pass 2 has to re-extract at all. Pass 1 covers +/- rt_win/2 around
+        // its own prediction and pass 2 wants +/- rt_win_recal/2 around the recalibrated one, so a
+        // precursor whose prediction moved by less than the difference of the half-widths has its
+        // pass-2 window ENTIRELY INSIDE the data pass 1 already read -- for those, re-extraction
+        // re-reads identical spectra and could be replaced by a slice.
+        //
+        // Reported rather than acted on: the containment rate is the number that says whether that
+        // replacement is worth building, and it has never been measured.
+        {
+          const double half_wide = getDoubleOption_("rt_extraction_window") * 0.5;
+          const double half_narrow = getDoubleOption_("rt_extraction_window_recal") * 0.5;
+          const double slack = half_wide - half_narrow;
+          std::vector<double> shift;
+          shift.reserve(transition_exp.getCompounds().size());
+          for (const auto& c : transition_exp.getCompounds())
+          {
+            const double before = c.rt;
+            const double after = pass_map.apply(before);
+            if (std::isfinite(before) && std::isfinite(after)) { shift.push_back(std::abs(after - before)); }
+          }
+          if (!shift.empty())
+          {
+            std::sort(shift.begin(), shift.end());
+            auto pct = [&](double q) { return shift[std::min(shift.size() - 1,
+                          static_cast<std::size_t>(q * static_cast<double>(shift.size())))]; };
+            std::size_t contained = 0;
+            for (const double d : shift) { contained += (d <= slack); }
+            OPENMS_LOG_INFO << "OpenDIAlyzer[recal-shift] |delta rt| over " << shift.size()
+                            << " precursors: median " << pct(0.50) << " s, p95 " << pct(0.95)
+                            << " s, p99 " << pct(0.99) << " s, max " << shift.back()
+                            << " s; pass-2 window fits inside pass-1 for "
+                            << (100.0 * static_cast<double>(contained) / static_cast<double>(shift.size()))
+                            << "% (slack " << slack << " s)." << std::endl;
+          }
+        }
+
         // Re-measure the run's mass accuracy on the precursors this pass actually found, so the
         // NEXT pass extracts at the instrument's real error instead of the configured guess.
         //
