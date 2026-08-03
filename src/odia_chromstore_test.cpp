@@ -66,6 +66,69 @@ int main()
   // estimating noise from the baseline inherits it.
   CHECK(base_err < 0.20);
 
+  // ---- 1b. ALL FOUR ENCODINGS on the same realistic signal ------------------------------------
+  // The metric that actually matters is CORRELATION fidelity: the dominant sub-scores
+  // (xcorr_shape, library_corr, dotprod, manhattan) are scale-invariant and read SHAPE, not
+  // absolute counts. So a per-point relative error spread uniformly across the range costs almost
+  // nothing, while an error concentrated at the apex -- which is what LINEAR quantisation gives --
+  // destroys the baseline that S/N is estimated from.
+  {
+    auto corr = [](const std::vector<float>& a, const std::vector<float>& b) {
+      const std::size_t n = std::min(a.size(), b.size());
+      double ma = 0, mb = 0;
+      for (std::size_t k = 0; k < n; ++k) { ma += a[k]; mb += b[k]; }
+      ma /= static_cast<double>(n); mb /= static_cast<double>(n);
+      double num = 0, da = 0, db = 0;
+      for (std::size_t k = 0; k < n; ++k)
+      {
+        const double x = a[k] - ma, y = b[k] - mb;
+        num += x * y; da += x * x; db += y * y;
+      }
+      return (da > 0 && db > 0) ? num / std::sqrt(da * db) : 0.0;
+    };
+    struct E { const char* name; ChromEncoding e; int bytes; };
+    const E encs[] = {{"Quantised8Log ", ChromEncoding::Quantised8Log, 1},
+                      {"Quantised8Lin ", ChromEncoding::Quantised8Lin, 1},
+                      {"Quantised16   ", ChromEncoding::Quantised16, 2},
+                      {"Float32       ", ChromEncoding::Float32, 4}};
+    std::printf("  %-15s %6s %11s %13s %13s\n", "encoding", "B/pt", "apex relerr", "baseline rel",
+                "1 - corr");
+    for (const E& e : encs)
+    {
+      ChromStore st(e.e);
+      const std::uint32_t a = st.addAxis(axis);
+      const std::size_t i2 = st.add(a, start, sig);
+      std::vector<double> r2; std::vector<float> g2;
+      st.get(i2, r2, g2);
+      double ap = static_cast<double>(std::abs(g2[600] - sig[600]) / sig[600]);
+      double bs = 0.0;
+      for (std::uint32_t k = 0; k < 50; ++k)
+      { bs = std::max(bs, static_cast<double>(std::abs(g2[k] - sig[k]) / sig[k])); }
+      std::printf("  %-15s %6d %11.2e %13.4f %13.2e\n", e.name, e.bytes, ap, bs,
+                  1.0 - corr(sig, g2));
+    }
+    // Linear 8-bit cannot represent a 100-count baseline under a 1e6 apex at all: the code step is
+    // 3922 counts, so it rounds to 0. That is the claim, so it is asserted rather than described.
+    {
+      ChromStore lin(ChromEncoding::Quantised8Lin);
+      const std::uint32_t a = lin.addAxis(axis);
+      const std::size_t i3 = lin.add(a, start, sig);
+      std::vector<double> r3; std::vector<float> g3;
+      lin.get(i3, r3, g3);
+      CHECK(g3[0] == 0.0F);                      // baseline annihilated
+    }
+    // Log 8-bit keeps the baseline to a few percent AND correlates essentially perfectly.
+    {
+      ChromStore lg(ChromEncoding::Quantised8Log);
+      const std::uint32_t a = lg.addAxis(axis);
+      const std::size_t i4 = lg.add(a, start, sig);
+      std::vector<double> r4; std::vector<float> g4;
+      lg.get(i4, r4, g4);
+      CHECK(g4[0] > 90.0F && g4[0] < 111.0F);    // baseline preserved within ~4%
+      CHECK(1.0 - corr(sig, g4) < 1e-4);         // shape intact, which is what the scores read
+    }
+  }
+
   // ---- 2. slicing must return exactly the points a narrower window would --------------------
   // This is the operation the store exists for, and getting it wrong is invisible: a slice off by
   // one still looks like a chromatogram.

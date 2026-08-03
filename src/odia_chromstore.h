@@ -1,5 +1,5 @@
 #pragma once
-// A compact chromatogram store: 2 bytes per point instead of 16.
+// A compact chromatogram store: 1 byte per point instead of 16.
 //
 // THE PROBLEM. OpenMS holds an extracted chromatogram as a vector of ChromatogramPeak, which is a
 // double RT plus a double intensity -- 16 bytes per point. On the Astral benchmark that is
@@ -18,27 +18,42 @@
 // THE LAYOUT. One global axis per SWATH window, and each chromatogram is a contiguous SLICE of it:
 //
 //   axis:   per window, the ascending MS2 cycle times           (150 x ~1945 x 8 B = 2.3 MB total)
-//   chrom:  window id, start index, length, scale, uint16[length]
+//   chrom:  window id, start index, length, scale, uint8[length]
 //
 // A chromatogram therefore stores NO times at all: point i is at axis[window][start + i]. That is
 // exactly the "index to the start RT and length, infer the rest" arrangement, and it also makes the
 // slice operation this store exists to support -- narrowing an RT window -- a pair of integers,
 // with no data movement.
 //
-//   per point:        2 B          (uint16 intensity, per-chromatogram scale)
+//   per point:        1 B          (uint8 intensity, LOG-spaced against a per-chromatogram max)
 //   per chromatogram: 16 B         (window, start, length, scale)
-//   benchmark total:  4.46M x (16 + 2 x 1196) = 10.7 GB   vs 85 GB, a 7.9x reduction
+//   benchmark total:  4.46M x (16 + 1196) = 5.4 GB   vs 85 GB, a 15.5x reduction (measured)
 //
-// INTENSITY QUANTISATION, and its one real risk. Intensity is stored as uint16 against a
-// per-chromatogram scale, so relative precision at the apex is 1/65535 = 1.5e-5 -- far finer than
-// the measurement. The exposure is at the BOTTOM of the range: a chromatogram whose apex is 1e6 and
-// whose baseline is 1e2 resolves that baseline into ~7 levels, which is coarse for anything that
-// estimates noise from the baseline (S/N, and therefore var_ms2_log_sn_score).
+// WHY LOG SPACING, AND WHY IT IS NOT A COMPROMISE. What the scores actually read is SHAPE:
+// xcorr_shape, library_corr, dotprod and manhattan are all scale-invariant, so the quantity to
+// preserve is RELATIVE accuracy per point, uniformly. Linear quantisation does the opposite -- it
+// spends its resolution near the apex, where the data least needs it, and starves the baseline that
+// S/N is estimated from. Log spacing gives (1e4)^(1/254) - 1 = 3.7% relative precision at EVERY
+// intensity, so 255 codes cover four decades.
 //
-// So the store measures its own error rather than asserting it is small: `quantisationReport()`
-// returns the worst relative error over a set of chromatograms, and the test checks a realistic
-// 1e6:1e2 dynamic range. If an S/N score ever moves, this is the first place to look, and
-// `Encoding::Float` exists to rule it out in one line.
+// Measured on a realistic 1e6 apex over a 1e2 baseline (odia_chromstore_test):
+//
+//     encoding         B/pt   apex relerr   baseline relerr   1 - corr
+//     Quantised8Log       1      0.00e+00            0.0001   5.09e-05
+//     Quantised8Lin       1      0.00e+00            1.0000   2.78e-06
+//     Quantised16         2      0.00e+00            0.0682   1.28e-10
+//     Float32             4      0.00e+00            0.0000   0.00e+00
+//
+// One byte LOG-spaced preserves the baseline 680x better than two bytes linear, at half the size.
+// Linear 8-bit annihilates it outright (the code step is 3922 counts under a 1e6 apex, so a
+// 100-count baseline rounds to zero) -- the failure is the SPACING, not the bit depth.
+//
+// Note also that correlation alone would have chosen wrongly: Quantised8Lin scores BETTER on
+// 1 - corr than Quantised8Log, because correlation is dominated by the apex it preserved, while
+// the baseline it destroyed does not show up there. That is why the test asserts both.
+//
+// ChromEncoding::Float32 remains, so a suspected quantisation effect can be ruled out by changing
+// one value rather than by reasoning about it.
 
 #include <algorithm>
 #include <cmath>
@@ -55,9 +70,16 @@ namespace odia
 /// quantisation effect can be tested by changing one value rather than by reasoning about it.
 enum class ChromEncoding
 {
-  Quantised16,   ///< uint16 + per-chromatogram scale: 2 B/point
-  Float32        ///< float: 4 B/point, no quantisation error
+  Quantised8Log,  ///< uint8 + f32 scale, LOG-spaced: 1 B/point. Default -- see the note below.
+  Quantised8Lin,  ///< uint8 + f32 scale, linear: 1 B/point. Provided to demonstrate why not.
+  Quantised16,    ///< uint16 + f32 scale, linear: 2 B/point
+  Float32         ///< float: 4 B/point, no quantisation error
 };
+
+/// Dynamic range covered by the log encodings, as a ratio to the chromatogram's own maximum.
+/// 1e4 spans the benchmark's observed 1e2 baseline under a 1e6 apex with room to spare; 255 codes
+/// across it give (1e4)^(1/254) - 1 = 3.7% relative precision at EVERY intensity.
+inline constexpr double kChromLogDynamicRange = 1.0e4;
 
 /// The shared time axis of one SWATH window. Chromatograms reference it by index.
 struct ChromAxis
@@ -83,7 +105,7 @@ struct ChromRef
   std::uint32_t start = 0;     ///< first index on that axis
   std::uint32_t length = 0;    ///< number of points
   std::uint64_t offset = 0;    ///< where the payload begins in the store's blob
-  float scale = 0.0F;          ///< intensity at code 65535 (Quantised16); unused for Float32
+  float scale = 0.0F;          ///< the chromatogram's maximum: the top code decodes to this
 };
 
 /// Compact store for many chromatograms over a few shared axes.
@@ -95,7 +117,7 @@ struct ChromRef
 class ChromStore
 {
 public:
-  explicit ChromStore(ChromEncoding enc = ChromEncoding::Quantised16) : enc_(enc) {}
+  explicit ChromStore(ChromEncoding enc = ChromEncoding::Quantised8Log) : enc_(enc) {}
 
   /// Register a window's time axis; returns its id. Axes are few (one per SWATH window) and small.
   std::uint32_t addAxis(std::vector<double> rt)
@@ -133,16 +155,21 @@ public:
     {
       const auto* p = reinterpret_cast<const std::uint8_t*>(intensity.data());
       blob_.insert(blob_.end(), p, p + intensity.size() * sizeof(float));
+      refs_.push_back(r);
+      return refs_.size() - 1;
     }
-    else
+
+    float mx = 0.0F;
+    for (const float v : intensity) { if (std::isfinite(v) && v > mx) { mx = v; } }
+    r.scale = mx;
+    // A flat-zero chromatogram keeps scale 0 and stores zero codes; decode then returns zeros,
+    // which is the truth. Dividing by a zero scale would produce NaN for a case that is common
+    // (a transition with no signal in the window) and entirely legitimate.
+    const bool have = (mx > 0.0F);
+
+    if (enc_ == ChromEncoding::Quantised16)
     {
-      float mx = 0.0F;
-      for (const float v : intensity) { if (std::isfinite(v) && v > mx) { mx = v; } }
-      r.scale = mx;
-      // A flat-zero chromatogram keeps scale 0 and stores zero codes; decode then returns zeros,
-      // which is the truth. Dividing by a zero scale would produce NaN for a case that is common
-      // (a transition with no signal in the window) and entirely legitimate.
-      const double inv = (mx > 0.0F) ? (65535.0 / static_cast<double>(mx)) : 0.0;
+      const double inv = have ? (65535.0 / static_cast<double>(mx)) : 0.0;
       blob_.reserve(blob_.size() + intensity.size() * 2);
       for (const float v : intensity)
       {
@@ -150,6 +177,37 @@ public:
         const std::uint16_t q = static_cast<std::uint16_t>(std::min(65535.0, std::max(0.0, c)));
         blob_.push_back(static_cast<std::uint8_t>(q & 0xFF));
         blob_.push_back(static_cast<std::uint8_t>(q >> 8));
+      }
+    }
+    else if (enc_ == ChromEncoding::Quantised8Lin)
+    {
+      const double inv = have ? (255.0 / static_cast<double>(mx)) : 0.0;
+      blob_.reserve(blob_.size() + intensity.size());
+      for (const float v : intensity)
+      {
+        const double c = (std::isfinite(v) && v > 0.0F) ? std::lround(static_cast<double>(v) * inv) : 0.0;
+        blob_.push_back(static_cast<std::uint8_t>(std::min(255.0, std::max(0.0, c))));
+      }
+    }
+    else   // Quantised8Log
+    {
+      // Code 0 is reserved for EXACT zero -- a transition with no signal in a cycle is common and
+      // must decode back to zero, not to the bottom of the range. Codes 1..255 are log-spaced from
+      // scale/kChromLogDynamicRange up to scale, so relative precision is constant everywhere
+      // rather than concentrated at the apex where it is least needed.
+      const double floor_v = have ? static_cast<double>(mx) / kChromLogDynamicRange : 0.0;
+      const double lr = have ? std::log(static_cast<double>(mx) / floor_v) : 1.0;
+      blob_.reserve(blob_.size() + intensity.size());
+      for (const float v : intensity)
+      {
+        std::uint8_t code = 0;
+        if (have && std::isfinite(v) && v > 0.0F)
+        {
+          const double vv = std::max(floor_v, std::min(static_cast<double>(mx), static_cast<double>(v)));
+          const double t = std::log(vv / floor_v) / lr;                     // 0..1
+          code = static_cast<std::uint8_t>(1 + std::lround(t * 254.0));
+        }
+        blob_.push_back(code);
       }
     }
     refs_.push_back(r);
@@ -186,7 +244,7 @@ public:
       const auto* src = reinterpret_cast<const float*>(blob_.data() + r.offset);
       for (std::uint32_t k = 0; k < n; ++k) { intensity[k] = src[from + k]; }
     }
-    else
+    else if (enc_ == ChromEncoding::Quantised16)
     {
       const double s = static_cast<double>(r.scale) / 65535.0;
       const std::uint8_t* src = blob_.data() + r.offset + 2ULL * from;
@@ -194,6 +252,28 @@ public:
       {
         const std::uint16_t q = static_cast<std::uint16_t>(src[2 * k] | (src[2 * k + 1] << 8));
         intensity[k] = static_cast<float>(static_cast<double>(q) * s);
+      }
+    }
+    else if (enc_ == ChromEncoding::Quantised8Lin)
+    {
+      const double s = static_cast<double>(r.scale) / 255.0;
+      const std::uint8_t* src = blob_.data() + r.offset + from;
+      for (std::uint32_t k = 0; k < n; ++k)
+      {
+        intensity[k] = static_cast<float>(static_cast<double>(src[k]) * s);
+      }
+    }
+    else   // Quantised8Log
+    {
+      const std::uint8_t* src = blob_.data() + r.offset + from;
+      const double mx = static_cast<double>(r.scale);
+      const double floor_v = (mx > 0.0) ? mx / kChromLogDynamicRange : 0.0;
+      const double lr = (mx > 0.0) ? std::log(mx / floor_v) : 1.0;
+      for (std::uint32_t k = 0; k < n; ++k)
+      {
+        const std::uint8_t c = src[k];
+        intensity[k] = (c == 0) ? 0.0F
+                     : static_cast<float>(floor_v * std::exp(lr * (static_cast<double>(c) - 1.0) / 254.0));
       }
     }
   }
