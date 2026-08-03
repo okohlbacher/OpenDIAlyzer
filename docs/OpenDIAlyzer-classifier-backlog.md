@@ -201,7 +201,24 @@ split.
 path. **Check whether the fixture dump happens before or after it**, and either canonicalise before
 dumping or interleave the classes.
 
-## 13. THE .oswpq SCORE TABLE CANNOT BE JOINED TO ITS FEATURE TABLE — HIGH, output-integrity bug
+## 13. THE .oswpq SCORE TABLE CANNOT BE JOINED TO ITS FEATURE TABLE — FIXED
+
+**Cause: two id conventions in one bundle.** `OpenSwathOSWParquetWriter` writes
+`clearSignBit(feature.getUniqueId())` (`OpenSwathOSWParquetWriter.cpp:603`); our score writer cast
+the raw `uint64` to `int64`. `UniqueIdGenerator` is effectively random, so half the ids have the
+high bit set and came out negative on one side and positive on the other — hence exactly 50%
+overlap.
+
+Both earlier hypotheses were wrong and are recorded so they are not re-tried: it is **not** two
+different runs, and it **is** a sign issue — but the transform is `+2^63` (clear the sign bit), not
+the `+2^64` I tested, which is why that test matched zero rows and wrongly exonerated the idea.
+
+Verified after the fix: **2,070,355 of 2,070,355 score rows join, 100%.**
+
+It cost more than downstream convenience: the entrapment validation could map only 2,328 of 4,588
+identifications back to a precursor, halving the sample its FDP estimate rests on.
+
+### original text, kept for the diagnosis trail
 
 In `bench/nnfix/nnfix.oswpq`, `runs/run_id=*/score_ms2.parquet` and `runs/run_id=*/features.parquet`
 each hold **14,943,922 unique `feature_id`s and share only 7,472,175** — exactly half. Any consumer
@@ -297,6 +314,29 @@ if the coefficient is.
 **Decision: not building it.** 6.2% is not worth a retained chromatogram store (which does not
 exist), a containment fallback, and an MS1 exception — in a project whose worst metric is memory.
 Revisit only if scoring gets much cheaper, which would change the ratio.
+
+## 16. ENTRAPMENT RAN, AND 5% IS TOO SMALL A FRACTION
+
+First external FDR check. Library: 2,223,453 real targets + 86,257 entrapment (5% of decoys
+promoted). At q<0.01, rank 1:
+
+| | |
+|---|---:|
+| real target precursors | 2,301 |
+| **entrapment precursors** | **2** |
+| observed FDP | 0.09% |
+| scaled x20 (entrapment was 5% of the decoy pool) | **1.7%** vs nominal 1% |
+
+**Consistent with calibration, and too weak to say more.** Two events: the Poisson 95% interval on 2
+is [0.24, 7.2], so the scaled FDP lies somewhere in ~0.2%-6%. That rules out gross miscalibration --
+we are not claiming 1% and delivering 20% -- and cannot separate "well calibrated" from "twice as
+bad as claimed".
+
+**Next run: raise the fraction to 25-50%.** The uncertainty here is entirely event-count driven. The
+cost is a smaller decoy null, which the script's own header already flags as the trade.
+
+Note the sample was also halved by item 13 (the feature_id join defect), now fixed -- so a re-run
+gets both a larger fraction and twice the joinable data.
 
 ## 8. Carried over, unrelated to tonight
 

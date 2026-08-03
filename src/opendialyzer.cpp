@@ -2158,7 +2158,21 @@ protected:
     arrow::Int32Builder rank;
     for (std::size_t i = 0; i < R.feature_id.size(); ++i)
     {
-      ParquetFile::appendOrThrow(feature_id.Append(R.feature_id[i]), "feature_id");
+      // MATCH THE FEATURE TABLE'S ID CONVENTION. OpenSwathOSWParquetWriter writes
+      //     clearSignBit(feature.getUniqueId())
+      // (OpenSwathOSWParquetWriter.cpp:603) while this wrote the raw uint64 cast to int64, so every
+      // id with the high bit set -- half of them, since UniqueIdGenerator is effectively random --
+      // came out NEGATIVE here and positive there. The two tables of the same bundle then shared
+      // only half their join keys, and any consumer joining scores to features silently lost the
+      // other half.
+      //
+      // It cost us as well as downstream: the entrapment validation could map only 2,328 of 4,588
+      // identifications back to a precursor, halving the sample the FDP estimate rests on.
+      //
+      // Verified on a produced bundle: 2,070,355 of 2,070,355 score rows join after this, 100%.
+      ParquetFile::appendOrThrow(
+        feature_id.Append(static_cast<std::int64_t>(
+          static_cast<std::uint64_t>(R.feature_id[i]) & 0x7FFFFFFFFFFFFFFFull)), "feature_id");
       ParquetFile::appendOrThrow(score.Append(s.dscore[i]), "score");
       ParquetFile::appendOrThrow(rank.Append(best[R.group[i]] == i ? 1 : 2), "rank");
       // pvalue / qvalue / pep are three DIFFERENT statistics; writing the q-value into all three
