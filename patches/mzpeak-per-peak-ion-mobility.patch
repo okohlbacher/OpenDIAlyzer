@@ -1,0 +1,871 @@
+diff --git a/include/mzpeak/data/signals.h b/include/mzpeak/data/signals.h
+index b62800a..80f162a 100644
+--- a/include/mzpeak/data/signals.h
++++ b/include/mzpeak/data/signals.h
+@@ -38,6 +38,13 @@ public:
+    */
+   std::size_t record_count() const;
+ 
++  /// Actual number of PEAK ROWS in the backing parquet file (footer metadata --
++  /// no data is read). Distinct from record_count(), which is the entity count
++  /// (spectra) taken from a KV shared by the profile and centroid files: a
++  /// centroid-only run has a profile file with 0 rows but a non-zero spectrum
++  /// count, and only this tells the two apart.
++  std::size_t row_count() const;
++
+   /**
+    * Return a query builder for the index column.
+    *
+diff --git a/include/mzpeak/index.h b/include/mzpeak/index.h
+index b927957..5e7311e 100644
+--- a/include/mzpeak/index.h
++++ b/include/mzpeak/index.h
+@@ -41,6 +41,23 @@ public:
+    */
+   const std::string& version() const;
+ 
++  /**
++   * `ims-compact` calibration from the index `metadata.ims_calibration`.
++   *
++   * Bruker TDF files converted with mzpeak-convert's ims-compact codec store NO
++   * m/z array: the signal arrays are nonstandard("tof") (Int32) + intensity +
++   * MeanInverseReducedIonMobilityArray, and readers are expected to reconstruct
++   * m/z as `(a + b*tof)^2`. Without this a reader finds no Mz dimension and
++   * decodes nothing.  `valid` is false when the index declares no calibration.
++   */
++  struct ImsCalibration {
++    bool valid = false;
++    double a = 0.0;
++    double b = 0.0;
++    double mz(double tof) const { const double r = a + b * tof; return r * r; }
++  };
++  const ImsCalibration& ims_calibration() const;
++
+   /**
+    * Access the spectra in the file.
+    */
+diff --git a/include/mzpeak/metadata/table.h b/include/mzpeak/metadata/table.h
+index cf4eca7..43b4196 100644
+--- a/include/mzpeak/metadata/table.h
++++ b/include/mzpeak/metadata/table.h
+@@ -27,6 +27,17 @@ public:
+   /// Constructor.
+   Table(std::unique_ptr<Util::Parquet>);
+ 
++  /**
++   * Construct with the NORMALISED (side-table) metadata layout written by
++   * mzpeak-convert >= 0.7: the main table plus spectra_metadata_scans and
++   * spectra_metadata_precursors.  Either side table may be null.
++   * read_spectrum_metadata() then joins them on `source_index`.
++   */
++  Table(std::unique_ptr<Util::Parquet> main,
++        std::unique_ptr<Util::Parquet> scans,
++        std::unique_ptr<Util::Parquet> precursors,
++        std::unique_ptr<Util::Parquet> selected_ions = nullptr);
++
+   /// Destructor.
+   ~Table();
+ 
+diff --git a/include/mzpeak/spectra.h b/include/mzpeak/spectra.h
+index b4abdd5..799c360 100644
+--- a/include/mzpeak/spectra.h
++++ b/include/mzpeak/spectra.h
+@@ -36,13 +36,20 @@ public:
+   Spectra() = default;
+ 
+   /// Constructor for profile-only or centroid-only data.
+-  explicit Spectra(std::unique_ptr<Data::Signals>, std::unique_ptr<Metadata::Table>);
++  explicit Spectra(std::unique_ptr<Data::Signals>, std::unique_ptr<Metadata::Table>,
++                   double ims_a = 0.0, double ims_b = 0.0, bool ims_valid = false);
+ 
+   /// Constructor for mixed profile+centroid data (data = profile file, peaks =
+   /// centroid file).
++  /// NOTE: Spectra binds its fetch callback to `this`, so it must only ever be
++  /// created as the direct operand of a `return` (guaranteed copy elision).
++  /// Never construct it into a named local and return that -- the callback would
++  /// point at the destroyed local. Hence the ims-compact calibration is passed
++  /// through the constructor rather than a setter.
+   explicit Spectra(std::unique_ptr<Data::Signals> data,
+                    std::unique_ptr<Data::Signals> peaks,
+-                   std::unique_ptr<Metadata::Table>);
++                   std::unique_ptr<Metadata::Table>,
++                   double ims_a = 0.0, double ims_b = 0.0, bool ims_valid = false);
+ 
+ private:
+   // Internal data access.
+@@ -54,6 +61,9 @@ private:
+   // built lazily on first fetch from meta_ and shared into each Spectrum.  Null
+   // until built, and stays null when there is no metadata table.
+   std::shared_ptr<const std::map<uint64_t, SpectrumMetadata>> md_map_;
++  double ims_a_ = 0.0;
++  double ims_b_ = 0.0;
++  bool ims_valid_ = false;
+ 
+   // Function to fetch a specific spectrum.
+   Spectrum fetch(uint64_t);
+diff --git a/include/mzpeak/spectrum.h b/include/mzpeak/spectrum.h
+index 407aea9..900098c 100644
+--- a/include/mzpeak/spectrum.h
++++ b/include/mzpeak/spectrum.h
+@@ -50,6 +50,14 @@ public:
+    */
+   const std::vector<float>& intensity() const;
+ 
++  /**
++   * Per-peak ion mobility, parallel to mz()/intensity().  Non-empty only for
++   * ims-compact (Bruker TDF) files, which store a
++   * MeanInverseReducedIonMobilityArray alongside the tof column.  Lazily
++   * decoded with the peak arrays.
++   */
++  const std::vector<double>& ion_mobility_array() const;
++
+   /**
+    * Stage number achieved in a multi stage mass spectrometry
+    * acquisition.  Read from metadata; does NOT decode peaks.
+@@ -91,7 +99,8 @@ protected:
+            std::shared_ptr<Data::Signals>,
+            std::vector<Data::ArrayIndex::Dimension>,
+            std::shared_ptr<Metadata::Table>,
+-           std::shared_ptr<const std::map<uint64_t, SpectrumMetadata>> md_map);
++           std::shared_ptr<const std::map<uint64_t, SpectrumMetadata>> md_map,
++           double ims_a = 0.0, double ims_b = 0.0, bool ims_valid = false);
+ 
+ private:
+   /// Read + decode the peak arrays into mz_/intensity_ on first access
+@@ -107,6 +116,13 @@ private:
+   std::shared_ptr<Data::Signals> signals_;
+   std::vector<Data::ArrayIndex::Dimension> dims_;
+ 
++  // ims-compact (Bruker TDF): no m/z array is stored; m/z is reconstructed from
++  // the nonstandard "tof" column as (a + b*tof)^2 using the index calibration.
++  double ims_a_ = 0.0;
++  double ims_b_ = 0.0;
++  bool ims_valid_ = false;
++  mutable std::vector<double> mobility_;   ///< per-peak ion mobility (ims-compact only)
++
+   mutable bool decoded_ = false;
+   mutable std::vector<double> mz_;
+   mutable std::vector<float> intensity_;
+diff --git a/include/mzpeak/spectrum_metadata.h b/include/mzpeak/spectrum_metadata.h
+index 0933d10..36dffd8 100644
+--- a/include/mzpeak/spectrum_metadata.h
++++ b/include/mzpeak/spectrum_metadata.h
+@@ -64,6 +64,14 @@ struct SelectedIonInfo {
+   /// NULL in ALL bundled fixtures; value-level decode is fixture-gated.
+   std::optional<std::string> ion_mobility_type;
+ 
++  /// Mobility band this isolation window occupies within its frame (1/K0), when the
++  /// writer records it. A dia-PASEF frame carries several windows over disjoint and
++  /// generally ASYMMETRIC mobility ranges, so these bounds -- not the midpoint above --
++  /// are what a reader needs to split a frame's peaks between its windows and to set
++  /// the window's mobility limits. Absent for writers that emit only the midpoint.
++  std::optional<double> ion_mobility_lower_limit;
++  std::optional<double> ion_mobility_upper_limit;
++
+   /// Additional CV parameters on this selected-ion entry.
+   std::vector<CvParam> parameters;
+ };
+diff --git a/include/mzpeak/util/enumerable_proxy.h b/include/mzpeak/util/enumerable_proxy.h
+index 6fe6766..50be3af 100644
+--- a/include/mzpeak/util/enumerable_proxy.h
++++ b/include/mzpeak/util/enumerable_proxy.h
+@@ -55,9 +55,11 @@ public:
+ 
+     // Copy, move, and assignment constructors.
+     Iterator(const Iterator&) = default;
+-    Iterator(const Iterator&&) = default;
++    // NOTE: `const Iterator&&` is not a move constructor/assignment signature, so
++    // `= default` on it is ill-formed (GCC rejects it; clang happens to accept).
++    Iterator(Iterator&&) = default;
+     Iterator& operator=(const Iterator&) = default;
+-    Iterator& operator=(const Iterator&&) = default;
++    Iterator& operator=(Iterator&&) = default;
+ 
+     /// Prefix increment.
+     Iterator& operator++()
+diff --git a/include/mzpeak/util/metadata_model.h b/include/mzpeak/util/metadata_model.h
+index d13cd11..3384739 100644
+--- a/include/mzpeak/util/metadata_model.h
++++ b/include/mzpeak/util/metadata_model.h
+@@ -59,6 +59,36 @@ std::map<uint64_t, std::vector<double>> read_mz_delta_models(Parquet& metadata);
+  */
+ std::map<uint64_t, SpectrumMetadata> read_spectra_metadata(Parquet& metadata);
+ 
++/**
++ * Read spectrum metadata written in the NORMALISED (side-table) layout.
++ *
++ * mzpeak-convert >= 0.7 no longer writes one metadata table holding nested
++ * `spectrum` / `scan` / `precursor` / `selected_ion` STRUCT columns.  It writes
++ * flat top-level columns in spectra_metadata.parquet plus sibling files:
++ *
++ *   spectra_metadata.parquet          index, id, ms_level, time, ...
++ *   spectra_metadata_scans.parquet    source_index, scan_start_time,
++ *                                     ion_mobility_value, ion_mobility_type, ...
++ *   spectra_metadata_precursors.parquet
++ *                                     source_index, precursor_index,
++ *                                     isolation_window{isolation_window_target,
++ *                                       _lower_offset, _upper_offset}, ...
++ *
++ * read_spectra_metadata() finds no `spectrum` struct column in such a file and
++ * returns an EMPTY map, which surfaces downstream as ms_level 0, no isolation
++ * windows and no ion mobility (i.e. a DIA run looks like it has no windows).
++ * This overload handles that layout: it reads the flat columns and LEFT-JOINS
++ * the side tables on `source_index` (the spectrum's `index` VALUE, never a
++ * positional row number -- chunk boundaries differ per column).
++ *
++ * @p scans and @p precursors may be null; the corresponding fields are then
++ * simply absent.  Retention time is taken from scans.scan_start_time when
++ * available (seconds), else from the flat `time` column (minutes x 60).
++ */
++std::map<uint64_t, SpectrumMetadata>
++read_spectra_metadata_flat(Parquet& metadata, Parquet* scans, Parquet* precursors,
++                           Parquet* selected_ions = nullptr);
++
+ /**
+  * Read the native-id → entity-index map from a metadata Parquet table whose
+  * top-level column is named @p col_name (e.g. "chromatogram" or
+diff --git a/src/data/array_index.cpp b/src/data/array_index.cpp
+index 9d2cff6..82802b8 100644
+--- a/src/data/array_index.cpp
++++ b/src/data/array_index.cpp
+@@ -70,7 +70,10 @@ ArrayIndex::ArrayIndex(EntityType entity_type, const json::object& obj)
+ 
+         entry.array_type =
+             PSI::array_type_from_string(eo.at("array_type").as_string());
+-        entry.unit = eo.at("unit").as_string();
++        // `unit` is optional and some writers emit null rather than a string.
++        if (const auto u = eo.find("unit"); u != eo.end() && u->value().is_string()) {
++          entry.unit = u->value().as_string();
++        }
+ 
+         if (auto bp = eo.find("buffer_priority");
+             bp != eo.end() && bp->value().is_string()) {
+diff --git a/src/data/signals.cpp b/src/data/signals.cpp
+index 30777a1..23610e7 100644
+--- a/src/data/signals.cpp
++++ b/src/data/signals.cpp
+@@ -83,6 +83,13 @@ const std::shared_ptr<ArrayIndex>& Signals::array_index() const
+   return impl_->array_index_;
+ }
+ 
++/******************************************************************************/
++std::size_t Signals::row_count() const
++{
++  auto md = impl_->parquet_->file_metadata();
++  return md ? static_cast<std::size_t>(md->num_rows()) : 0;
++}
++
+ /******************************************************************************/
+ std::size_t Signals::record_count() const
+ {
+diff --git a/src/index.cpp b/src/index.cpp
+index e540a6d..6553757 100644
+--- a/src/index.cpp
++++ b/src/index.cpp
+@@ -52,6 +52,9 @@ struct Index::Impl {
+   // The mzPeak format version from metadata.version (empty if absent).
+   std::string version_;
+ 
++  // ims-compact TOF->m/z calibration from metadata.ims_calibration (if any).
++  Index::ImsCalibration ims_cal_;
++
+   // Return an iterator to the requested file.
+   std::vector<Schema::File>::const_iterator find_file(const std::string_view& name)
+   {
+@@ -68,6 +71,12 @@ Index::Index(std::unique_ptr<MzPeak::IO::Archive> archive)
+ /******************************************************************************/
+ Index::~Index() = default;
+ 
++/******************************************************************************/
++const Index::ImsCalibration& Index::ims_calibration() const
++{
++  return impl_->ims_cal_;
++}
++
+ /******************************************************************************/
+ const std::vector<Schema::File>& Index::files() const { return impl_->files_; }
+ 
+@@ -117,6 +126,34 @@ void Index::Impl::parse_index()
+         v != meta.end() && v->value().is_string()) {
+       version_ = v->value().as_string().c_str();
+     }
++    // ims-compact: {"a":..., "b":..., "mz_from_tof":"(a + b*tof)^2", ...}
++    // Writers emit this either as a JSON object or as a STRING containing that
++    // object (both seen in the wild), so accept both spellings.
++    if (const auto ic = meta.find("ims_calibration"); ic != meta.end()) {
++      json::value parsed;
++      if (ic->value().is_string()) {
++        boost::system::error_code pe;
++        parsed = json::parse(ic->value().as_string(), pe);
++        if (pe) parsed = nullptr;
++      }
++      const json::value& calv = ic->value().is_string() ? parsed : ic->value();
++      if (calv.is_object()) {
++      const json::object& cal = calv.as_object();
++      const auto num = [&](const char* k, double& dst) {
++        if (const auto f = cal.find(k); f != cal.end() && f->value().is_number()) {
++          dst = f->value().to_number<double>();
++          return true;
++        }
++        return false;
++      };
++      double a = 0.0, b = 0.0;
++      if (num("a", a) && num("b", b)) {
++        ims_cal_.a = a;
++        ims_cal_.b = b;
++        ims_cal_.valid = true;
++      }
++      }
++    }
+   }
+ 
+   // Reject a future, potentially incompatible MAJOR version (the spec is a
+@@ -160,7 +197,18 @@ Spectra Index::spectra() const
+ 
+   std::unique_ptr<Metadata::Table> meta = nullptr;
+   if (meta_file) {
+-    meta = std::make_unique<Metadata::Table>(parquet(*meta_file));
++    // mzpeak-convert >= 0.7 normalises spectrum metadata into side tables; hand
++    // them to Metadata::Table so scans (ion mobility) and precursors (isolation
++    // windows) can be joined on source_index. Absent for the older nested
++    // layout, in which case these are simply null.
++    auto side = [&](const char* name) -> std::unique_ptr<Util::Parquet> {
++      auto it = std::ranges::find(impl_->files_, name, &Schema::File::file_name);
++      return it == impl_->files_.end() ? nullptr : parquet(*it);
++    };
++    meta = std::make_unique<Metadata::Table>(parquet(*meta_file),
++                                             side("spectra_metadata_scans.parquet"),
++                                             side("spectra_metadata_precursors.parquet"),
++                                             side("spectra_metadata_selected_ions.parquet"));
+   }
+ 
+   std::unique_ptr<Data::Signals> data =
+@@ -169,10 +217,15 @@ Spectra Index::spectra() const
+   if (peaks_file) {
+     std::unique_ptr<Data::Signals> peaks =
+         std::make_unique<Data::Signals>(parquet(*peaks_file));
+-    return Spectra(std::move(data), std::move(peaks), std::move(meta));
++    // Construct in the return expression: Spectra binds its fetch callback to
++    // `this`, so a named local would leave the returned copy pointing at the
++    // destroyed one.
++    return Spectra(std::move(data), std::move(peaks), std::move(meta),
++                   impl_->ims_cal_.a, impl_->ims_cal_.b, impl_->ims_cal_.valid);
+   }
+ 
+-  return Spectra(std::move(data), std::move(meta));
++  return Spectra(std::move(data), std::move(meta),
++                 impl_->ims_cal_.a, impl_->ims_cal_.b, impl_->ims_cal_.valid);
+ }
+ 
+ /******************************************************************************/
+diff --git a/src/metadata/spectrum.cpp b/src/metadata/spectrum.cpp
+index 007671a..265d678 100644
+--- a/src/metadata/spectrum.cpp
++++ b/src/metadata/spectrum.cpp
+@@ -28,8 +28,18 @@ Spectrum::Spectrum(std::shared_ptr<Table> table, uint64_t index)
+     , ms_level_()
+     , delta_model_()
+ {
+-  if (table_ == nullptr || group_ == nullptr) {
+-    throw ParquetError("metadata file missing or does not have the spectrum group");
++  // A missing table is fatal, but a missing `spectrum` GROUP is not: mzpeak-convert >= 0.7
++  // writes spectrum metadata as FLAT top-level columns (index/id/ms_level/time/...) with no
++  // `spectrum` struct group, and emits no `mz_delta_model` column at all. Throwing here made
++  // every peak decode on such a file fail outright. Degrade instead: leave ms_level_ and
++  // delta_model_ empty, which gives the decoder a no-op DeltaEstimator -- correct when the
++  // writer stored no delta model. (ms_level for the flat layout is served from
++  // SpectrumMetadata via read_spectra_metadata_flat(), not from here.)
++  if (table_ == nullptr) {
++    throw ParquetError("metadata file missing");
++  }
++  if (group_ == nullptr) {
++    return;
+   }
+ 
+   Projection projection;
+diff --git a/src/metadata/table.cpp b/src/metadata/table.cpp
+index 1004294..8b785e5 100644
+--- a/src/metadata/table.cpp
++++ b/src/metadata/table.cpp
+@@ -20,6 +20,9 @@ namespace MzPeak::Metadata {
+ /******************************************************************************/
+ struct Table::Impl {
+   Impl(std::unique_ptr<Util::Parquet> parquet);
++  std::unique_ptr<Util::Parquet> scans_;        ///< spectra_metadata_scans (may be null)
++  std::unique_ptr<Util::Parquet> precursors_;   ///< spectra_metadata_precursors (may be null)
++  std::unique_ptr<Util::Parquet> selected_ions_; ///< spectra_metadata_selected_ions (may be null)
+   ~Impl();
+ 
+   std::unique_ptr<Util::Parquet> parquet_;
+@@ -42,6 +45,18 @@ Table::Impl::Impl(std::unique_ptr<Util::Parquet> parquet)
+ /******************************************************************************/
+ Table::Impl::~Impl() = default;
+ 
++/******************************************************************************/
++Table::Table(std::unique_ptr<Util::Parquet> main,
++             std::unique_ptr<Util::Parquet> scans,
++             std::unique_ptr<Util::Parquet> precursors,
++             std::unique_ptr<Util::Parquet> selected_ions)
++    : Table(std::move(main))
++{
++  impl_->scans_ = std::move(scans);
++  impl_->precursors_ = std::move(precursors);
++  impl_->selected_ions_ = std::move(selected_ions);
++}
++
+ /******************************************************************************/
+ Table::Table(std::unique_ptr<Util::Parquet> parquet)
+     : impl_(std::make_unique<Impl>(std::move(parquet)))
+@@ -83,7 +98,16 @@ Table::indexed(uint64_t index,
+ /******************************************************************************/
+ std::map<uint64_t, SpectrumMetadata> Table::read_spectrum_metadata() const
+ {
+-  return Util::read_spectra_metadata(*impl_->parquet_);
++  // The nested layout (one table with `spectrum`/`scan`/`precursor` STRUCT
++  // columns) and the normalised layout (flat columns + side tables) are both in
++  // the wild: mzpeak-convert >= 0.7 writes the latter. Try the nested reader
++  // first and fall back when it yields nothing, so old files keep their exact
++  // behaviour and new files stop silently reporting "no windows, no mobility".
++  auto nested = Util::read_spectra_metadata(*impl_->parquet_);
++  if (!nested.empty()) return nested;
++  return Util::read_spectra_metadata_flat(*impl_->parquet_, impl_->scans_.get(),
++                                          impl_->precursors_.get(),
++                                          impl_->selected_ions_.get());
+ }
+ 
+ } // namespace MzPeak::Metadata
+diff --git a/src/spectra.cpp b/src/spectra.cpp
+index 6881c39..d44d2bb 100644
+--- a/src/spectra.cpp
++++ b/src/spectra.cpp
+@@ -22,12 +22,16 @@ namespace MzPeak {
+ 
+ /******************************************************************************/
+ Spectra::Spectra(std::unique_ptr<Data::Signals> data,
+-                 std::unique_ptr<Metadata::Table> meta)
++                 std::unique_ptr<Metadata::Table> meta,
++                 double ims_a, double ims_b, bool ims_valid)
+     : EnumerableProxy(
+           0, std::bind(std::mem_fn(&Spectra::fetch), this, std::placeholders::_1))
+     , data_(std::move(data))
+     , peaks_()
+     , meta_(std::move(meta))
++    , ims_a_(ims_a)
++    , ims_b_(ims_b)
++    , ims_valid_(ims_valid)
+ {
+   resize(data_->record_count());
+ }
+@@ -35,12 +39,16 @@ Spectra::Spectra(std::unique_ptr<Data::Signals> data,
+ /******************************************************************************/
+ Spectra::Spectra(std::unique_ptr<Data::Signals> data,
+                  std::unique_ptr<Data::Signals> peaks,
+-                 std::unique_ptr<Metadata::Table> meta)
++                 std::unique_ptr<Metadata::Table> meta,
++                 double ims_a, double ims_b, bool ims_valid)
+     : EnumerableProxy(
+           0, std::bind(std::mem_fn(&Spectra::fetch), this, std::placeholders::_1))
+     , data_(std::move(data))
+     , peaks_(std::move(peaks))
+     , meta_(std::move(meta))
++    , ims_a_(ims_a)
++    , ims_b_(ims_b)
++    , ims_valid_(ims_valid)
+ {
+   // Both files share the same spectrum_count KV; read it from data_.
+   resize(data_->record_count());
+@@ -53,7 +61,24 @@ Spectrum Spectra::fetch(uint64_t index)
+   std::shared_ptr<Data::Signals> signals = data_;
+   if (peaks_ && meta_) {
+     auto grp = meta_->group("spectrum");
+-    if (grp) {
++    if (!grp) {
++      // FLAT metadata layout (mzpeak-convert >= 0.7): there is no `spectrum` STRUCT group to
++      // read MS:1003059 (number_of_peaks) from, so this centroid dispatch never fired and every
++      // fetch decoded the PROFILE file. For a centroid-only file that file is empty
++      // (spectra_data.parquet: 0 rows) while spectra_peaks.parquet holds the data -- which is
++      // why such files silently yielded zero peaks. When the profile file carries no rows,
++      // the peaks file IS the signal source.
++      if (data_->array_index()->dimensions().empty() || data_->row_count() == 0) {
++        signals = peaks_;
++      }
++    }
++    if (grp && data_->row_count() == 0) {
++      // Nested metadata present, but the profile file holds no rows at all --
++      // the peaks file is the only possible signal source, whatever the
++      // per-spectrum number_of_peaks says.
++      signals = peaks_;
++    }
++    else if (grp) {
+       Util::Projection proj;
+       auto peaks_col = proj.project(grp, Schema::Group::CVType("MS", "1003059"));
+       if (peaks_col.has_value()) {
+@@ -70,8 +95,15 @@ Spectrum Spectra::fetch(uint64_t index)
+ 
+   std::vector<Data::ArrayIndex::Dimension> dims =
+       signals->array_index()->dimensions() | std::views::filter([](auto& d) {
++        // Keep the ims-compact columns too: a Bruker TDF file has NO Mz
++        // dimension (a nonstandard "tof" column stands in, plus a per-peak
++        // mobility array), so filtering to Mz|Intensity alone selected nothing
++        // and every such spectrum decoded as empty.
+         return d.array_type == Schema::PSI::ArrayType::Mz ||
+-               d.array_type == Schema::PSI::ArrayType::Intensity;
++               d.array_type == Schema::PSI::ArrayType::Intensity ||
++               d.array_type == Schema::PSI::ArrayType::IonMobility ||
++               d.name.find("tof") != std::string::npos ||
++               d.name.find("mobility") != std::string::npos;
+       }) |
+       std::ranges::to<std::vector<Data::ArrayIndex::Dimension>>();
+ 
+@@ -83,7 +115,8 @@ Spectrum Spectra::fetch(uint64_t index)
+         meta_->read_spectrum_metadata());
+   }
+ 
+-  return Spectrum(index, signals, std::move(dims), meta_, md_map_);
++  return Spectrum(index, signals, std::move(dims), meta_, md_map_,
++                  ims_a_, ims_b_, ims_valid_);
+ }
+ 
+ } // namespace MzPeak
+diff --git a/src/spectrum.cpp b/src/spectrum.cpp
+index 263edfc..4dca152 100644
+--- a/src/spectrum.cpp
++++ b/src/spectrum.cpp
+@@ -20,12 +20,16 @@ Spectrum::Spectrum(
+     std::shared_ptr<Data::Signals> data,
+     std::vector<Data::ArrayIndex::Dimension> dims,
+     std::shared_ptr<Metadata::Table> metadata,
+-    std::shared_ptr<const std::map<uint64_t, SpectrumMetadata>> md_map)
++    std::shared_ptr<const std::map<uint64_t, SpectrumMetadata>> md_map,
++    double ims_a, double ims_b, bool ims_valid)
+     : index_(index)
+     , md_table_(std::move(metadata))
+     , md_map_(std::move(md_map))
+     , signals_(std::move(data))
+     , dims_(std::move(dims))
++    , ims_a_(ims_a)
++    , ims_b_(ims_b)
++    , ims_valid_(ims_valid)
+ {
+ }
+ 
+@@ -45,11 +49,41 @@ void Spectrum::decode_() const
+   decoder_type decoder(signals_, std::move(slice),
+                        Util::DeltaEstimator<double>(md_spec.delta_model()));
+ 
++  // ims-compact (Bruker TDF) stores NO m/z array: a nonstandard "tof" Int32
++  // column stands in for it and m/z is reconstructed as (a + b*tof)^2 from the
++  // index calibration. It also carries a per-peak
++  // MeanInverseReducedIonMobilityArray. Decode those here; without this the
++  // Mz/Intensity filter below matches nothing and the spectrum reads as empty.
++  std::vector<double> tof;
+   for (const auto& dim : dims_) {
+     if (dim.array_type == Schema::PSI::ArrayType::Mz) {
+       decoder.decimal(dim, mz_);
+     } else if (dim.array_type == Schema::PSI::ArrayType::Intensity) {
+-      decoder.decimal(dim, intensity_);
++      // Bruker TDF stores intensities as INT32, and decimal() throws on integer
++      // types. Dispatch on the column's declared type rather than widening
++      // decimal() itself: doing that instantiates the delta estimator for 8-bit
++      // types, which Boost's median() does not compile for.
++      const Util::Type it = dim.type_or_throw();
++      if (it == Util::Type::Int32 || it == Util::Type::Int64) {
++        decoder.integer(dim, intensity_);
++      } else {
++        decoder.decimal(dim, intensity_);
++      }
++    } else if (dim.array_type == Schema::PSI::ArrayType::IonMobility ||
++               dim.name.find("mobility") != std::string::npos) {
++      // The converter writes MeanInverseReducedIonMobilityArray (MS:1002816),
++      // which this enum does not model, so it arrives as NonStandard: match on
++      // the column name as well as the modelled IonMobility term.
++      decoder.decimal(dim, mobility_);
++    } else if (dim.name.find("tof") != std::string::npos) {
++      decoder.integer(dim, tof);
++    }
++  }
++  if (mz_.empty() && !tof.empty() && ims_valid_) {
++    mz_.reserve(tof.size());
++    for (double t : tof) {
++      const double r = ims_a_ + ims_b_ * t;
++      mz_.push_back(r * r);
+     }
+   }
+   decoded_ = true;
+@@ -69,6 +103,13 @@ const std::vector<float>& Spectrum::intensity() const
+   return intensity_;
+ }
+ 
++/******************************************************************************/
++const std::vector<double>& Spectrum::ion_mobility_array() const
++{
++  decode_();
++  return mobility_;
++}
++
+ /******************************************************************************/
+ const SpectrumMetadata& Spectrum::metadata() const
+ {
+diff --git a/src/util/metadata_model.cpp b/src/util/metadata_model.cpp
+index f52ac8d..f5fc294 100644
+--- a/src/util/metadata_model.cpp
++++ b/src/util/metadata_model.cpp
+@@ -343,6 +343,258 @@ std::map<uint64_t, std::vector<double>> read_mz_delta_models(Parquet& metadata)
+   return out;
+ }
+ 
++/******************************************************************************/
++namespace {
++
++/// Chunk-walking accessor for a flat top-level column: calls @p fn(row_index_in_
++/// file, typed_array, row_in_chunk) for every row, so callers never depend on
++/// chunk boundaries (they differ per column).
++template <typename ArrayT, typename Fn>
++void for_each_row(const std::shared_ptr<arrow::ChunkedArray>& col, Fn&& fn)
++{
++  if (!col) return;
++  int64_t base = 0;
++  for (const auto& chunk : col->chunks()) {
++    auto arr = std::dynamic_pointer_cast<ArrayT>(chunk);
++    if (arr) {
++      for (int64_t r = 0; r < arr->length(); ++r) fn(base + r, *arr, r);
++    }
++    base += chunk->length();
++  }
++}
++
++/// Read a whole numeric column into a dense vector indexed by file row, with a
++/// parallel validity mask. Handles the width the writer actually used.
++template <typename ArrayT, typename V>
++void column_to_vector(const std::shared_ptr<arrow::Table>& t, const char* name,
++                      std::vector<V>& out, std::vector<char>& valid)
++{
++  auto col = t ? t->GetColumnByName(name) : nullptr;
++  if (!col) return;
++  out.assign(static_cast<std::size_t>(col->length()), V{});
++  valid.assign(static_cast<std::size_t>(col->length()), 0);
++  for_each_row<ArrayT>(col, [&](int64_t i, const ArrayT& a, int64_t r) {
++    if (!a.IsNull(r)) { out[static_cast<std::size_t>(i)] = static_cast<V>(a.Value(r));
++                        valid[static_cast<std::size_t>(i)] = 1; }
++  });
++}
++
++} // namespace
++
++/******************************************************************************/
++std::map<uint64_t, SpectrumMetadata>
++read_spectra_metadata_flat(Parquet& metadata, Parquet* scans, Parquet* precursors,
++                           Parquet* selected_ions)
++{
++  std::map<uint64_t, SpectrumMetadata> out;
++  auto table = read_metadata_table(metadata);
++  if (!table) return out;
++
++  // ---- PASS 1: the flat spectrum columns -----------------------------------
++  auto idx_col = table->GetColumnByName("index");
++  if (!idx_col) return out;                       // not the flat layout after all
++  auto id_col       = table->GetColumnByName("id");
++  auto mslevel_col  = table->GetColumnByName("ms_level");
++  auto time_col     = table->GetColumnByName("time");
++  auto pol_col      = table->GetColumnByName("scan_polarity");
++  auto repr_col     = table->GetColumnByName("spectrum_representation");
++  auto stype_col    = table->GetColumnByName("spectrum_type");
++  auto ndp_col      = table->GetColumnByName("number_of_data_points");
++
++  // index -> the SpectrumMetadata being built (join key is the VALUE, not a row)
++  std::vector<uint64_t> row_index;                // file row -> index value
++  for_each_row<arrow::UInt64Array>(idx_col, [&](int64_t, const arrow::UInt64Array& a, int64_t r) {
++    row_index.push_back(a.IsNull(r) ? 0 : a.Value(r));
++  });
++
++  auto str_at = [](const std::shared_ptr<arrow::ChunkedArray>& col, int64_t want) -> std::string {
++    std::string v; int64_t base = 0;
++    if (!col) return v;
++    for (const auto& chunk : col->chunks()) {
++      if (want < base + chunk->length()) {
++        const int64_t r = want - base;
++        if (auto a = std::dynamic_pointer_cast<arrow::LargeStringArray>(chunk))
++          { if (!a->IsNull(r)) v = a->GetString(r); }
++        else if (auto b = std::dynamic_pointer_cast<arrow::StringArray>(chunk))
++          { if (!b->IsNull(r)) v = b->GetString(r); }
++        break;
++      }
++      base += chunk->length();
++    }
++    return v;
++  };
++
++  std::vector<double> ms_v, time_v, pol_v, ndp_v;
++  std::vector<char>   ms_ok, time_ok, pol_ok, ndp_ok;
++  column_to_vector<arrow::UInt8Array, double>(table, "ms_level", ms_v, ms_ok);
++  column_to_vector<arrow::DoubleArray, double>(table, "time", time_v, time_ok);
++  column_to_vector<arrow::Int8Array,  double>(table, "scan_polarity", pol_v, pol_ok);
++  column_to_vector<arrow::UInt64Array, double>(table, "number_of_data_points", ndp_v, ndp_ok);
++
++  for (std::size_t r = 0; r < row_index.size(); ++r) {
++    SpectrumMetadata m;
++    m.index = row_index[r];
++    m.id    = str_at(id_col, static_cast<int64_t>(r));
++    if (r < ms_ok.size()  && ms_ok[r])  m.ms_level = static_cast<int>(ms_v[r]);
++    if (r < pol_ok.size() && pol_ok[r]) m.polarity = static_cast<int>(pol_v[r]);
++    if (r < ndp_ok.size() && ndp_ok[r]) m.number_of_data_points = static_cast<uint64_t>(ndp_v[r]);
++    // `time` is minutes (same convention as the nested layout); scans override below.
++    if (r < time_ok.size() && time_ok[r]) m.retention_time = time_v[r] * 60.0;
++    m.representation = str_at(repr_col, static_cast<int64_t>(r));
++    m.spectrum_type  = str_at(stype_col, static_cast<int64_t>(r));
++    out[m.index] = std::move(m);
++  }
++
++  // ---- PASS 2: scans side table -> retention time + ion mobility ------------
++  if (scans) {
++    auto st = read_metadata_table(*scans);
++    if (st) {
++      std::vector<double> src, rt, im;
++      std::vector<char> src_ok, rt_ok, im_ok;
++      column_to_vector<arrow::UInt64Array, double>(st, "source_index", src, src_ok);
++      column_to_vector<arrow::FloatArray,  double>(st, "scan_start_time", rt, rt_ok);
++      column_to_vector<arrow::DoubleArray, double>(st, "ion_mobility_value", im, im_ok);
++      auto imtype = st->GetColumnByName("ion_mobility_type");
++      for (std::size_t r = 0; r < src_ok.size(); ++r) {
++        if (!src_ok[r]) continue;
++        auto it = out.find(static_cast<uint64_t>(src[r]));
++        if (it == out.end()) continue;            // unmatched source_index: skip, no silent merge
++        // scan_start_time is minutes (UO_0000031), like the nested layout.
++        if (r < rt_ok.size() && rt_ok[r]) it->second.retention_time = rt[r] * 60.0;
++        if (r < im_ok.size() && im_ok[r]) {
++          it->second.ion_mobility = im[r];
++          it->second.ion_mobility_type = str_at(imtype, static_cast<int64_t>(r));
++        }
++      }
++    }
++  }
++
++  // ---- PASS 3: precursors side table -> isolation windows ------------------
++  if (precursors) {
++    auto pt = read_metadata_table(*precursors);
++    if (pt) {
++      std::vector<double> src; std::vector<char> src_ok;
++      column_to_vector<arrow::UInt64Array, double>(pt, "source_index", src, src_ok);
++      auto iso_col = pt->GetColumnByName("isolation_window");
++      // isolation_window is a struct<isolation_window_target, _lower_offset,
++      // _upper_offset, parameters>; walk it in file-row order to stay aligned
++      // with source_index.
++      std::vector<double> tgt, lo, hi; std::vector<char> tgt_ok, lo_ok, hi_ok;
++      if (iso_col) {
++        const int64_t n = iso_col->length();
++        tgt.assign(n, 0); lo.assign(n, 0); hi.assign(n, 0);
++        tgt_ok.assign(n, 0); lo_ok.assign(n, 0); hi_ok.assign(n, 0);
++        int64_t base = 0;
++        for (const auto& chunk : iso_col->chunks()) {
++          auto st_arr = std::dynamic_pointer_cast<arrow::StructArray>(chunk);
++          if (st_arr) {
++            auto f_t = std::dynamic_pointer_cast<arrow::FloatArray>(st_arr->GetFieldByName("isolation_window_target"));
++            auto f_l = std::dynamic_pointer_cast<arrow::FloatArray>(st_arr->GetFieldByName("isolation_window_lower_offset"));
++            auto f_u = std::dynamic_pointer_cast<arrow::FloatArray>(st_arr->GetFieldByName("isolation_window_upper_offset"));
++            for (int64_t r = 0; r < st_arr->length(); ++r) {
++              const std::size_t i = static_cast<std::size_t>(base + r);
++              if (st_arr->IsNull(r)) continue;
++              if (f_t && !f_t->IsNull(r)) { tgt[i] = f_t->Value(r); tgt_ok[i] = 1; }
++              if (f_l && !f_l->IsNull(r)) { lo[i]  = f_l->Value(r); lo_ok[i]  = 1; }
++              if (f_u && !f_u->IsNull(r)) { hi[i]  = f_u->Value(r); hi_ok[i]  = 1; }
++            }
++          }
++          base += chunk->length();
++        }
++      }
++      // ---- PASS 4: selected_ions side table ---------------------------------
++      // Carries each isolation window's ion_mobility_value -- for diaPASEF this is
++      // the mobility MIDPOINT of the window's scan range, and it is the only thing
++      // that distinguishes the N windows a single frame carries. Without it every
++      // window of a frame looks identical in mobility and half of them are lost.
++      //
++      // Both side tables leave precursor_index NULL, so the pairing has to be
++      // POSITIONAL (row r of precursors <-> row r of selected_ions). That is only
++      // valid if the two tables agree row-for-row, so verify it instead of
++      // assuming, and skip the attach entirely if they do not.
++      std::vector<double> si_src, si_im, si_mz, si_int, si_lo, si_hi;
++      std::vector<char> si_src_ok, si_im_ok, si_mz_ok, si_int_ok, si_lo_ok, si_hi_ok;
++      std::shared_ptr<arrow::Table> sit;
++      if (selected_ions) {
++        sit = read_metadata_table(*selected_ions);
++        if (sit) {
++          column_to_vector<arrow::UInt64Array, double>(sit, "source_index", si_src, si_src_ok);
++          column_to_vector<arrow::DoubleArray, double>(sit, "ion_mobility_value", si_im, si_im_ok);
++          column_to_vector<arrow::DoubleArray, double>(sit, "selected_ion_mz", si_mz, si_mz_ok);
++          column_to_vector<arrow::FloatArray,  double>(sit, "peak_intensity", si_int, si_int_ok);
++
++          // The isolation window's mobility BOUNDS ride in the selected-ion `parameters`
++          // list, matched by name: PSI-MS has no term for them, and a non-standard
++          // accession cannot be encoded (mzdata panics on unknown CVs), so the writer
++          // emits them name-only.
++          auto par_col = sit->GetColumnByName("parameters");
++          if (par_col) {
++            si_lo.assign(par_col->length(), 0.0); si_lo_ok.assign(par_col->length(), 0);
++            si_hi.assign(par_col->length(), 0.0); si_hi_ok.assign(par_col->length(), 0);
++            int64_t base = 0;
++            for (const auto& chunk : par_col->chunks()) {
++              auto lst = std::dynamic_pointer_cast<arrow::LargeListArray>(chunk);
++              if (!lst) { base += chunk->length(); continue; }
++              auto items = std::dynamic_pointer_cast<arrow::StructArray>(lst->values());
++              if (!items) { base += chunk->length(); continue; }
++              auto nm = std::dynamic_pointer_cast<arrow::LargeStringArray>(items->GetFieldByName("name"));
++              auto val = std::dynamic_pointer_cast<arrow::StructArray>(items->GetFieldByName("value"));
++              auto fl = val ? std::dynamic_pointer_cast<arrow::DoubleArray>(val->GetFieldByName("float")) : nullptr;
++              if (!nm || !fl) { base += chunk->length(); continue; }
++              for (int64_t r = 0; r < lst->length(); ++r) {
++                if (lst->IsNull(r)) continue;
++                const std::size_t row = static_cast<std::size_t>(base + r);
++                for (int64_t k = lst->value_offset(r); k < lst->value_offset(r + 1); ++k) {
++                  if (nm->IsNull(k) || fl->IsNull(k)) continue;
++                  const std::string_view n = nm->GetView(k);
++                  if (n.find("ion mobility lower limit") != std::string_view::npos) {
++                    si_lo[row] = fl->Value(k); si_lo_ok[row] = 1;
++                  } else if (n.find("ion mobility upper limit") != std::string_view::npos) {
++                    si_hi[row] = fl->Value(k); si_hi_ok[row] = 1;
++                  }
++                }
++              }
++              base += chunk->length();
++            }
++          }
++        }
++      }
++      bool aligned = !si_src.empty() && si_src.size() == src.size();
++      for (std::size_t r = 0; aligned && r < src.size(); ++r) {
++        if (src_ok[r] != si_src_ok[r] || (src_ok[r] && src[r] != si_src[r])) aligned = false;
++      }
++      if (!si_src.empty() && !aligned) {
++        std::fprintf(stderr,
++                     "mzpeak: selected_ions does not align row-for-row with precursors "
++                     "(%zu vs %zu rows); ion mobility per isolation window not attached\n",
++                     si_src.size(), src.size());
++      }
++
++      for (std::size_t r = 0; r < src_ok.size(); ++r) {
++        if (!src_ok[r]) continue;
++        auto it = out.find(static_cast<uint64_t>(src[r]));
++        if (it == out.end()) continue;
++        PrecursorInfo pi;
++        if (r < tgt_ok.size() && tgt_ok[r]) pi.isolation_window.target_mz = static_cast<float>(tgt[r]);
++        if (r < lo_ok.size()  && lo_ok[r])  pi.isolation_window.lower_offset = static_cast<float>(lo[r]);
++        if (r < hi_ok.size()  && hi_ok[r])  pi.isolation_window.upper_offset = static_cast<float>(hi[r]);
++        if (aligned) {
++          SelectedIonInfo ion;
++          if (r < si_mz_ok.size()  && si_mz_ok[r])  ion.selected_ion_mz = si_mz[r];
++          if (r < si_int_ok.size() && si_int_ok[r]) ion.intensity = static_cast<float>(si_int[r]);
++          if (r < si_im_ok.size()  && si_im_ok[r])  ion.ion_mobility_value = si_im[r];
++          if (r < si_lo_ok.size()  && si_lo_ok[r])  ion.ion_mobility_lower_limit = si_lo[r];
++          if (r < si_hi_ok.size()  && si_hi_ok[r])  ion.ion_mobility_upper_limit = si_hi[r];
++          if (ion.selected_ion_mz || ion.ion_mobility_value) pi.selected_ions.push_back(std::move(ion));
++        }
++        it->second.precursors.push_back(std::move(pi));
++      }
++    }
++  }
++
++  return out;
++}
++
+ /******************************************************************************/
+ std::map<uint64_t, SpectrumMetadata> read_spectra_metadata(Parquet& metadata)
+ {
