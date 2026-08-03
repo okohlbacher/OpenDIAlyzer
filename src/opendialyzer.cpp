@@ -163,7 +163,10 @@ protected:
                           "screen and the scoring want opposite widths: narrow loses real "
                           "precursors before scoring, wide only costs the screen some specificity. "
                           "Try 2-3x -mz_extraction_window.", false, true);
-    registerIntOption_("prefilter_min_fragments", "<n>", 3,
+    // RESTORED TO 4. Dropped to 3 on 2026-08-02 on the reasoning that the prefilter was masking a
+    // scoring failure, and measured -1350 identifications for it; also ~913k extra candidates, which
+    // cost 2.5x wall and 1.6x peak RSS. Reverted to the best-known value on request.
+    registerIntOption_("prefilter_min_fragments", "<n>", 4,
                        "MS2 evidence threshold: distinct library fragments (from the top-6 by "
                        "predicted intensity) that must match in one spectrum for a precursor to "
                        "survive -prefilter. MEASURED enrichment of true IDs by match depth: 730 per "
@@ -446,8 +449,26 @@ protected:
     // key lever to recover the narrow-pass collapse (predicted-RT residual p95 ~342s >> window).
     registerStringOption_("empirical_rt", "true|false", "false", "Pass-2+: replace predicted RT of every pass-1-seen precursor (target AND decoy) with its OWN measured apex RT (DIA-NN-style empirical library; symmetric -> FDR-safe).", false);
     setValidStrings_("empirical_rt", {"true", "false"});
-    registerDoubleOption_("mz_extraction_window", "<ppm>", 30.0, "MS2 m/z window (ppm).", false);
-    registerDoubleOption_("mz_extraction_window_ms1", "<ppm>", 30.0, "MS1 m/z window (ppm).", false);
+    // NO DEFAULT. -1 means "not given": the window is then whatever the run's own mass calibration
+    // infers, wider or narrower. Naming a default up front is a guess about the instrument, and a
+    // wrong guess is silently expensive in both directions -- too wide admits interference, too
+    // narrow discards real fragments before anything can score them.
+    //
+    // The "calibration may only narrow" clamp therefore applies ONLY when a value was configured
+    // explicitly. It exists because an UNGATED estimate once cost 2,302 identifications: an MS1 fit
+    // returned offset 24.6 ppm / sigma 24.2 ppm / peakedness exactly 3.0 -- noise filling the 50 ppm
+    // bootstrap window and squeaking past the gate -- and set MS1 to 72.6 ppm on an instrument
+    // measured at 1.66 ppm, taking IDs from 6,798 to 4,496. With no configured ceiling that rail is
+    // gone, so two others carry the weight: the peakedness gate (which rejected exactly that fit
+    // when it was tightened), and a cap at -mz_calib_bootstrap_ppm, since an estimate cannot
+    // legitimately be wider than the window it searched.
+    registerDoubleOption_("mz_extraction_window", "<ppm>", -1.0,
+                          "MS2 m/z window (ppm). UNSET by default: the run's own mass calibration "
+                          "supplies it. Give a value to pin it, in which case calibration may only "
+                          "narrow from there.", false);
+    registerDoubleOption_("mz_extraction_window_ms1", "<ppm>", -1.0,
+                          "MS1 m/z window (ppm). UNSET by default; falls back to the MS2 window "
+                          "when neither is configured nor inferred.", false);
     registerDoubleOption_("ion_mobility_window", "<1/K0>", -1.0,
                           "Ion-mobility extraction window. -1 = OFF, which is required for data "
                           "with no ion-mobility dimension; with -pasef auto this is switched on "
@@ -910,6 +931,49 @@ protected:
   // makeChromParams_ keeps the configured -mz_extraction_window.
   mutable double inferred_mz_window_ms2_ = -1.0;
   mutable double inferred_mz_window_ms1_ = -1.0;
+
+  /// The m/z window to EXTRACT with. Precedence: inferred from this run > configured > fallback.
+  ///
+  /// Inferred wins deliberately, and it is safe to let it: when a value WAS configured the estimate
+  /// has already been clamped against it (calibration may only narrow), so "inferred first" is
+  /// really "the narrower of the two". When nothing was configured there is nothing to clamp
+  /// against and the estimate stands on its own -- which is the point of having no default.
+  double effectiveMzWindow_(bool ms1) const
+  {
+    const double inf = ms1 ? inferred_mz_window_ms1_ : inferred_mz_window_ms2_;
+    if (inf > 0.0) { return inf; }
+    const double cfg = ms1 ? getDoubleOption_("mz_extraction_window_ms1")
+                           : getDoubleOption_("mz_extraction_window");
+    if (cfg > 0.0) { return cfg; }
+    // MS1 unset and uninferred: use MS2's answer rather than the bootstrap. Same instrument, and
+    // MS2 has far more anchors to fit from.
+    if (ms1)
+    {
+      const double ms2 = effectiveMzWindow_(false);
+      if (ms2 > 0.0) { return ms2; }
+    }
+    // Nothing configured, nothing inferred: the width the anchor search itself used. Not a default
+    // in disguise -- it is the only number known to be wide enough to have found anything, and it
+    // applies only when calibration declined to produce an estimate (too few anchors, or residuals
+    // too flat to mean anything).
+    return getDoubleOption_("mz_calib_bootstrap_ppm");
+  }
+
+  /// The window the CALLER asserted, for deciding how wide to SEARCH when measuring mass error.
+  /// Deliberately not effectiveMzWindow_(): searching around an inferred value would make the
+  /// estimate depend on the previous estimate, which is a feedback loop that can only shrink.
+  double configuredMzWindow_(bool ms1) const
+  {
+    const double cfg = ms1 ? getDoubleOption_("mz_extraction_window_ms1")
+                           : getDoubleOption_("mz_extraction_window");
+    if (cfg > 0.0) { return cfg; }
+    if (ms1)
+    {
+      const double ms2 = getDoubleOption_("mz_extraction_window");
+      if (ms2 > 0.0) { return ms2; }
+    }
+    return getDoubleOption_("mz_calib_bootstrap_ppm");
+  }
 
   bool loadDIARun_(const std::string& in, std::shared_ptr<ExperimentalSettings>& exp_meta,
                    std::vector<OpenSwath::SwathMap>& swath_maps, const std::string& tmp)
@@ -2578,10 +2642,28 @@ protected:
     // offset 24.6 ppm, sigma 24.2 ppm, peakedness exactly 3.0 -- noise filling the 50 ppm bootstrap
     // window, squeaking past the gate -- and set the MS1 window to 72.6 ppm on an instrument
     // measured at 1.66 ppm. Identifications fell from 6,798 to 4,496.
+    // Only a value the CALLER pinned may clamp the estimate. Unset means "tell me what this run
+    // says", and clamping that against a number nobody chose would silently reinstate a default.
     const double cfg_ms2 = getDoubleOption_("mz_extraction_window");
     const double cfg_ms1 = getDoubleOption_("mz_extraction_window_ms1") > 0.0
                              ? getDoubleOption_("mz_extraction_window_ms1") : cfg_ms2;
-    if (ms2 > cfg_ms2)
+    // An estimate can never legitimately exceed the width it searched -- that is a fit to the edge
+    // of the bootstrap window, i.e. noise. Applies whether or not a value was configured.
+    const double boot = getDoubleOption_("mz_calib_bootstrap_ppm");
+    if (ms2 > boot)
+    {
+      OPENMS_LOG_WARN << "OpenDIAlyzer: MS2 calibration returned " << ms2 << " ppm, at or beyond the "
+                      << boot << " ppm search width -- that is a fit to the window edge, not the "
+                      << "instrument. Rejecting." << std::endl;
+      ms2 = -1.0;
+    }
+    if (ms1 > boot)
+    {
+      OPENMS_LOG_WARN << "OpenDIAlyzer: MS1 calibration returned " << ms1 << " ppm, at or beyond the "
+                      << boot << " ppm search width -- rejecting (same rule)." << std::endl;
+      ms1 = -1.0;
+    }
+    if (cfg_ms2 > 0.0 && ms2 > cfg_ms2)
     {
       OPENMS_LOG_WARN << "OpenDIAlyzer: MS2 mass calibration returned " << ms2 << " ppm, WIDER than "
                       << "the configured " << cfg_ms2 << " ppm -- rejecting it. Calibration may only "
@@ -2589,7 +2671,7 @@ protected:
                       << std::endl;
       ms2 = -1.0;
     }
-    if (ms1 > cfg_ms1)
+    if (cfg_ms1 > 0.0 && ms1 > cfg_ms1)
     {
       OPENMS_LOG_WARN << "OpenDIAlyzer: MS1 mass calibration returned " << ms1 << " ppm, WIDER than "
                       << "the configured " << cfg_ms1 << " ppm -- rejecting it (same rule)."
@@ -2658,9 +2740,7 @@ protected:
     // Searching wider than that assertion cannot find signal it excludes; it can only add noise.
     // Search 3x the asserted half-width: wide enough to see the distribution's shape and its
     // shoulders, narrow enough that the sample is mostly real.
-    const double cfg_full = ms1 && getDoubleOption_("mz_extraction_window_ms1") > 0.0
-                              ? getDoubleOption_("mz_extraction_window_ms1")
-                              : getDoubleOption_("mz_extraction_window");
+    const double cfg_full = configuredMzWindow_(ms1);
     const double boot = std::min(getDoubleOption_("mz_calib_bootstrap_ppm"),
                                  cfg_full > 0.0 ? 1.5 * cfg_full : 50.0);   // 3x the half-width
     const int    min_n = getIntOption_("mz_calib_min_anchors");
@@ -3073,10 +3153,13 @@ protected:
     // one; it is expressed in ppm by contract, so the unit flag is forced to match.
     // mz_window_override lets the PREFILTER screen at a different width than extraction scores at
     // -- see -prefilter_mz_extraction_window.
-    cp.mz_extraction_window = (mz_window_override > 0.0)     ? mz_window_override
-                            : (inferred_mz_window_ms2_ > 0.0) ? inferred_mz_window_ms2_
-                                                              : getDoubleOption_("mz_extraction_window");
-    cp.ppm = (inferred_mz_window_ms2_ > 0.0) || (getStringOption_("mz_extraction_window_unit") == "ppm");
+    cp.mz_extraction_window = (mz_window_override > 0.0) ? mz_window_override
+                                                         : effectiveMzWindow_(false);
+    // ppm when the width came from an inference or from the bootstrap (both ppm by construction),
+    // otherwise whatever unit the caller declared for their own value.
+    cp.ppm = (inferred_mz_window_ms2_ > 0.0)
+             || (getDoubleOption_("mz_extraction_window") <= 0.0)
+             || (getStringOption_("mz_extraction_window_unit") == "ppm");
     cp.rt_extraction_window = rt_window;                       // < 0 -> whole RT range
     // Requesting IM extraction on data WITHOUT an ion-mobility array is a hard abort in
     // ChromatogramExtractorAlgorithm.cpp:307 ("Requested ion mobility extraction but no ion
@@ -3097,10 +3180,9 @@ protected:
   ChromExtractParams makeMs1ChromParams_(const ChromExtractParams& cp) const
   {
     ChromExtractParams cp_ms1 = cp;
-    cp_ms1.mz_extraction_window = (inferred_mz_window_ms1_ > 0.0)
-                                    ? inferred_mz_window_ms1_
-                                    : getDoubleOption_("mz_extraction_window_ms1");
+    cp_ms1.mz_extraction_window = effectiveMzWindow_(true);
     cp_ms1.ppm = (inferred_mz_window_ms1_ > 0.0)
+                 || (getDoubleOption_("mz_extraction_window_ms1") <= 0.0)
                  || (getStringOption_("mz_extraction_window_ms1_unit") == "ppm");
     cp_ms1.im_extraction_window = getDoubleOption_("im_extraction_window_ms1");
     return cp_ms1;
