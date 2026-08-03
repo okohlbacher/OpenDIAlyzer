@@ -191,6 +191,30 @@ int main()
     std::printf("  Float32 encoding: exact (rel err 0)\n");
   }
 
+  // ---- 7. recalibration re-times every chromatogram without touching one of them --------------
+  // The reason chromatograms hold indices rather than seconds: a re-timed run rewrites ~150 small
+  // axes, not 4.46M chromatograms, and nothing can be left on the old calibration because nothing
+  // else stores an RT.
+  {
+    ChromStore st;
+    const std::uint32_t a = st.addAxis(axis);
+    const std::size_t i5 = st.add(a, start, sig);
+    std::vector<double> r5; std::vector<float> g5;
+    st.get(i5, r5, g5);
+    const double t_before = r5.front();
+    const float  i_before = g5[600];
+
+    st.recalibrateAxes([](double s) { return 1.02 * s - 3.0; });
+
+    std::vector<double> r6; std::vector<float> g6;
+    st.get(i5, r6, g6);
+    CHECK(r6.size() == r5.size());                       // same points
+    CHECK(std::abs(r6.front() - (1.02 * t_before - 3.0)) < 1e-9);
+    CHECK(g6[600] == i_before);                          // intensities untouched
+    std::printf("  recalibrate: %.2f -> %.2f s, %zu points and all intensities unchanged\n",
+                t_before, r6.front(), r6.size());
+  }
+
   if (g_fail) { std::printf("odia_chromstore_test FAILED (%d)\n", g_fail); return 1; }
   std::printf("odia_chromstore_test OK\n");
   return 0;

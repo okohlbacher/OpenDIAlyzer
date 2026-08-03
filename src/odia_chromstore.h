@@ -55,6 +55,8 @@
 // ChromEncoding::Float32 remains, so a suspected quantisation effect can be ruled out by changing
 // one value rather than by reasoning about it.
 
+#include "odia_rtaxis.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -81,22 +83,12 @@ enum class ChromEncoding
 /// across it give (1e4)^(1/254) - 1 = 3.7% relative precision at EVERY intensity.
 inline constexpr double kChromLogDynamicRange = 1.0e4;
 
-/// The shared time axis of one SWATH window. Chromatograms reference it by index.
-struct ChromAxis
-{
-  std::vector<double> rt;      ///< ascending cycle times, seconds
-
-  /// First index with rt >= t (lower_bound). Used to turn an RT window into a slice.
-  std::size_t lower(double t) const
-  {
-    return static_cast<std::size_t>(std::lower_bound(rt.begin(), rt.end(), t) - rt.begin());
-  }
-  /// First index with rt > t (upper_bound).
-  std::size_t upper(double t) const
-  {
-    return static_cast<std::size_t>(std::upper_bound(rt.begin(), rt.end(), t) - rt.begin());
-  }
-};
+/// The shared time axis of one SWATH window.
+///
+/// This is an odia::RtAxis, deliberately: it is the ONE type in the tool that turns an index into
+/// seconds, so recalibrating a run is a single call on each axis and every chromatogram's stored
+/// (start, length) stays valid untouched. See odia_rtaxis.h for the rule.
+using ChromAxis = RtAxis;
 
 /// A stored chromatogram: no times, just where it starts on its window's axis and how long it is.
 struct ChromRef
@@ -119,14 +111,19 @@ class ChromStore
 public:
   explicit ChromStore(ChromEncoding enc = ChromEncoding::Quantised8Log) : enc_(enc) {}
 
+  /// Recalibrate every axis, keeping all stored (start, length) valid. This is why chromatograms
+  /// hold indices and not times: a re-timed run touches ~150 small arrays, not 4.46M chromatograms,
+  /// and nothing can be left on the old calibration because nothing else stores an RT.
+  template <typename Fn>
+  void recalibrateAxes(Fn&& map)
+  {
+    for (auto& a : axes_) { a.recalibrate(map); }
+  }
+
   /// Register a window's time axis; returns its id. Axes are few (one per SWATH window) and small.
   std::uint32_t addAxis(std::vector<double> rt)
   {
-    if (!std::is_sorted(rt.begin(), rt.end()))
-    {
-      throw std::invalid_argument("odia::ChromStore: axis retention times must be ascending");
-    }
-    axes_.push_back(ChromAxis{std::move(rt)});
+    axes_.emplace_back(std::move(rt));            // RtAxis rejects a non-ascending grid
     return static_cast<std::uint32_t>(axes_.size() - 1);
   }
 
@@ -141,7 +138,7 @@ public:
   std::size_t add(std::uint32_t axis_id, std::uint32_t start, const std::vector<float>& intensity)
   {
     const ChromAxis& a = axes_.at(axis_id);
-    if (static_cast<std::size_t>(start) + intensity.size() > a.rt.size())
+    if (static_cast<std::size_t>(start) + intensity.size() > a.size())
     {
       throw std::out_of_range("odia::ChromStore::add: slice extends past the axis");
     }
@@ -237,7 +234,7 @@ public:
     const ChromAxis& a = axes_.at(r.axis);
     rt.resize(n);
     intensity.resize(n);
-    for (std::uint32_t k = 0; k < n; ++k) { rt[k] = a.rt[r.start + from + k]; }
+    for (std::uint32_t k = 0; k < n; ++k) { rt[k] = a.seconds(r.start + from + k); }
 
     if (enc_ == ChromEncoding::Float32)
     {
@@ -285,8 +282,13 @@ public:
   {
     const ChromRef& r = refs_.at(i);
     const ChromAxis& a = axes_.at(r.axis);
-    const std::size_t lo = std::max<std::size_t>(a.lower(rt_low), r.start);
-    const std::size_t hi = std::min<std::size_t>(a.upper(rt_high), r.start + r.length);
+    // lower_bound / upper_bound on the axis, then intersect with what this chromatogram covers.
+    const auto& g = a.seconds();
+    const std::size_t lo = std::max<std::size_t>(
+      static_cast<std::size_t>(std::lower_bound(g.begin(), g.end(), rt_low) - g.begin()), r.start);
+    const std::size_t hi = std::min<std::size_t>(
+      static_cast<std::size_t>(std::upper_bound(g.begin(), g.end(), rt_high) - g.begin()),
+      r.start + r.length);
     if (hi <= lo) { rt.clear(); intensity.clear(); return 0; }
     const std::uint32_t from = static_cast<std::uint32_t>(lo - r.start);
     const std::uint32_t n = static_cast<std::uint32_t>(hi - lo);
@@ -298,7 +300,7 @@ public:
   std::size_t bytes() const
   {
     std::size_t b = blob_.capacity() + refs_.capacity() * sizeof(ChromRef);
-    for (const auto& a : axes_) { b += a.rt.capacity() * sizeof(double); }
+    for (const auto& a : axes_) { b += a.seconds().capacity() * sizeof(double); }
     return b;
   }
 

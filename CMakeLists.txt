@@ -72,6 +72,7 @@ add_executable(odia-anchor-training-test src/odia_anchor_training_test.cpp)
 add_executable(odia-ablate src/odia_ablate.cpp)
 add_executable(odia-nn-diag src/odia_nn_diag.cpp)
 add_executable(odia-chromstore-test src/odia_chromstore_test.cpp)
+add_executable(odia-rtaxis-test src/odia_rtaxis_test.cpp)
 
 # The semi-supervised loop on a REAL score matrix (44,568 peak groups x 29 sub-scores extracted
 # from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
@@ -177,6 +178,7 @@ add_test(NAME odia-gbt-serial COMMAND odia-gbt-test-serial)
 add_test(NAME odia-nn COMMAND odia-nn-test)
 add_test(NAME odia-anchor-training COMMAND odia-anchor-training-test)
 add_test(NAME odia-chromstore COMMAND odia-chromstore-test)
+add_test(NAME odia-rtaxis COMMAND odia-rtaxis-test)
 add_test(NAME odia-lda-realdata
          COMMAND odia-lda-realdata-test "${CMAKE_CURRENT_SOURCE_DIR}/testdata/lda_fixture.txt")
 set_tests_properties(odia-lda-realdata PROPERTIES SKIP_RETURN_CODE 77)
