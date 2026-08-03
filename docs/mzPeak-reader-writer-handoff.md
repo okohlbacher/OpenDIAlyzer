@@ -14,9 +14,20 @@ toward *diaPASEF* (ion mobility). It says so wherever that bias matters.
 
 | what | where | state |
 |---|---|---|
-| Upstream C++ library | `github.com/okohlbacher/mzpeak-openms` (= `mzpeak-1`, same repo) | `trunk` is June 2026; tag **`reader-fixes-2026-08-02`** is current |
+| Upstream C++ library | `github.com/okohlbacher/mzpeak-openms` | **`trunk` @ `7f54871`** (2026-08-03) — what we build against |
 | Reference implementation | HUPO-PSI Rust (`hupo-mzpeak`) | the conformance oracle |
-| **What OpenDIAlyzer actually runs** | commit `18a53b5` on branch `writer_test` **+ 871 lines uncommitted** | preserved as `patches/mzpeak-per-peak-ion-mobility.patch` |
+| Local patch | `patches/mzpeak-per-peak-ion-mobility.patch` | **SUBSUMED** — kept for provenance only |
+
+> **RESOLVED 2026-08-03.** The situation this section originally described — a deployed reader that
+> was no upstream commit, carrying 871 lines of uncommitted work — is over. That work landed on
+> trunk as `458d067` (per-peak ion mobility + isolation-window mobility limits) and `b599ba4`
+> (Bruker TDF ims-compact), and trunk additionally closed the chunked/numpress gap (`36226bb`),
+> three silent-corruption defects (`46050a8`), a writer seconds-into-a-minutes-column bug
+> (`d9dfc03`), and added the selection/batch-read streaming API (`4f3167a`). The local patch is no
+> longer applied; it is retained only so the provenance of those features stays traceable.
+>
+> Verified on this build: **26/26 reader tests pass** (the tag failed 3 on chunked decoding), and
+> OpenDIAlyzer reads a 136 MB `.mzpeak` end to end at **0.60 GB peak RSS**.
 
 **The third row is the important one.** The deployed reader is not any upstream commit. It carries
 local work that was never committed, never pushed, and existed only as a dirty working tree on a
@@ -167,11 +178,13 @@ consumer boundary is **seconds** — convert once, at the edge, and say so in th
 Getting this wrong is a factor-of-60 error that will look like a calibration failure, not a units
 failure.
 
-### 2.4 CHUNKED ARRAYS AND NUMPRESS — upstream Phase 6 (RDR-6/7), not implemented
+### 2.4 CHUNKED ARRAYS AND NUMPRESS — CLOSED on trunk (`36226bb`, `3b0a04c`, `8fbd040`)
 
-**Status upstream:** `include/mzpeak/data/encoding.h:157` throws
-`"chunked array decoding is not implemented (MS:1000515)"`. Three of 24 tests fail on this
-(`chunked`, `numpress`, `has_uv`). This is a known gap with a `chunked-decoder-wip` branch.
+Was: `encoding.h:157` threw `"chunked array decoding is not implemented (MS:1000515)"`, failing 3
+of 24 tests. Trunk decodes the chunked layout including delta (MS:1003089) and MS-Numpress
+(MS:1002312/1002314), and validates each chunk against its declared `chunk_end`. **26/26 tests now
+pass.** The blocker analysis below is retained because it is a good record of how the gap was
+characterised before it was closed.
 
 **Upstream's own analysis of the blockers** (from `docs/roadmap.md`, worth reproducing because it is
 precise):
