@@ -4116,6 +4116,15 @@ protected:
       auto mod_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::MODIFIED_SEQUENCE);
       auto unm_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::UNMODIFIED_SEQUENCE);
       auto acc_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::PROTEIN_ACCESSIONS);
+      // THE FOUR COLUMNS THIS LOADER USED TO SKIP. Without them every precursor carried m/z 0,
+      // RT 0 and decoy=false, so the prefilter matched nothing and reported "supported no
+      // precursors" on a library that had loaded perfectly -- 7,149,966 peptides, 78,569,077
+      // transitions, and not one of them locatable in a spectrum. The library looked right in every
+      // log line because the fields that were missing are not the ones the logs print.
+      auto mz_c  = ParquetFile::getColumn(tbl, OSWPrecursorSchema::PRECURSOR_MZ);
+      auto rt_c  = ParquetFile::getColumn(tbl, OSWPrecursorSchema::LIBRARY_RT);
+      auto im_c  = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::LIBRARY_DRIFT_TIME);
+      auto dec_c = ParquetFile::getColumn(tbl, OSWPrecursorSchema::DECOY);
       const int64_t n = tbl->num_rows();
       pep_by_id.reserve(n);
       clib.reserve(prot_by_acc.size(), n, 0, 0);
@@ -4127,6 +4136,8 @@ protected:
       std::vector<odia::SequenceStore::Span> spans(n);
       std::vector<odia::CompactLibrary::Protein> parents(n, odia::CompactLibrary::no_protein);
       std::vector<int> charges(n, 0);
+      std::vector<double> mzs(n, 0.0), rts(n, 0.0), ims(n, -1.0);
+      std::vector<char> decoys(n, 0);
       std::vector<std::string> misses(n);          // sequence, only where locate() failed
       std::vector<long long> ids(n, 0);
 #ifdef _OPENMP
@@ -4151,6 +4162,10 @@ protected:
         parents[r] = parent;
         charges[r] = int(ParquetFile::getInt64(ch_c, r, 0, true));
         ids[r] = ParquetFile::getInt64(id_c, r, 0, false);
+        mzs[r] = ParquetFile::getDouble(mz_c, r, 0.0, false);
+        rts[r] = ParquetFile::getDouble(rt_c, r, 0.0, true);
+        ims[r] = im_c ? ParquetFile::getDouble(im_c, r, -1.0, true) : -1.0;
+        decoys[r] = ParquetFile::getBool(dec_c, r, false, true) ? 1 : 0;
         const auto sp = clib.locateOrNull(seq);        // proteome-wide, not accession-keyed
         if (sp.valid()) { spans[r] = sp; } else { misses[r] = seq; }
       }
@@ -4177,9 +4192,26 @@ protected:
           }
         }
         clib.setPeptide(std::size_t(r), parents[r], spans[r], charges[r], derived);
-        pep_by_id[ids[r]] = odia::CompactLibrary::Peptide(std::uint32_t(r));
+        const auto pep = odia::CompactLibrary::Peptide(std::uint32_t(r));
+        clib.setPrecursor(pep, mzs[r], rts[r], ims[r]);
+        clib.setDecoy(pep, decoys[r] != 0);
+        pep_by_id[ids[r]] = pep;
       }
       clib.indexInterned();
+      // Fail loudly on the shape of the bug this loader used to have. A library whose precursors
+      // all carry m/z 0 loads without error and then matches nothing; the prefilter reports "no
+      // precursors supported" a phase later, which points at the prefilter rather than here.
+      {
+        std::size_t with_mz = 0, dec = 0;
+        for (long long r = 0; r < n; ++r) { with_mz += (mzs[r] > 0.0); dec += (decoys[r] != 0); }
+        if (with_mz == 0)
+        {
+          throw std::runtime_error("compact library: every precursor has m/z 0 -- the "
+                                   "precursor_mz column was not read");
+        }
+        OPENMS_LOG_INFO << "OpenDIAlyzer[compact] precursors: " << with_mz << "/" << n
+                        << " with m/z, " << dec << " decoys." << std::endl;
+      }
       OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << late_hits
                       << " peptides resolved against previously-interned sequences (decoys included "
                       << "in the index); index " << std::fixed << std::setprecision(2)
