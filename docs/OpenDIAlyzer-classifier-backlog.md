@@ -128,7 +128,34 @@ LINEARLY SEPARABLE. It establishes the direction (updates matter, ~3x cheaper vi
 than via more epochs) but not the magnitude for real sub-scores. Re-tune on the benchmark fixture
 once the ablation has a working baseline.
 
-## 11. THE NETWORK DOES NOT WORK ON REAL SUB-SCORES — the top item now
+## 11a. THE SEED-STEP PROXY DID NOT TRANSFER — new, and it invalidates a tuning claim
+
+`f68ad14` tuned the network on a seed-step proxy (targets clearing the 99th percentile of decoys,
+held-out groups of one subsample) and reported it beating the GBT 2.09% to 1.99%. End-to-end on the
+full fixture:
+
+| arm | IDs@1% |
+|---|---:|
+| gbt | 6,421 |
+| nn (tuned) | **5,236** |
+
+**18% behind**, where the proxy predicted ahead. The architecture fix is real and necessary — the
+network went from 0 IDs and 0/9 iterations trained to 5,236 and 9/0 — but "beats the GBT" was an
+artefact of the proxy, the tuning set, or both.
+
+Two distinguishable causes, cheapest test first:
+1. **The proxy is wrong.** It measures ONE fit on seed rows; production runs three semi-supervised
+   iterations per fold, and a model that starts better can end worse by selecting a narrower
+   positive set to retrain on. Test: instrument the per-iteration positive-set size and composition
+   for both learners on the same fixture. This also directly exercises mechanism 5.
+2. **Overfitting to the tuning subsample.** ~20 configurations, best kept, one subsample, margin
+   0.10 points. Test: re-evaluate the top 3 configurations on a DIFFERENT subsample (`id%13==1`)
+   without retuning.
+
+Until one of these is settled, `-classifier gbt` remains the honest default and the NN defaults in
+`odia_nn.h` are "best known", not "validated".
+
+## 11. THE NETWORK DOES NOT WORK ON REAL SUB-SCORES — CAUSE FOUND (`f68ad14`), see 11a for what remains
 
 `nn` returns 0 identifications where `gbt` returns 6,421, and the cause is upstream of everything
 the five mechanisms do: the seed model never produces 26 confident positives, so all 9
