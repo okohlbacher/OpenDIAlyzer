@@ -4860,6 +4860,36 @@ protected:
         }
         { PhaseTimer pt_mc("setup/mass_calibration");
           calibrateMassFromPass_(swath_maps, transition_exp, mass_cal_trafo); }
+
+        // RELEASE PASS 1'S FEATURES BEFORE PASS 2 ALLOCATES ITS OWN.
+        //
+        // pass_features_ is assigned `= std::move(fmap)` at the END of each pass, so pass 1's
+        // FeatureMap stays resident for the whole of pass 2's extraction and is only destroyed when
+        // pass 2's replacement is moved in. Both are live at once at exactly the moment the run is
+        // at its peak. Measured: RSS 85.1 -> 96.1 GB across pass 2, on top of the 45 GB pass 1 had
+        // already taken.
+        //
+        // Everything that reads pass 1's features has run by here -- recalibrate_ above consumed
+        // them for the anchors, and calibrateMassFromPass_ has just used the confident set. Pass 2
+        // will overwrite them regardless; freeing early only changes WHEN, and the when is the
+        // peak.
+        //
+        // clear() alone does not return the memory: FeatureMap keeps its capacity, and these are
+        // 2.07M features with ~30 subordinates each. The swap-with-empty idiom destroys the storage
+        // outright, and malloc_trim then hands the pages back -- without it glibc keeps them in the
+        // arena free-lists, which is where this run's 73.5 GB of retained-but-unused memory comes
+        // from in the first place.
+        {
+          PhaseTimer pt_fr("setup/free_pass1_features");
+          const std::size_t n_freed = pass_features_.size();
+          FeatureMap().swap(pass_features_);
+#ifdef __GLIBC__
+          malloc_trim(0);
+#endif
+          OPENMS_LOG_INFO << "OpenDIAlyzer: released " << n_freed
+                          << " pass-" << p << " features before the next extraction." << std::endl;
+        }
+        MemProbe::logAllocator("after free pass1 features");
         // Diagnostic only: this is the IN-SAMPLE anchor residual (small); it is NOT the
         // predictive residual on unseen peptides, so it must NOT auto-size the window
         // (would collapse it and lose unseen precursors). Window sizing stays fixed until a
