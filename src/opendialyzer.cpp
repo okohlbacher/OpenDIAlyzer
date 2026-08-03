@@ -4520,6 +4520,8 @@ protected:
     const bool calib_none = (calib_mode == "none");
     bool calib_done = false;
     TransformationDescription pass_map;                       // pass 1: library RT -> run seconds
+    TransformationDescription pass_map_prev;                  // the previous pass's map, for the
+    TransformationDescription native_trafo_prev;              // recal-shift diagnostic
     // OpenSWATH convention: performExtraction takes a trafo mapping RUN RT -> normalized iRT.
     // It inverts that itself for the extraction windows, and the scorer uses it directly
     // (normalized_experimental_rt = trafo.apply(exp_rt)) to compare against the library's iRT.
@@ -4742,31 +4744,46 @@ protected:
         // keep the library untouched. On the fallback path pass_map is applied to compound.rt.
         if (use_native_trafo)
         {
+          // Kept so the recal-shift diagnostic can compare WHERE PASS 1 LOOKED against where pass 2
+          // will, both in run seconds. native_trafo is run -> iRT, so the forward (iRT -> run) map
+          // is its inverse -- which is what pass_map already is.
+          native_trafo_prev = pass_map_prev;
           TransformationDescription t = pass_map;
           t.invert();
           native_trafo = t;
+          pass_map_prev = pass_map;
         }
         // DIAGNOSTIC: how far does recalibration actually MOVE each precursor?
         //
         // This decides whether pass 2 has to re-extract at all. Pass 1 covers +/- rt_win/2 around
         // its own prediction and pass 2 wants +/- rt_win_recal/2 around the recalibrated one, so a
         // precursor whose prediction moved by less than the difference of the half-widths has its
-        // pass-2 window ENTIRELY INSIDE the data pass 1 already read -- for those, re-extraction
-        // re-reads identical spectra and could be replaced by a slice.
+        // pass-2 window ENTIRELY INSIDE the data pass 1 already read.
         //
-        // Reported rather than acted on: the containment rate is the number that says whether that
-        // replacement is worth building, and it has never been measured.
+        // BOTH PREDICTIONS IN RUN SECONDS. The first version of this differenced
+        // pass_map.apply(c.rt) against the raw c.rt, which on the native path subtracts IRT UNITS
+        // from SECONDS -- the library is deliberately kept in iRT there and pass_map is the
+        // iRT -> run map. It reported a median "shift" of ~1,234 s on every run regardless of
+        // settings, because that is the OFFSET BETWEEN THE TWO COORDINATE SYSTEMS, not a movement.
+        // Two runs with wildly different extraction windows giving the identical number was the
+        // tell.
+        //
+        // What is wanted is the INCREMENTAL change: where pass 1 looked, versus where pass 2 will.
         {
           const double half_wide = getDoubleOption_("rt_extraction_window") * 0.5;
           const double half_narrow = getDoubleOption_("rt_extraction_window_recal") * 0.5;
           const double slack = half_wide - half_narrow;
+          // prev maps library coordinates to run seconds as PASS 1 saw them; pass_map is the
+          // freshly fitted replacement. On the fallback path the library was already rescaled into
+          // run seconds, so prev is the identity and the comparison still holds.
+          const TransformationDescription& prev = use_native_trafo ? native_trafo_prev : identity;
           std::vector<double> shift;
           shift.reserve(transition_exp.getCompounds().size());
           for (const auto& c : transition_exp.getCompounds())
           {
-            const double before = c.rt;
-            const double after = pass_map.apply(before);
-            if (std::isfinite(before) && std::isfinite(after)) { shift.push_back(std::abs(after - before)); }
+            const double a = prev.apply(c.rt);
+            const double b = pass_map.apply(c.rt);
+            if (std::isfinite(a) && std::isfinite(b)) { shift.push_back(std::abs(b - a)); }
           }
           if (!shift.empty())
           {
