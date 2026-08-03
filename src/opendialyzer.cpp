@@ -529,12 +529,25 @@ protected:
                           "Write the classifier's input matrix (group, label, sub-scores) to this "
                           "file and continue. Line 1 is 'nrows ncols name...'; one row follows per "
                           "peak group. Consumed by odia-ablate.", false, true);
-    registerFlag_("retain_chromatograms", "Keep extracted chromatograms in the compact store "
-                  "(src/odia_chromstore.h: one shared RT axis per SWATH window, 1 byte per point, "
-                  "log-spaced against a per-chromatogram max). Measured 15.5x smaller than OpenMS "
-                  "ChromatogramPeak -- ~5.4 GB here against 85 GB. Off by default: the pass-2 "
-                  "slicing it exists to enable is not built yet, so it would cost memory for "
-                  "nothing.", true);
+    // ON by default, and the reason is that the alternative is emitting NO chromatograms at all.
+    //
+    // The extractor hands its traces to a NoopMSDataWritingConsumer, so an ODIA bundle carries
+    // features and scores but not one chromatogram -- nothing downstream can plot a peak, do QC, or
+    // check an identification by eye. OpenSwathWorkflow writes them; this tool silently dropped the
+    // capability because ChromatogramPeak costs 16 B/point (85 GB on this benchmark), and that
+    // trade was never written down.
+    //
+    // At 1 B/point (src/odia_chromstore.h: one shared RT axis per SWATH window, log-spaced uint8
+    // against a per-chromatogram max) the same traces are ~5.4 GB -- 5.5% of this run's peak RSS,
+    // measured 15.5x smaller than ChromatogramPeak. That is affordable for a capability the tool
+    // is otherwise missing entirely.
+    registerStringOption_("retain_chromatograms", "true|false", "true",
+                          "Keep extracted chromatograms in the compact store (1 byte per point, "
+                          "shared RT axis per SWATH window). Without this the run emits NO "
+                          "chromatograms at all -- features and scores only. ~5.4 GB on a "
+                          "proteome-scale run; set false to reclaim it when traces are not wanted.",
+                          false, true);
+    setValidStrings_("retain_chromatograms", {"true", "false"});
     registerFlag_("selftest", "Run the recalibration-fit self-check and exit (no data needed).");
   }
 
@@ -3657,7 +3670,7 @@ protected:
     // yet -- so switching it on by default would buy memory for nothing.
     std::unique_ptr<ChromCaptureConsumer> cap;
     Interfaces::IMSDataConsumer* chrom = nullptr;
-    if (getFlag_("retain_chromatograms"))
+    if (getStringOption_("retain_chromatograms") != "false")
     {
       chrom_store_ = std::make_unique<odia::ChromStore>(odia::ChromEncoding::Quantised8Log);
       cap = std::make_unique<ChromCaptureConsumer>(*chrom_store_);
