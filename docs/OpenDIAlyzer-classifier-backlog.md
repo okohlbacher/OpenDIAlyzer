@@ -201,6 +201,61 @@ split.
 path. **Check whether the fixture dump happens before or after it**, and either canonicalise before
 dumping or interleave the classes.
 
+## 13. THE .oswpq SCORE TABLE CANNOT BE JOINED TO ITS FEATURE TABLE — HIGH, output-integrity bug
+
+In `bench/nnfix/nnfix.oswpq`, `runs/run_id=*/score_ms2.parquet` and `runs/run_id=*/features.parquet`
+each hold **14,943,922 unique `feature_id`s and share only 7,472,175** — exactly half. Any consumer
+joining scores to features silently loses half the rows.
+
+Diagnosis so far, with two hypotheses already refuted:
+* NOT a signed/unsigned wraparound. 7,471,747 score ids are negative and the feature table has none,
+  which looks exactly like a uint64 written through `arrow::int64()` — but adding 2^64 to the
+  negative ids matches **zero** feature ids, and reinterpreting the whole column as unsigned still
+  gives 50.00%.
+* NOT two different runs. Both tables have the same row count as the candidate set, and two
+  independent 63-bit id sets of 15M elements would collide ~never, not 50% of the time.
+
+Most likely: OpenMS assigns a **new** `UniqueId` when a Feature is copied, so the features written
+to disk are not the objects that were scored. That is consistent with the existing upstream item
+"native IDs are join keys, should be indices".
+
+**This did not affect any identification count** — the pipeline computes q-values in memory and
+never performs this join; its 6,433 is authoritative. It affects downstream consumers and any
+external analysis, and it invalidated one gap number I computed tonight before I noticed.
+
+**Workaround that works today:** `score_peptide.parquet` keys on `modified_sequence` and reproduces
+the pipeline's own peptide count exactly (5,625). Use it for identity-level comparisons.
+
+## 14. THE DIA-NN REFERENCE USED FOR ALL GAP ANALYSIS WAS WRONG — corrected
+
+`bench/diann_ids.txt` (7,787 entries, 30 July) was used for every gap analysis in this project.
+It is not DIA-NN 2.0's real output: against a target-only library DIA-NN 2.0 reports 9,261
+precursor rows. Rebuilt from `bench/dn_fair/d20.parquet` as `bench/diann_ids_correct.txt`:
+
+| key space | count |
+|---|---:|
+| precursor rows (DIA-NN's own headline) | 9,261 |
+| unique stripped-sequence + charge | 8,812 |
+| unique stripped sequence (peptide) | 7,831 |
+
+Against the old list: 7,582 shared, **1,230 real IDs missing from it**, and 205 entries that were
+never DIA-NN 2.0 IDs at q<0.01. So every earlier gap was understated by ~14% and slightly polluted.
+
+**The real, trustworthy comparison** (peptide level, both sides keyed on sequence, using the tables
+that reproduce each tool's own reported counts):
+
+| | peptides @1% |
+|---|---:|
+| ODIA | 5,625 |
+| DIA-NN 2.0 | 7,831 |
+| shared | 4,766 |
+| **DIA-NN only — the gap** | **3,065** |
+| ODIA only | 859 |
+| **recall of DIA-NN** | **60.9%** |
+
+ODIA is not a subset: it finds 859 peptides DIA-NN does not. Re-do the prefilter/loss attribution
+against `diann_ids_correct.txt`; the earlier attribution used the wrong target.
+
 ## 8. Carried over, unrelated to tonight
 
 * Report upstream: needless deep copy of every `Feature` inside `omp critical (osw_write_out)`.
