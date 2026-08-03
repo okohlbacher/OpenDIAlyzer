@@ -259,7 +259,68 @@ Unsigned indices currently work only for small fixture values. Widening is neede
 
 ## 3. Writer side
 
-We do not currently write mzPeak, so this is assessment rather than requirement.
+### 3.0 REQUIRED: chromatogram writing — the writer cannot do it, and we need it
+
+**This is now a blocking requirement, not an assessment.** OpenDIAlyzer extracts ~4.46M
+chromatograms per run and currently emits **none of them** — its bundles carry features and scores
+but no traces, so nothing downstream can plot a peak, run QC, or verify an identification by eye.
+That capability was dropped only because OpenMS's `ChromatogramPeak` costs 16 B/point (85 GB on the
+reference run). At 1 B/point it is ~5.4 GB and affordable, so the storage problem is solved and the
+remaining obstacle is that **mzPeak has nowhere to put them.**
+
+Current writer surface (`include/mzpeak/writer.h`):
+
+```cpp
+void write_spectra_directory(const std::filesystem::path&, const std::vector<SpectrumData>&);
+void write_spectra_archive  (const std::filesystem::path&, const std::vector<SpectrumData>&);
+```
+
+`SpectrumData` is `{mz, intensity, centroid, ms_level, retention_time, polarity, id}`. The emitted
+tables are `spectra_data`, `spectra_peaks`, `spectra_metadata`, `spectra_metadata_{precursors,
+scans,selected_ions}`. **There is no chromatogram table on any path**, and `grep -i chromatogram`
+over `writer.h` + `writer.cpp` returns nothing. The reader models chromatograms
+(`include/mzpeak/chromatogram.h`, `chromatograms.h`) and the bundled fixtures contain
+`chromatograms_data.parquet` / `chromatograms_metadata.parquet`, so **the format supports them and
+only the writer is missing.**
+
+**What is needed**, mirroring the spectra path:
+
+```cpp
+struct ChromatogramData {
+  std::vector<double> time;            // SECONDS at the API boundary; the file stores minutes
+  std::vector<float>  intensity;
+  std::optional<std::string> id;       // e.g. the transition's native id
+  std::optional<double> precursor_mz;  // for a SRM/DIA transition
+  std::optional<double> product_mz;
+  std::optional<std::string> type;     // TIC / BPC / SRM / SIC
+};
+void write_chromatograms_directory(const std::filesystem::path&,
+                                   const std::vector<ChromatogramData>&);
+void write_chromatograms_archive  (const std::filesystem::path&,
+                                   const std::vector<ChromatogramData>&);
+```
+
+Plus the ability to write chromatograms **alongside** spectra into one bundle, since a search result
+wants both.
+
+**Two things the implementation should exploit**, both established in
+`~/Downloads/compact-chromatogram-storage-handoff.md`:
+
+1. **Chromatograms from one SWATH window share an identical time axis.** Storing time per
+   chromatogram is the single largest waste in the naive form (42.7 GB of 85 GB on our run). A
+   columnar format should factor the axis out, exactly as the reader's point layout factors out
+   coordinates.
+2. **Intensity does not need `double`, or even linear spacing.** Measured on real dynamic range
+   (1e6 apex over 1e2 baseline), one byte log-spaced preserves the baseline 680x better than two
+   bytes linear, because the scores that consume chromatograms are scale-invariant and read shape.
+
+**Units warning, repeating §2.3 because it bites hardest here:** the file stores retention time in
+**minutes** and the reader converts to seconds. Writer commit `d9dfc03` fixed the writer storing
+SECONDS into that minutes column — a silent 60x error. Any chromatogram writer inherits that trap.
+
+### 3.1 The rest of the writer
+
+We do not currently write mzPeak spectra, so this part is assessment rather than requirement.
 
 **Where upstream is:** writer P0/P1a/P1b done on `writer_test` — point directory, zip-STORE archive,
 `spectra_metadata` — and **T2 cross-implementation PASS** (the Rust reference reads C++ output with
