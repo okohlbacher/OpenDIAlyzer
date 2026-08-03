@@ -56,6 +56,7 @@
 #include <OpenMS/KERNEL/FeatureMap.h>
 #include <OpenMS/METADATA/ExperimentalSettings.h>
 
+#include "odia_chromstore.h"
 #include "odia_lda.h"                                          // in-process semi-supervised LDA
 #include "odia_fdr.h"
 #include "odia_library.h"
@@ -528,6 +529,12 @@ protected:
                           "Write the classifier's input matrix (group, label, sub-scores) to this "
                           "file and continue. Line 1 is 'nrows ncols name...'; one row follows per "
                           "peak group. Consumed by odia-ablate.", false, true);
+    registerFlag_("retain_chromatograms", "Keep extracted chromatograms in the compact store "
+                  "(src/odia_chromstore.h: one shared RT axis per SWATH window, 1 byte per point, "
+                  "log-spaced against a per-chromatogram max). Measured 15.5x smaller than OpenMS "
+                  "ChromatogramPeak -- ~5.4 GB here against 85 GB. Off by default: the pass-2 "
+                  "slicing it exists to enable is not built yet, so it would cost memory for "
+                  "nothing.", true);
     registerFlag_("selftest", "Run the recalibration-fit self-check and exit (no data needed).");
   }
 
@@ -929,6 +936,8 @@ protected:
   mutable bool pasef_ = false;                 // set by detectPasef_ once maps are loaded
   // Set only by the (currently empty) mass-accuracy hook. <= 0 means "not inferred", in which case
   // makeChromParams_ keeps the configured -mz_extraction_window.
+  /// Compact chromatogram store, populated only when -retain_chromatograms is on.
+  std::unique_ptr<odia::ChromStore> chrom_store_;
   mutable double inferred_mz_window_ms2_ = -1.0;
   mutable double inferred_mz_window_ms1_ = -1.0;
 
@@ -3188,6 +3197,77 @@ protected:
     return cp;
   }
 
+  /// Capture extracted chromatograms into a ChromStore instead of discarding them.
+  ///
+  /// The extractor currently hands its chromatograms to a NoopMSDataWritingConsumer -- they are
+  /// produced and dropped. Keeping them as OpenMS ChromatogramPeak would cost 16 B/point, i.e. 85 GB
+  /// on this benchmark, which is why they were dropped. At 1 B/point (odia_chromstore.h) the same
+  /// data is ~5.4 GB, which changes the arithmetic: ~5.5% of peak RSS to hold what pass 2 currently
+  /// spends ~115 s re-reading.
+  ///
+  /// One axis per distinct time vector. Chromatograms from the same SWATH window share their cycle
+  /// times exactly, so in practice this is one axis per window (~150) rather than per chromatogram.
+  /// The axis is keyed on (first time, last time, count) -- cheap, and exact for the equal-length
+  /// equal-grid case that actually occurs; a collision would only merge two genuinely identical
+  /// axes.
+  class ChromCaptureConsumer : public Interfaces::IMSDataConsumer
+  {
+  public:
+    explicit ChromCaptureConsumer(odia::ChromStore& store) : store_(store) {}
+    void consumeSpectrum(MSSpectrum&) override {}
+    void setExpectedSize(Size, Size) override {}
+    void setExperimentalSettings(const ExperimentalSettings&) override {}
+
+    void consumeChromatogram(MSChromatogram& c) override
+    {
+      const std::size_t n = c.size();
+      if (n == 0) { ++empty_; return; }
+      const double t0 = c[0].getRT(), t1 = c[n - 1].getRT();
+      const AxisKey key{t0, t1, n};
+      std::uint32_t axis_id;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = axis_of_.find(key);
+        if (it == axis_of_.end())
+        {
+          std::vector<double> rt(n);
+          for (std::size_t k = 0; k < n; ++k) { rt[k] = c[k].getRT(); }
+          axis_id = store_.addAxis(std::move(rt));
+          axis_of_.emplace(key, axis_id);
+        }
+        else { axis_id = it->second; }
+      }
+      std::vector<float> in(n);
+      for (std::size_t k = 0; k < n; ++k) { in[k] = static_cast<float>(c[k].getIntensity()); }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        const std::size_t idx = store_.add(axis_id, 0, in);
+        id_of_[c.getNativeID()] = idx;
+      }
+    }
+
+    std::size_t emptyCount() const { return empty_; }
+    const std::map<std::string, std::size_t>& index() const { return id_of_; }
+
+  private:
+    struct AxisKey
+    {
+      double t0, t1;
+      std::size_t n;
+      bool operator<(const AxisKey& o) const
+      {
+        if (t0 != o.t0) { return t0 < o.t0; }
+        if (t1 != o.t1) { return t1 < o.t1; }
+        return n < o.n;
+      }
+    };
+    odia::ChromStore& store_;
+    std::map<AxisKey, std::uint32_t> axis_of_;
+    std::map<std::string, std::size_t> id_of_;   ///< native id -> store index, kept current on add
+    std::size_t empty_ = 0;
+    std::mutex mu_;
+  };
+
   // MS1 extraction params. Deliberately NOT `cp_ms1 = cp` with the window overwritten: that
   // inherits the MS2 m/z UNIT, so selecting Th for MS2 would reinterpret a 30 ppm MS1 window
   // as 30 Th. TOPP keeps the units separate; so do we.
@@ -3572,7 +3652,21 @@ protected:
     OpenSwathOSWWriter oswwriter(parquet_out_ ? std::string() : osw_path, /*uis*/ false);
     if (!parquet_out_) { oswwriter.writeHeader(); }             // create RUN / FEATURE / FEATURE_MS2
     const UInt64 cur_run = UniqueIdGenerator::getUniqueId();
-    Interfaces::IMSDataConsumer* chrom = new NoopMSDataWritingConsumer("");   // no chromatogram output
+    // -retain_chromatograms captures them into the compact store instead of dropping them.
+    // Default OFF: it is new, and the thing it enables (slicing pass 2 out of pass 1) is not built
+    // yet -- so switching it on by default would buy memory for nothing.
+    std::unique_ptr<ChromCaptureConsumer> cap;
+    Interfaces::IMSDataConsumer* chrom = nullptr;
+    if (getFlag_("retain_chromatograms"))
+    {
+      chrom_store_ = std::make_unique<odia::ChromStore>(odia::ChromEncoding::Quantised8Log);
+      cap = std::make_unique<ChromCaptureConsumer>(*chrom_store_);
+      chrom = cap.get();
+    }
+    else
+    {
+      chrom = new NoopMSDataWritingConsumer("");                             // produced and dropped
+    }
     if (!parquet_out_) { oswwriter.addRun(cur_run, in_file); }
     oswwriter.setRunId(cur_run);
     run_id_ = cur_run;
@@ -4605,7 +4699,18 @@ protected:
         rc = extractPass_(swath_maps, exp_meta, transition_exp,
                           use_native_trafo ? native_trafo : identity, rt_win, in, osw);
       }
-      MemProbe::logAllocator(p == 1 ? "after extract pass1" : "after extract pass2");
+      if (chrom_store_)
+      {
+        OPENMS_LOG_INFO << "OpenDIAlyzer[chrom/store] " << chrom_store_->size() << " chromatograms, "
+                        << chrom_store_->axisCount() << " shared RT axes, "
+                        << (chrom_store_->bytes() / 1073741824.0) << " GB stored vs "
+                        << (chrom_store_->bytesAsPeaks() / 1073741824.0)
+                        << " GB as ChromatogramPeak ("
+                        << (chrom_store_->bytesAsPeaks() /
+                            std::max<double>(1.0, static_cast<double>(chrom_store_->bytes())))
+                        << "x)." << std::endl;
+      }
+    MemProbe::logAllocator(p == 1 ? "after extract pass1" : "after extract pass2");
       if (rc != EXECUTION_OK) { return rc; }
 
       if (p < passes)
