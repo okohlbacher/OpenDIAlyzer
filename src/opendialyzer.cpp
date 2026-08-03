@@ -3005,11 +3005,25 @@ protected:
         }
         else
         {
-          OPENMS_LOG_INFO << "OpenDIAlyzer: mass-accuracy inference not implemented -- using the "
-                          << "configured -mz_extraction_window (" << getDoubleOption_("mz_extraction_window")
-                          << " ppm). NOTE this instrument's measured MS2 accuracy is ~1.6 ppm; a "
-                          << "window far wider than the real error admits interference and destroys "
-                          << "target/decoy separation." << std::endl;
+          OPENMS_LOG_INFO << "OpenDIAlyzer: mass-accuracy inference declined (too few anchors, or "
+                          << "residuals too flat to fit) -- extracting at "
+                          << effectiveMzWindow_(false) << " ppm MS2 / " << effectiveMzWindow_(true)
+                          << " ppm MS1." << std::endl;
+          if (getDoubleOption_("mz_extraction_window") <= 0.0)
+          {
+            // No configured value AND no estimate: the fallback is the bootstrap SEARCH width,
+            // which is deliberately far wider than any real instrument error. Extracting there is
+            // legal but bad, and it must not pass silently -- an over-wide window admits
+            // interference and destroys target/decoy separation, which is how this project lost
+            // 2,302 identifications once before.
+            OPENMS_LOG_WARN << "OpenDIAlyzer: no -mz_extraction_window was given and calibration "
+                            << "could not infer one, so extraction falls back to the "
+                            << getDoubleOption_("mz_calib_bootstrap_ppm") << " ppm bootstrap SEARCH "
+                            << "width. That is a search bound, not an instrument estimate. Give "
+                            << "-mz_extraction_window explicitly, or raise the anchor count, "
+                            << "unless you know this instrument is really that inaccurate."
+                            << std::endl;
+          }
         }
 
         const double rt_win = inferRtWindowSeconds_(swath_maps, irt.nonlinear_irt, rt_trafo,
