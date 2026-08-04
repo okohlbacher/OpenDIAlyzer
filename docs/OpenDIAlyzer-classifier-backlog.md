@@ -338,6 +338,44 @@ cost is a smaller decoy null, which the script's own header already flags as the
 Note the sample was also halved by item 13 (the feature_id join defect), now fixed -- so a re-run
 gets both a larger fraction and twice the joinable data.
 
+## 17. -compact_library: FOUR DEFECTS FIXED, STILL NOT USABLE — the null is degenerate
+
+The option's help said "not diagnosed; do not enable" for weeks. It is now diagnosed four times over
+and still must not be enabled, for a fifth reason that is not a loader defect.
+
+**Fixed, each verified by a load-time assertion that now exists:**
+
+| # | commit | never populated | how it surfaced |
+|---|---|---|---|
+| 1 | `480b7a3` | `PRECURSOR_MZ`, `LIBRARY_RT`, `DECOY` on precursors | prefilter: "no supported precursors" |
+| 2 | `48fd9a8` | transition `DETECTING` flags | prefilter: "0 targets, 0 decoys" |
+| 3 | `2b4da1a` | transition decoy flag (wrong source) | prefilter: "118,902 target / **0 decoy**" |
+| 4 | `4642e64` | decoy↔target pairing (design, not omission) | prefilter: still 0 decoy |
+
+The first three are the same shape — a setter that exists, is correct, and is never called — which
+is why each fix only revealed the next. The fourth is a design error: `syntheticId()` encodes a
+peptide's OWN row, but pairing downstream is by string (`"DECOY_" + target id`), so every decoy id
+matched no target. Fixed by resolving the pairing at load from `TRAML_ID` and storing it as a 4-byte
+index, then releasing the strings.
+
+**What remains, and it is not the loader.** The path now runs end to end and produces:
+
+    381,457 target precursors at q<0.01, from 393,753 retained targets  (97%)
+    ordinary path, same data:  6,980
+
+All four load assertions pass. Decoy pairing is verified 1:1 over 3,546,541 decoys (all distinct
+after stripping the tag, all matching a target). So the library is correctly loaded and correctly
+paired, and the **scoring** is nonetheless degenerate: decoys sit at the floor, so essentially every
+retained target clears q<0.01. **Not diagnosed.**
+
+Next step when this is picked up: compare the materialised `LightTargetedExperiment` field by field
+against the ordinary loader's, on a small library where both paths run. The divergence is in what
+materialisation produces, not in what the parquet reader read — the assertions cover the latter.
+
+**Guard added so this can never be reported as a result again**: if more than 50% of retained
+targets pass q<0.01, the run fails with `UNEXPECTED_RESULT` and states that the null is degenerate.
+At a nominal 1% FDR that fraction is impossible with a valid null, and the broken run exited 0.
+
 ## 8. Carried over, unrelated to tonight
 
 * Report upstream: needless deep copy of every `Feature` inside `omp critical (osw_write_out)`.

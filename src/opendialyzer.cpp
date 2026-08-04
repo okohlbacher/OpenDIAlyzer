@@ -214,6 +214,14 @@ protected:
                           "position feature from its LINEAR classifier, so this needs measuring "
                           "before it is trusted.", false, true);
     setValidStrings_("rt_features", {"true", "false"});
+    // STILL NOT USABLE. Four defects fixed (4642e64 and its three predecessors) and the path now
+    // runs end to end -- but the FDR it produces is invalid: 381,457 target precursors at q<0.01
+    // against the ordinary path's 6,980 on the same data, i.e. 97% of kept targets "identified".
+    // Decoys score at the floor, so the null is degenerate and the q-values are meaningless. The
+    // cause is downstream of the loader (the four load-time assertions all pass, the decoy pairing
+    // is verified 1:1 over 3,546,541 decoys) and is NOT yet diagnosed.
+    //
+    // Do not enable. See docs/OpenDIAlyzer-classifier-backlog.md for the full state.
     registerStringOption_("compact_library", "true|false", "false",
                           "Load the library through CompactLibrary and materialise a targeted "
                           "experiment with SYNTHETIC ids. Measured: the library holds 32.65 GB RSS "
@@ -966,6 +974,10 @@ protected:
   mutable bool pasef_ = false;                 // set by detectPasef_ once maps are loaded
   // Set only by the (currently empty) mass-accuracy hook. <= 0 means "not inferred", in which case
   // makeChromParams_ keeps the configured -mz_extraction_window.
+  /// Targets surviving the prefilter, so the final identification count can be sanity-bounded.
+  /// mutable: the prefilter runs from a const method, and this is a diagnostic, not state the
+  /// method's contract depends on.
+  mutable std::size_t n_kept_targets_ = 0;
   /// Compact chromatogram store, populated only when -retain_chromatograms is on.
   std::unique_ptr<odia::ChromStore> chrom_store_;
   mutable double inferred_mz_window_ms2_ = -1.0;
@@ -3643,6 +3655,7 @@ protected:
       if (kept_ids.count(t.getPeptideRef())) { out.transitions.push_back(t); }
     }
     out.proteins = transition_exp.proteins;
+    n_kept_targets_ = out.compounds.size() - n_dec;   // for the post-scoring sanity bound
     OPENMS_LOG_INFO << "OpenDIAlyzer[prefilter] " << n_before << " -> " << out.compounds.size()
                     << " precursors (" << (out.compounds.size() - n_dec) << " target / " << n_dec
                     << " decoy), " << out.transitions.size() << " transitions; evidence: "
@@ -5114,6 +5127,23 @@ protected:
                       << pass_features_.size() << " features)." << std::endl;
     }
     const int ids = finalScore_(out);            // in-process LDA FDR on the final pass
+    // SANITY BOUND ON THE IDENTIFICATION COUNT. A run that "identifies" a large fraction of the
+    // library has a broken null, not a good day: the compact-library path produced 381,457 of
+    // 393,753 kept targets at q<0.01 (97%) while the ordinary path gives 6,980, and it exited 0.
+    // A number that wrong must not be reportable as a result.
+    if (n_kept_targets_ > 0)
+    {
+      const double frac = static_cast<double>(ids) / static_cast<double>(n_kept_targets_);
+      if (frac > 0.5)
+      {
+        OPENMS_LOG_ERROR << "OpenDIAlyzer: " << ids << " of " << n_kept_targets_
+                         << " retained targets (" << (100.0 * frac) << "%) pass q<0.01. At a "
+                         << "nominal 1% FDR that is impossible with a valid null -- the decoy "
+                         << "distribution is degenerate and these q-values are meaningless."
+                         << std::endl;
+        return UNEXPECTED_RESULT;
+      }
+    }
     OPENMS_LOG_INFO << "OpenDIAlyzer: done -> " << out << " (" << ids << " target precursors at q<0.01)" << std::endl;
     return EXECUTION_OK;
   }
