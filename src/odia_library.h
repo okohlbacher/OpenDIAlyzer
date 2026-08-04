@@ -219,8 +219,8 @@ public:
   {
     auto& r = peptides_[idx(p)];
     r.precursor_mz = mz;
-    r.rt = float(rt);
-    r.drift_time = float(drift);
+    r.rt = rt;
+    r.drift_time = drift;
   }
   double precursorMz(Peptide p) const { return peptides_[idx(p)].precursor_mz; }
   double rt(Peptide p) const { return peptides_[idx(p)].rt; }
@@ -327,8 +327,18 @@ private:
     SequenceStore::Span span;                              // sequence, as a slice of its protein
     std::uint32_t paired = ~std::uint32_t(0);   ///< a decoy's target, by peptide index
     double precursor_mz = 0.0;
-    float rt = std::numeric_limits<float>::quiet_NaN();    // library RT
-    float drift_time = -1.0f;
+    // DOUBLE, not float. It costs 8 B per peptide (the record goes 48 -> 56 B, +54.5 MB over
+    // 7.15M peptides, 0.08% of the run's peak) and it buys exact agreement with the ordinary
+    // reader, which is the whole point of this class.
+    //
+    // As a float these lost ~6e-9 of the library RT (measured: 422,353 of 423,079 precursors
+    // differed from the ordinary reader, median 6.15e-09). That is six orders of magnitude too
+    // small to matter directly, but the CiRT calibration is an iterative fit: a perturbation that
+    // size flips borderline anchors in and out, the fitted curve moves ~1.7 s, and every RT and
+    // chromatogram-shape score moves with it. The measured cost was 424 peptides lost and 320
+    // gained against a path that is otherwise bit-identical run to run.
+    double rt = std::numeric_limits<double>::quiet_NaN();  // library RT
+    double drift_time = -1.0;
     Protein parent = no_protein;
     SequenceStore::Id original_id = SequenceStore::npos;
     std::int16_t charge = 0;
