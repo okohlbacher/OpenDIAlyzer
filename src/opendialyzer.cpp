@@ -821,6 +821,20 @@ protected:
       compact_lib_ = odia::CompactLibrary();
       if (!loadCompactFromParquet_(tr, /*fasta*/ std::string(), compact_lib_)) { return false; }
       materializeFromCompact_(compact_lib_, exp);
+      // A materialised library whose transitions carry no decoy flag yields a target-only search
+      // and an uncalibrated FDR. Both previous compact_library defects surfaced two phases away
+      // from their cause; this one is checked where it is caused.
+      {
+        std::size_t dec_tr = 0;
+        for (const auto& t : exp.getTransitions()) { dec_tr += t.getDecoy() ? 1 : 0; }
+        if (!exp.getTransitions().empty() && dec_tr == 0)
+        {
+          throw std::runtime_error("compact library: no transition is flagged decoy, so the run "
+                                   "would have no null to calibrate against");
+        }
+        OPENMS_LOG_INFO << "OpenDIAlyzer[compact] materialised " << dec_tr << "/"
+                        << exp.getTransitions().size() << " decoy transitions." << std::endl;
+      }
       compact_lib_used_ = true;
       OPENMS_LOG_INFO << "OpenDIAlyzer[compact] library loaded compactly: "
                       << compact_lib_.peptideCount() << " peptides, "
@@ -4090,7 +4104,18 @@ protected:
       tr.library_intensity = clib.intensity(t);
       tr.precursor_im = clib.driftTime(pep);
       tr.fragment_charge = clib.fragmentCharge(t);
-      tr.setDecoy((fl & CL::Decoy) != 0);
+      // FROM THE PEPTIDE, not the transition's own DECOY column.
+      //
+      // Downstream derives a precursor's decoy status by scanning its TRANSITIONS
+      // (buildPrecursorIndex_ / the prefilter both do `if (t.getDecoy()) decoy_refs.insert(...)`),
+      // so a decoy peptide whose transitions are not flagged is invisible AS A DECOY -- which is
+      // what produced "118,902 target / 0 decoy" here even with 3,546,541 decoy peptides correctly
+      // loaded. The transition table's own DECOY column is not reliably populated in this library.
+      //
+      // The peptide's flag is authoritative and the invariant is exact: every transition of a decoy
+      // peptide is a decoy transition. Deriving it removes the dependency on a column that may not
+      // be there.
+      tr.setDecoy(clib.isDecoy(pep));
       tr.setDetectingTransition((fl & CL::Detecting) != 0);
       tr.setIdentifyingTransition((fl & CL::Identifying) != 0);
       tr.setQuantifyingTransition((fl & CL::Quantifying) != 0);
