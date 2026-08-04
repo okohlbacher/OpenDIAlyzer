@@ -4076,7 +4076,11 @@ protected:
     {
       const auto p = CL::Peptide(std::uint32_t(i));
       OpenSwath::LightCompound c;
-      c.id = CL::syntheticId(std::uint32_t(i), clib.isDecoy(p));      // SSO: no allocation
+      // A decoy is named for its TARGET, which is what makes "DECOY_" + target id pair.
+      const bool dec = clib.isDecoy(p);
+      const std::uint32_t pr = clib.pairedTarget(p);
+      const std::uint32_t idn = (dec && pr != CL::no_pair) ? pr : std::uint32_t(i);
+      c.id = CL::syntheticId(idn, dec);                               // SSO: no allocation
       c.sequence = std::string(clib.sequence(p));                     // real sequence: scoring needs it
       c.charge = clib.charge(p);
       c.rt = clib.rt(p);
@@ -4098,7 +4102,9 @@ protected:
       OpenSwath::LightTransition tr;
       // "t" + base-36 index: <= 8 chars, always SSO.
       tr.transition_name = "t" + CL::syntheticId(std::uint32_t(i), false).substr(1);
-      tr.peptide_ref = CL::syntheticId(pi, clib.isDecoy(pep));
+      const bool tdec = clib.isDecoy(pep);
+      const std::uint32_t tpr = clib.pairedTarget(pep);
+      tr.peptide_ref = CL::syntheticId((tdec && tpr != CL::no_pair) ? tpr : pi, tdec);
       tr.precursor_mz = clib.precursorMz(pep);
       tr.product_mz = clib.productMz(t);
       tr.library_intensity = clib.intensity(t);
@@ -4209,6 +4215,11 @@ protected:
       auto rt_c  = ParquetFile::getColumn(tbl, OSWPrecursorSchema::LIBRARY_RT);
       auto im_c  = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::LIBRARY_DRIFT_TIME);
       auto dec_c = ParquetFile::getColumn(tbl, OSWPrecursorSchema::DECOY);
+      // TRAML_ID is read but NOT stored. It is needed only to resolve which target each decoy
+      // pairs with: the library names a decoy "DECOY_" + its target's traml_id, and downstream
+      // pairs by exactly that string. The compact representation cannot keep 7.1M ids (that is what
+      // it exists to avoid), so the relation is resolved here and kept as a 4-byte INDEX.
+      auto tid_c = ParquetFile::getOptionalColumn(tbl, OSWPrecursorSchema::TRAML_ID);
       const int64_t n = tbl->num_rows();
       pep_by_id.reserve(n);
       clib.reserve(prot_by_acc.size(), n, 0, 0);
@@ -4222,6 +4233,7 @@ protected:
       std::vector<int> charges(n, 0);
       std::vector<double> mzs(n, 0.0), rts(n, 0.0), ims(n, -1.0);
       std::vector<char> decoys(n, 0);
+      std::vector<std::string> tramls(n);        // transient: dropped after pairing is resolved
       std::vector<std::string> misses(n);          // sequence, only where locate() failed
       std::vector<long long> ids(n, 0);
 #ifdef _OPENMP
@@ -4250,6 +4262,7 @@ protected:
         rts[r] = ParquetFile::getDouble(rt_c, r, 0.0, true);
         ims[r] = im_c ? ParquetFile::getDouble(im_c, r, -1.0, true) : -1.0;
         decoys[r] = ParquetFile::getBool(dec_c, r, false, true) ? 1 : 0;
+        tramls[r] = tid_c ? ParquetFile::getString(tid_c, r) : std::string();
         const auto sp = clib.locateOrNull(seq);        // proteome-wide, not accession-keyed
         if (sp.valid()) { spans[r] = sp; } else { misses[r] = seq; }
       }
@@ -4281,6 +4294,50 @@ protected:
         clib.setDecoy(pep, decoys[r] != 0);
         pep_by_id[ids[r]] = pep;
       }
+      // ---- resolve decoy -> target pairing, then drop the ids ----------------------------------
+      // Downstream pairs by id ("DECOY_" + target id) and a synthetic id encodes the peptide's OWN
+      // row, so without this a decoy's id corresponds to no target, no pair forms, and the run has
+      // no null -- silently. Resolved here, stored as an index, ids released immediately.
+      {
+        PhaseTimer pt_pair("compact_probe/pair_decoys");
+        const std::string dtag = getStringOption_("decoy_tag");
+        std::unordered_map<std::string, std::uint32_t> target_row;
+        target_row.reserve(static_cast<std::size_t>(n) / 2 + 1);
+        for (long long r = 0; r < n; ++r)
+        {
+          if (!decoys[r] && !tramls[r].empty())
+          {
+            target_row.emplace(tramls[r], static_cast<std::uint32_t>(r));
+          }
+        }
+        std::size_t paired = 0, unpaired = 0;
+        for (long long r = 0; r < n; ++r)
+        {
+          if (!decoys[r]) { continue; }
+          const std::string& id = tramls[r];
+          if (id.size() > dtag.size() && id.compare(0, dtag.size(), dtag) == 0)
+          {
+            const auto it = target_row.find(id.substr(dtag.size()));
+            if (it != target_row.end())
+            {
+              clib.setPairedTarget(odia::CompactLibrary::Peptide(std::uint32_t(r)), it->second);
+              ++paired;
+              continue;
+            }
+          }
+          ++unpaired;
+        }
+        OPENMS_LOG_INFO << "OpenDIAlyzer[compact] decoy pairing: " << paired << " paired, "
+                        << unpaired << " unpaired." << std::endl;
+        if (paired == 0 && unpaired > 0)
+        {
+          throw std::runtime_error("compact library: no decoy could be paired to a target by id -- "
+                                   "the synthetic ids would form no target/decoy pairs and the run "
+                                   "would have no null");
+        }
+        std::vector<std::string>().swap(tramls);        // release the ids now, not at scope exit
+      }
+
       clib.indexInterned();
       // Fail loudly on the shape of the bug this loader used to have. A library whose precursors
       // all carry m/z 0 loads without error and then matches nothing; the prefilter reports "no

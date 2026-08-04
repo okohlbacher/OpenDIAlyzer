@@ -250,7 +250,22 @@ public:
   void setDecoy(Peptide p, bool d) { peptides_[idx(p)].decoy = d; }
   bool isDecoy(Peptide p) const { return peptides_[idx(p)].decoy; }
 
+  /// The TARGET a decoy pairs with, as a peptide index. no_pair when unknown or when p is a target.
+  ///
+  /// Needed because target-decoy pairing downstream is BY ID -- a decoy must be named
+  /// "DECOY_" + its target's id -- while a synthetic id encodes the peptide's OWN row. Without the
+  /// pairing the decoy's synthetic id corresponds to no target, no pair can be formed, and the run
+  /// has no null. Storing the partner's INDEX (4 bytes) preserves the relation without keeping the
+  /// 78.6M id strings the compact representation exists to avoid.
+  static constexpr std::uint32_t no_pair = ~std::uint32_t(0);
+  void setPairedTarget(Peptide p, std::uint32_t target_index) { peptides_[idx(p)].paired = target_index; }
+  std::uint32_t pairedTarget(Peptide p) const { return peptides_[idx(p)].paired; }
+
   /// Synthetic id for the materialised view: "p<n>" for targets, "DECOY_p<n>" for decoys.
+  ///
+  /// For a DECOY, <n> must be its TARGET's index, not its own: downstream pairs a decoy to its
+  /// target by string equality on "DECOY_" + target id. Passing a decoy its own index produces an
+  /// id that pairs with nothing, which is silent -- the run simply has no null.
   /// Both stay within the SSO buffer (max "DECOY_p4294967295" is 17 -- so the index is emitted in
   /// base-36, bounding it at "DECOY_p1z141z3" = 14 characters for any uint32).
   static std::string syntheticId(std::uint32_t index, bool decoy)
@@ -310,6 +325,7 @@ private:
   struct PeptideRec
   {
     SequenceStore::Span span;                              // sequence, as a slice of its protein
+    std::uint32_t paired = ~std::uint32_t(0);   ///< a decoy's target, by peptide index
     double precursor_mz = 0.0;
     float rt = std::numeric_limits<float>::quiet_NaN();    // library RT
     float drift_time = -1.0f;
