@@ -4289,6 +4289,7 @@ protected:
       std::vector<char> decoys(n, 0);
       std::vector<std::string> tramls(n);        // transient: dropped after pairing is resolved
       std::vector<std::string> misses(n);          // sequence, only where locate() failed
+      std::vector<std::string> acc_miss(n);        // accession, only where prot_by_acc missed
       std::vector<long long> ids(n, 0);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static)
@@ -4315,9 +4316,10 @@ protected:
         auto parent = odia::CompactLibrary::no_protein;
         if (!acc.empty())
         {
-          const auto first = acc.substr(0, acc.find('/'));
+          auto first = acc.substr(0, acc.find('/'));
           const auto it = prot_by_acc.find(first);      // read-only after the FASTA pass
           if (it != prot_by_acc.end()) { parent = it->second; }
+          else { acc_miss[r] = std::move(first); }      // registered serially below
         }
         parents[r] = parent;
         charges[r] = int(ParquetFile::getInt64(ch_c, r, 0, true));
@@ -4329,6 +4331,35 @@ protected:
         tramls[r] = tid_c ? ParquetFile::getString(tid_c, r) : std::string();
         const auto sp = clib.locateOrNull(seq);        // proteome-wide, not accession-keyed
         if (sp.valid()) { spans[r] = sp; } else { misses[r] = seq; }
+      }
+      // EVERY ACCESSION THE FASTA DID NOT HAVE. The protein table was built from the FASTA alone,
+      // and a FASTA holds targets only -- so all 20,180 "DECOY_..." accessions missed and every
+      // decoy precursor was left with no protein. Picked competition then found 0 target/decoy
+      // protein pairs and reported 0 proteins at q<0.01, where the ordinary path reported 646 from
+      // 18,925 pairs. The ordinary reader takes protein_refs straight from the precursor column and
+      // never consults a FASTA, so it never had this to lose.
+      //
+      // Registered without a sequence: the sequence only feeds the substring optimisation, and a
+      // decoy is shuffled -- it occurs in no protein anyway. Serial because interning mutates.
+      {
+        std::size_t added = 0;
+        for (long long r = 0; r < n; ++r)
+        {
+          if (acc_miss[r].empty()) { continue; }
+          auto it = prot_by_acc.find(acc_miss[r]);
+          if (it == prot_by_acc.end())
+          {
+            it = prot_by_acc.emplace(acc_miss[r], clib.addProtein(acc_miss[r], {})).first;
+            ++added;
+          }
+          parents[r] = it->second;
+        }
+        std::vector<std::string>().swap(acc_miss);
+        if (added)
+        {
+          OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << added << " accessions not in the FASTA "
+                          << "(decoys above all) registered without a sequence" << std::endl;
+        }
       }
       // PASS 2, SERIAL and only for the misses -- on this library that is the decoys, which are
       // shuffled and occur in no protein.
