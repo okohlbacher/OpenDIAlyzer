@@ -4093,6 +4093,18 @@ protected:
     }
   }
 
+  /// True when @p s could occur inside a stored sequence at all -- i.e. it is pure uppercase
+  /// amino acids. A MODIFIED sequence ("AEY(UniMod:35)FQ") never occurs in a protein or in another
+  /// peptide, but its amino-acid PREFIX does, so findAnywhere() walks every position that prefix
+  /// matches and fails each comparison. Measured on a 1M-row replica of the no-FASTA path: the
+  /// search costs 0.35 s over unmodified sequences and 14.4 s over modified ones, 41x, and the
+  /// modified ones contribute 6% of the hits. Skipping them outright brings it back to 1.9x.
+  static bool pureAA(std::string_view s)
+  {
+    for (const char c : s) { if (c < 'A' || c > 'Z') { return false; } }
+    return !s.empty();
+  }
+
   /// Text of row `r`, handling both utf8 and large_utf8 -- the writer picks either depending on
   /// column size, and a dynamic_cast to only one of them silently yields nothing. That is exactly
   /// how a probe reported "0 distinct fragment annotations" where there were 102.
@@ -4329,7 +4341,9 @@ protected:
         ims[r] = im_c ? ParquetFile::getDouble(im_c, r, -1.0, true) : -1.0;
         decoys[r] = ParquetFile::getBool(dec_c, r, false, true) ? 1 : 0;
         tramls[r] = tid_c ? ParquetFile::getString(tid_c, r) : std::string();
-        const auto sp = clib.locateOrNull(seq);        // proteome-wide, not accession-keyed
+        // Only worth searching for if it could be found: see pureAA().
+        const auto sp = pureAA(seq) ? clib.locateOrNull(seq)   // proteome-wide, not accession-keyed
+                                    : odia::SequenceStore::Span{};
         if (sp.valid()) { spans[r] = sp; } else { misses[r] = seq; }
       }
       // EVERY ACCESSION THE FASTA DID NOT HAVE. The protein table was built from the FASTA alone,
@@ -4374,8 +4388,10 @@ protected:
         bool derived = misses[r].empty();
         if (!derived)
         {
-          // Retry against everything indexed since this peptide was first looked up.
-          const auto retry = clib.locateOrNull(misses[r]);
+          // Retry against everything indexed since this peptide was first looked up -- again only
+          // if it could be found at all, or this loop pays the 41x described on pureAA().
+          const auto retry = pureAA(misses[r]) ? clib.locateOrNull(misses[r])
+                                               : odia::SequenceStore::Span{};
           if (retry.valid()) { spans[r] = retry; derived = true; ++late_hits; }
           else
           {
