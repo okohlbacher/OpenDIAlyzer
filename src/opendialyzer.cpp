@@ -403,6 +403,27 @@ protected:
                        "0 would silently disable nonlinear calibration upstream, so it is rejected.",
                        false, true);
     setMinInt_("calibration_nonlinear_per_bin", 1);
+    // THE TWO CUTOFFS THAT ACTUALLY DECIDE THE ANCHOR YIELD, and they were invisible.
+    //
+    // makeIrtDetectionParam_ sets estimateBestPeptides=false, which disables quality filtering --
+    // for the LINEAR phase. CalibrationWorkflow.cpp:323 then forces it back to "true" for the
+    // NONLINEAR phase, which is the phase whose transform is actually returned. So these two
+    // cutoffs are live on the anchors that matter, and nothing said so.
+    //
+    // 0.5 and 5.5 are the TOPP OpenSwathWorkflow defaults, inherited for parity. Parity is the
+    // wrong target here: TOPP applies them to a spiked-in iRT KIT -- a few dozen synthetic
+    // standards, all abundant by construction -- while we apply them to 3,897 anchors SAMPLED from
+    // a 7M predicted library, most of which are ordinary faint peptides. A threshold calibrated for
+    // bright standards rejects most of a faint population, which is what a 1.7% yield looks like.
+    registerDoubleOption_("calibration_quality_cutoff", "<q>", 5.5,
+                          "OverallQualityCutoff for nonlinear iRT anchors: a candidate whose best "
+                          "peak scores below this is not used for RT calibration at all. TOPP "
+                          "default 5.5 on a range of ca. 0-10, tuned for a spiked iRT kit rather "
+                          "than for library-sampled anchors.", false, true);
+    registerDoubleOption_("calibration_initial_quality", "<q>", 0.5,
+                          "InitialQualityCutoff (TransitionGroupPicker:minimal_quality) for "
+                          "nonlinear iRT anchors. TOPP default 0.5 on a range of ca. -2 to 2.",
+                          false, true);
     registerDoubleOption_("calibration_nonlinear_rt_window", "<s>", 2400.0,
                           "FULL-width RT window (i.e. +/-1200 s) for finding nonlinear iRT anchors, "
                           "applied around the LINEAR-transformed RT (OpenMS default 600). Too narrow "
@@ -3162,7 +3183,7 @@ protected:
   // made MRMRTNormalizer's quality filter discard so many anchors that calibration aborted
   // with "insufficient RT coverage after outlier removal", while stock OpenSwathWorkflow
   // calibrated the same library fine.
-  static Param makeIrtDetectionParam_()
+  Param makeIrtDetectionParam_() const
   {
     Param p;
     p.setValue("alignmentMethod", "linear");
@@ -3181,8 +3202,8 @@ protected:
     p.setValue("RANSACSamplingSize", 10);
     p.setValue("estimateBestPeptides", "false");
     p.setValidStrings("estimateBestPeptides", {"true", "false"});
-    p.setValue("InitialQualityCutoff", 0.5);
-    p.setValue("OverallQualityCutoff", 5.5);
+    p.setValue("InitialQualityCutoff", getDoubleOption_("calibration_initial_quality"));
+    p.setValue("OverallQualityCutoff", getDoubleOption_("calibration_quality_cutoff"));
     p.setValue("NrRTBins", 10);
     p.setValue("MinPeptidesPerBin", 1);
     p.setValue("MinBinsFilled", 8);
