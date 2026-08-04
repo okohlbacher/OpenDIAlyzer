@@ -4499,7 +4499,12 @@ protected:
             };
             for (int64_t g = r; g < seg; ++g)
             {
-              const auto it = pep_by_id.find(arrowInt(pa, pidc.local(g, ci)));
+              // A null precursor id counts as unmapped rather than defaulting to 0: id 0 can be a
+              // real peptide, so defaulting would attach the transition to the wrong precursor
+              // instead of to none, and only the second of those is visible in a count.
+              const int64_t li = pidc.local(g, ci);
+              if (pa->IsNull(li)) { ++local_unmapped; continue; }
+              const auto it = pep_by_id.find(arrowInt(pa, li));
               if (it == pep_by_id.end()) { ++local_unmapped; continue; }
               odia::CompactLibrary::AnnotationId aid = odia::SequenceStore::npos;
               if (aa)
