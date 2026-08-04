@@ -61,6 +61,7 @@
 #include "odia_fdr.h"
 #include "odia_library.h"
 #include "odia_prefilter_model.h"                         // learned library prefilter
+#include "odia_rtaxis.h"                                   // the run's validated RT grid
 #include "odia_split.h"                                   // compact library probe
 #include <OpenMS/FORMAT/FASTAFile.h>
 #include <unordered_set>
@@ -1510,6 +1511,9 @@ protected:
   /// produced, read where it is applied -- different functions, so it lives here rather than as a
   /// local that only looked like it was in scope.
   double calib_yield_pct_ = -1.0;
+
+  /// The run's acquisition grid, validated ascending. One place where an index becomes seconds.
+  odia::RtAxis run_axis_;
 
   /// Set when -out names a .oswpq: features stay in memory, nothing is written to sqlite, and the
   /// run's output is a parquet bundle. Decided once from the output extension.
@@ -5052,6 +5056,39 @@ protected:
       const double b = sm.sptr->getSpectrumMetaById(static_cast<int>(ns) - 1).RT;
       rt_min = std::min(rt_min, std::min(a, b));
       rt_max = std::max(rt_max, std::max(a, b));
+    }
+    // BUILD THE RUN'S RT GRID, and check the assumption two lines above rather than trusting it.
+    // "spectra are RT-ordered" is a comment, and everything here -- the window arithmetic, the
+    // binary searches downstream -- is wrong in a way nothing reports if it is false. RtAxis::reset
+    // rejects a non-ascending grid, so a file that violates it fails here with a reason instead of
+    // producing quietly wrong retention times. This is also the axis the recalibration and the
+    // chromatogram store share (src/odia_rtaxis.h), so there is exactly one place an index becomes
+    // seconds.
+    for (const auto& sm : swath_maps)
+    {
+      if (!sm.sptr || sm.sptr->getNrSpectra() == 0 || !sm.ms1) { continue; }
+      const size_t ns = sm.sptr->getNrSpectra();
+      std::vector<double> cycles;
+      cycles.reserve(ns);
+      for (size_t i = 0; i < ns; ++i)
+      { cycles.push_back(sm.sptr->getSpectrumMetaById(static_cast<int>(i)).RT); }
+      try
+      {
+        run_axis_.reset(std::move(cycles));
+        OPENMS_LOG_INFO << "OpenDIAlyzer[rt] run grid: " << run_axis_.size() << " cycles, "
+                        << run_axis_.seconds(0) << "-"
+                        << run_axis_.seconds(static_cast<std::uint32_t>(run_axis_.size() - 1))
+                        << " s, quantisation " << run_axis_.quantisationSeconds(
+                             static_cast<std::uint32_t>(run_axis_.size() / 2)) << " s" << std::endl;
+      }
+      catch (const std::invalid_argument& e)
+      {
+        OPENMS_LOG_ERROR << "OpenDIAlyzer[rt] " << e.what()
+                         << " -- the MS1 spectra are not in ascending RT order, which every RT "
+                            "window and lookup in this tool assumes." << std::endl;
+        return INCOMPATIBLE_INPUT_DATA;
+      }
+      break;                                                   // one MS1 map defines the cycle grid
     }
     }
     if (!(rt_max > rt_min) || !std::isfinite(rt_min) || !std::isfinite(rt_max))
