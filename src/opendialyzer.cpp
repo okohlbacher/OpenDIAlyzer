@@ -415,6 +415,15 @@ protected:
     // standards, all abundant by construction -- while we apply them to 3,897 anchors SAMPLED from
     // a 7M predicted library, most of which are ordinary faint peptides. A threshold calibrated for
     // bright standards rejects most of a faint population, which is what a 1.7% yield looks like.
+    // Is the nonlinear refinement earning its place? It fits on the anchors that SURVIVE, and on
+    // this data that is 72 of 3,897 -- then its transform REPLACES the linear one, which was fitted
+    // on 500 anchors including the CiRT priority set (CalibrationWorkflow.cpp:344,
+    // final_result.rt_trafo = nonlinear_trafo). A curved fit on 72 selected points is not
+    // self-evidently better than a straight one on 500, and nothing here had ever tested it.
+    registerStringOption_("calibration_nonlinear", "true|false", "true",
+                          "Run the nonlinear iRT refinement after the linear fit. false keeps the "
+                          "linear transform, which is fitted on more anchors.", false, true);
+    setValidStrings_("calibration_nonlinear", {"true", "false"});
     registerDoubleOption_("calibration_quality_cutoff", "<q>", 5.5,
                           "OverallQualityCutoff for nonlinear iRT anchors: a candidate whose best "
                           "peak scores below this is not used for RT calibration at all. TOPP "
@@ -3003,7 +3012,10 @@ protected:
         // These were previously left at OpenMS defaults, which is how the calibration came to cost
         // 32.7 CPU-hours for 136 anchors. See the option comments for the measurement.
         cwp.setValue("auto_irt:irt_bins_nonlinear", getIntOption_("calibration_nonlinear_bins"));
-        cwp.setValue("auto_irt:irt_peptides_per_bin_nonlinear", getIntOption_("calibration_nonlinear_per_bin"));
+        // 0 disables the nonlinear phase upstream (CalibrationWorkflow.cpp:971 guards on > 0).
+        cwp.setValue("auto_irt:irt_peptides_per_bin_nonlinear",
+                     getStringOption_("calibration_nonlinear") == "false"
+                       ? 0 : getIntOption_("calibration_nonlinear_per_bin"));
         cwp.setValue("auto_irt:irt_nonlinear_rt_extraction_window", getDoubleOption_("calibration_nonlinear_rt_window"));
         cw.setParameters(cwp);
       }
