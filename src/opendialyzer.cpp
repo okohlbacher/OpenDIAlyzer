@@ -541,11 +541,14 @@ protected:
     // against a per-chromatogram max) the same traces are ~5.4 GB -- 5.5% of this run's peak RSS,
     // measured 15.5x smaller than ChromatogramPeak. That is affordable for a capability the tool
     // is otherwise missing entirely.
-    registerStringOption_("retain_chromatograms", "true|false", "true",
+    registerStringOption_("retain_chromatograms", "true|false", "false",
                           "Keep extracted chromatograms in the compact store (1 byte per point, "
                           "shared RT axis per SWATH window). Without this the run emits NO "
                           "chromatograms at all -- features and scores only. ~5.4 GB on a "
-                          "proteome-scale run; set false to reclaim it when traces are not wanted.",
+                          "proteome-scale run. OFF by default again: the first version serialised "
+                          "every capture on one mutex and took 8 h against a 31 min baseline (353 "
+                          "of 354 threads asleep). Now per-thread buffered, but not yet measured at "
+                          "scale -- turn it on deliberately until it is.",
                           false, true);
     setValidStrings_("retain_chromatograms", {"true", "false"});
     registerFlag_("selftest", "Run the recalibration-fit self-check and exit (no data needed).");
@@ -3249,27 +3252,49 @@ protected:
     {
       const std::size_t n = c.size();
       if (n == 0) { ++empty_; return; }
-      const double t0 = c[0].getRT(), t1 = c[n - 1].getRT();
-      const AxisKey key{t0, t1, n};
-      std::uint32_t axis_id;
+
+      // PER-THREAD BUFFERS, MERGED ONCE. The first version took a global mutex twice per
+      // chromatogram; the extractor is 224-way parallel and produces ~4.46M of them, so that is
+      // ~9M serialised acquisitions. Measured effect: 353 of 354 threads SLEEPING, 201% CPU on a
+      // 224-core node, and an extraction that ran 8 hours against a 31-minute baseline.
+      //
+      // Each thread accumulates into its own vector with no synchronisation at all; merge() folds
+      // them into the store afterwards, single-threaded, which costs one pass over data that is
+      // already in memory.
+      Local& L = local();
+      L.rt.resize(n);
+      L.in.resize(n);
+      for (std::size_t k = 0; k < n; ++k)
       {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = axis_of_.find(key);
-        if (it == axis_of_.end())
-        {
-          std::vector<double> rt(n);
-          for (std::size_t k = 0; k < n; ++k) { rt[k] = c[k].getRT(); }
-          axis_id = store_.addAxis(std::move(rt));
-          axis_of_.emplace(key, axis_id);
-        }
-        else { axis_id = it->second; }
+        L.rt[k] = c[k].getRT();
+        L.in[k] = static_cast<float>(c[k].getIntensity());
       }
-      std::vector<float> in(n);
-      for (std::size_t k = 0; k < n; ++k) { in[k] = static_cast<float>(c[k].getIntensity()); }
+      L.items.push_back(Item{L.rt, L.in, c.getNativeID()});
+    }
+
+    /// Fold every thread's buffer into the store. Call once, after extraction, from one thread.
+    ///
+    /// Axis identity is resolved HERE rather than per-chromatogram, so the (first, last, count) key
+    /// is computed once per distinct grid instead of 4.46M times.
+    void merge()
+    {
+      for (auto& tl : locals_)
       {
-        std::lock_guard<std::mutex> lk(mu_);
-        const std::size_t idx = store_.add(axis_id, 0, in);
-        id_of_[c.getNativeID()] = idx;
+        for (auto& it : tl->items)
+        {
+          const AxisKey key{it.rt.front(), it.rt.back(), it.rt.size()};
+          auto f = axis_of_.find(key);
+          std::uint32_t axis_id;
+          if (f == axis_of_.end())
+          {
+            axis_id = store_.addAxis(it.rt);
+            axis_of_.emplace(key, axis_id);
+          }
+          else { axis_id = f->second; }
+          id_of_[it.id] = store_.add(axis_id, 0, it.in);
+        }
+        tl->items.clear();
+        tl->items.shrink_to_fit();
       }
     }
 
@@ -3288,11 +3313,30 @@ protected:
         return n < o.n;
       }
     };
+    struct Item { std::vector<double> rt; std::vector<float> in; std::string id; };
+    struct Local { std::vector<Item> items; std::vector<double> rt; std::vector<float> in; };
+
+    /// This thread's buffer. The registry is guarded, but it is touched ONCE per thread -- the
+    /// per-chromatogram path below never locks.
+    Local& local()
+    {
+      thread_local Local* mine = nullptr;
+      if (!mine)
+      {
+        auto up = std::make_unique<Local>();
+        mine = up.get();
+        std::lock_guard<std::mutex> lk(reg_mu_);
+        locals_.push_back(std::move(up));
+      }
+      return *mine;
+    }
+
     odia::ChromStore& store_;
     std::map<AxisKey, std::uint32_t> axis_of_;
-    std::map<std::string, std::size_t> id_of_;   ///< native id -> store index, kept current on add
+    std::map<std::string, std::size_t> id_of_;   ///< native id -> store index, filled by merge()
+    std::vector<std::unique_ptr<Local>> locals_;
+    std::mutex reg_mu_;                          ///< guards `locals_` only, once per thread
     std::size_t empty_ = 0;
-    std::mutex mu_;
   };
 
   // MS1 extraction params. Deliberately NOT `cp_ms1 = cp` with the window overwritten: that
@@ -3797,7 +3841,8 @@ protected:
         pass_features_ = std::move(fmap); }   // must happen while fmap is still in scope
     }
     { PhaseTimer pt_ch("setup/free_chromatograms");
-    delete chrom; }
+    if (cap) { PhaseTimer pt_m("setup/merge_chromatograms"); cap->merge(); }
+    else { delete chrom; } }
     }                                         // <- oswwriter closes its sqlite connection here
     // remapFeaturePrecursorIds_ is a SQLITE-ONLY fixup: OpenSwathOSWWriter emits whatever string id
     // the library carried into a column declared INT NOT NULL. The parquet schema declares
