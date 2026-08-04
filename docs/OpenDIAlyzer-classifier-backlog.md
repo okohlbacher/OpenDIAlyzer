@@ -397,6 +397,36 @@ the peptide formula, and therefore the isotope scores, from `compound.sequence`.
 44.1% of precursors carry a modification, and keying on the unmodified form merged 741,887 distinct
 identities (3,218,138 modified vs 2,476,251 unmodified).
 
+**Two more found while verifying the fixes above, both mine:**
+
+| # | commit | defect | how it surfaced |
+|---|---|---|---|
+| 8 | `1647421` | protein table built from the FASTA alone | 0 proteins, 0 picked pairs vs 646/18,925 |
+| 9 | `e0c1581` | index searched for sequences that cannot be in it | load 17 s -> 31 min |
+
+**#8**: a FASTA holds targets only, and these runs pass no FASTA at all -- so `prot_by_acc` was
+empty, every precursor got `no_protein`, and the protein level had no null whatsoever. The ordinary
+reader takes `protein_refs` straight from the precursor column and never consults a FASTA, so it
+never had this to lose. Now 40,371 accessions (20,191 target + 20,180 decoy) are registered without
+a sequence.
+
+**#9 was caused by fixing #6.** A modified sequence occurs in no protein and no other peptide, but
+its amino-acid PREFIX occurs everywhere, so `findAnywhere()` walks every position that prefix
+matches and fails each comparison. Measured on a 1M-row replica of the no-FASTA path:
+
+    unmodified                 0.35 s
+    modified                  14.43 s    41x
+    modified + pureAA guard    0.66 s     1.9x
+
+The guard loses 6% of the locations (modified sequences contributed 14,734 of 246,525 hits) and 95%
+of the cost.
+
+**Worth recording how nearly I got #9 wrong.** My first probe put the modification at a fixed early
+position, so every needle's first 5-mer contained '(' and missed the index instantly. It reported
+modified lookups as CHEAPER -- 0.2 us vs 0.5 us -- and refuted the hypothesis. The cost only appears
+when the modification site is random, which is what the real data has. **A probe that cannot
+reproduce the failure is not evidence of its absence.**
+
 **What is still not at parity, deliberately:** `LightTransition::fragment_nr` is never set (ordinary
 reads the ordinal). Storing it costs 2 B x 78.6M = 157 MB for a field only `MRMAssay`/`MRMIonSeries`
 read, and neither is in this pipeline. Also unset: `peptide_group_label`, `rt_start`, `rt_end`,
@@ -412,7 +442,15 @@ is never called in production, so the compact path ships synthetic ids in its ou
 1. If more than 50% of retained targets pass q<0.01 the run fails with `UNEXPECTED_RESULT`. At a
    nominal 1% FDR that fraction is impossible with a valid null, and the broken run exited 0.
    Verified to fire on the known-broken build: `381457 of 393753 (96.8772%) ... Exit status: 13`.
-2. The load check on library intensities is **per-label by construction**. An aggregate check would
+2. The load check on library intensities is **per-label by construction**, and verified to fire on
+   a build with the defect deliberately reintroduced:
+
+       mean library intensity 0.00 (target, 0.77% zero) vs 0.00 (decoy, 100.00% zero)
+       ... mean 0.001250 vs 0.000000, zero fraction 0.007701 vs 1.000000
+
+   Decoys read 100% ZERO -- which is why the first version of this check, testing finiteness and a
+   ratio guarded by `md > 0.0`, would have passed it silently. Out-of-bounds reads return zeros, and
+   zero is finite, non-negative, and makes a ratio test skip itself. An aggregate check would
    have passed on #5: it read one label correctly enough to look plausible and the other as garbage.
    Anything that can be wrong for one label only must be checked for each label separately.
 
