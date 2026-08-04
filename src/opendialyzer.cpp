@@ -4077,6 +4077,22 @@ protected:
     }
   }
 
+  /// Value of row `i` as an int64, whichever integer width the writer chose. Separate from
+  /// arrowNumber because an id must not round-trip through double: ids above 2^53 would come back
+  /// altered, and an id that is silently altered joins to the wrong row rather than to none.
+  static std::int64_t arrowInt(const arrow::Array* a, int64_t i, std::int64_t dflt = 0)
+  {
+    if (!a || a->IsNull(i)) { return dflt; }
+    switch (a->type_id())
+    {
+      case arrow::Type::INT64: return static_cast<const arrow::Int64Array*>(a)->Value(i);
+      case arrow::Type::INT32: return static_cast<const arrow::Int32Array*>(a)->Value(i);
+      case arrow::Type::INT16: return static_cast<const arrow::Int16Array*>(a)->Value(i);
+      case arrow::Type::INT8:  return static_cast<const arrow::Int8Array*>(a)->Value(i);
+      default: return dflt;
+    }
+  }
+
   /// Text of row `r`, handling both utf8 and large_utf8 -- the writer picks either depending on
   /// column size, and a dynamic_cast to only one of them silently yields nothing. That is exactly
   /// how a probe reported "0 distinct fragment annotations" where there were 102.
@@ -4467,11 +4483,11 @@ protected:
             if (cid >= 0) { seg = std::min(seg, idnc.chunkEnd(cid)); }
             if (cq >= 0) { seg = std::min(seg, qntc.chunkEnd(cq)); }
             if (cdec >= 0) { seg = std::min(seg, decc.chunkEnd(cdec)); }
-            const auto* pa = static_cast<const arrow::Int64Array*>(pidc.chunk(ci));
+            const arrow::Array* pa = pidc.chunk(ci);         // int64 today -- read by type
             const arrow::Array* ma = mzc.chunk(cm);          // float64 today
             const arrow::Array* ia = inc.chunk(cn);          // float32 today -- read by type, see arrowNumber
             const arrow::Array* aa = ca >= 0 ? annc.chunk(ca) : nullptr;
-            const auto* ga = cg   >= 0 ? static_cast<const arrow::Int32Array*>(chgc.chunk(cg))   : nullptr;
+            const arrow::Array* ga = cg >= 0 ? chgc.chunk(cg) : nullptr;   // int32 today
             const auto* da = cd   >= 0 ? static_cast<const arrow::BooleanArray*>(detc.chunk(cd)) : nullptr;
             const auto* na = cid  >= 0 ? static_cast<const arrow::BooleanArray*>(idnc.chunk(cid)): nullptr;
             const auto* qa = cq   >= 0 ? static_cast<const arrow::BooleanArray*>(qntc.chunk(cq)) : nullptr;
@@ -4483,7 +4499,7 @@ protected:
             };
             for (int64_t g = r; g < seg; ++g)
             {
-              const auto it = pep_by_id.find(pa->Value(pidc.local(g, ci)));
+              const auto it = pep_by_id.find(arrowInt(pa, pidc.local(g, ci)));
               if (it == pep_by_id.end()) { ++local_unmapped; continue; }
               odia::CompactLibrary::AnnotationId aid = odia::SequenceStore::npos;
               if (aa)
@@ -4519,8 +4535,7 @@ protected:
               // (TransitionParquetFile.cpp:409). DIAScoring maps both 0 and 1 to a putative charge
               // of 1 (DIAScoring.cpp:456), so this changes no score today -- it is here so the two
               // paths do not differ at all, rather than differ in a way that happens not to matter.
-              const std::int8_t fch = (ga && !ga->IsNull(chgc.local(g, cg)))
-                                        ? static_cast<std::int8_t>(ga->Value(chgc.local(g, cg))) : 0;
+              const std::int8_t fch = std::int8_t(arrowInt(ga, ga ? chgc.local(g, cg) : 0, 0));
               clib.setTransitionFlags(std::size_t(g), fch, fl);
             }
             r = seg;
