@@ -4282,10 +4282,20 @@ protected:
         const std::string acc = acc_c ? ParquetFile::getString(acc_c, r) : std::string();
         const std::string seq_m = mod_c ? ParquetFile::getString(mod_c, r) : std::string();
         const std::string seq_u = unm_c ? ParquetFile::getString(unm_c, r) : std::string();
-        // Substring matching must use the UNMODIFIED sequence: a modified one carries "(UniMod:4)"
-        // and occurs in no protein. The peptide identity for scoring is still the modified form,
-        // which is why a library needs both.
-        const std::string& seq = !seq_u.empty() ? seq_u : seq_m;
+        // The peptide identity is the MODIFIED sequence, and this line used to store the
+        // unmodified one -- trading correctness for storage while documenting the trade as if it
+        // were free. It is not: OpenSwathScoring derives the peptide's formula, and therefore its
+        // isotope scores, from compound.sequence (OpenSwathScoring.cpp:349), and the ordinary
+        // reader puts the modified form there. On this library 44.1% of precursors carry a
+        // modification, so the compact path scored them at the wrong mass, and keying on the
+        // unmodified form merged 741,887 distinct identities (3,218,138 modified vs 2,476,251
+        // unmodified).
+        //
+        // What it costs: a modified sequence carries "(UniMod:4)" and occurs in no protein, so
+        // locateOrNull() below misses and it is interned on its own. The substring optimisation
+        // only ever resolved 9.1% of peptides, so this is a small price for scoring the right
+        // molecule.
+        const std::string& seq = !seq_m.empty() ? seq_m : seq_u;
         auto parent = odia::CompactLibrary::no_protein;
         if (!acc.empty())
         {
@@ -4505,8 +4515,12 @@ protected:
               if (bit(na, idnc.local(g, cid),  false)) { fl |= odia::CompactLibrary::Identifying; }
               if (bit(qa, qntc.local(g, cq),   true))  { fl |= odia::CompactLibrary::Quantifying; }
               if (bit(ea, decc.local(g, cdec), false)) { fl |= odia::CompactLibrary::Decoy; }
+              // Null fragment charge reads as 0, matching the ordinary reader
+              // (TransitionParquetFile.cpp:409). DIAScoring maps both 0 and 1 to a putative charge
+              // of 1 (DIAScoring.cpp:456), so this changes no score today -- it is here so the two
+              // paths do not differ at all, rather than differ in a way that happens not to matter.
               const std::int8_t fch = (ga && !ga->IsNull(chgc.local(g, cg)))
-                                        ? static_cast<std::int8_t>(ga->Value(chgc.local(g, cg))) : 1;
+                                        ? static_cast<std::int8_t>(ga->Value(chgc.local(g, cg))) : 0;
               clib.setTransitionFlags(std::size_t(g), fch, fl);
             }
             r = seg;
@@ -4526,7 +4540,11 @@ protected:
         // two distributions must agree; when they disagree by orders of magnitude the column was
         // misread for one label only, and nothing downstream will say so -- it will just report an
         // impossible number of identifications.
-        std::size_t det = 0, n[2] = {0, 0}, bad[2] = {0, 0};
+        // Zeros are counted, not just non-finites. A first version of this check tested only
+        // finiteness and a target/decoy ratio guarded by `md > 0.0` -- which has a hole in exactly
+        // the shape of the bug it exists for, because reading off the end of a buffer most often
+        // returns ZEROS, and zero is finite, non-negative, and makes the ratio test skip itself.
+        std::size_t det = 0, n[2] = {0, 0}, bad[2] = {0, 0}, zero[2] = {0, 0};
         double sum[2] = {0.0, 0.0};
         for (std::size_t i = 0; i < clib.transitionCount(); ++i)
         {
@@ -4535,7 +4553,8 @@ protected:
           const int d = clib.isDecoy(clib.peptideOf(t)) ? 1 : 0;
           const float v = clib.intensity(t);
           ++n[d];
-          if (!std::isfinite(v) || v < 0.0F) { ++bad[d]; } else { sum[d] += v; }
+          if (!std::isfinite(v) || v < 0.0F) { ++bad[d]; }
+          else { sum[d] += v; zero[d] += (v == 0.0F); }
         }
         if (det == 0)
         {
@@ -4544,9 +4563,12 @@ protected:
         }
         const double mt = n[0] ? sum[0] / double(n[0]) : 0.0;
         const double md = n[1] ? sum[1] / double(n[1]) : 0.0;
+        const double zt = n[0] ? double(zero[0]) / double(n[0]) : 0.0;
+        const double zd = n[1] ? double(zero[1]) / double(n[1]) : 0.0;
         OPENMS_LOG_INFO << "OpenDIAlyzer[compact] transitions: " << det << "/"
                         << clib.transitionCount() << " detecting; mean library intensity "
-                        << mt << " (target) vs " << md << " (decoy)" << std::endl;
+                        << mt << " (target, " << 100.0 * zt << "% zero) vs "
+                        << md << " (decoy, " << 100.0 * zd << "% zero)" << std::endl;
         if (bad[0] || bad[1])
         {
           throw std::runtime_error("compact library: " + std::to_string(bad[0] + bad[1])
@@ -4554,13 +4576,23 @@ protected:
                                    + std::to_string(bad[0]) + " target, " + std::to_string(bad[1])
                                    + " decoy) -- the intensity column was misread");
         }
-        if (n[0] && n[1] && mt > 0.0 && md > 0.0
-            && (mt / md > 100.0 || md / mt > 100.0))
+        // Symmetric relative difference, defined when either side is zero -- which is the point.
+        // Decoys carry their targets' intensities, so the two means agree closely (0.39 vs 0.39 on
+        // this library). The threshold is loose enough not to fire on a library whose decoys were
+        // generated some other way, and a smaller drift is logged above rather than thrown on.
+        if (n[0] && n[1])
         {
-          throw std::runtime_error("compact library: mean library intensity differs by more than "
-                                   "100x between targets (" + std::to_string(mt) + ") and decoys ("
-                                   + std::to_string(md) + "). Decoys carry their targets' "
-                                   "intensities, so the column was misread for one label");
+          const double rel = (mt + md > 0.0) ? std::abs(mt - md) / std::max(mt, md) : 1.0;
+          if (rel > 0.9 || std::abs(zt - zd) > 0.5)
+          {
+            throw std::runtime_error(
+              "compact library: target and decoy library intensities disagree -- mean "
+              + std::to_string(mt) + " vs " + std::to_string(md) + ", zero fraction "
+              + std::to_string(zt) + " vs " + std::to_string(zd)
+              + ". Decoys carry their targets' intensities, so the column was misread for one "
+                "label; nothing downstream will say so, it will just report an impossible number "
+                "of identifications");
+          }
         }
       }
       OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << ann_id.size() << " distinct fragment annotations"

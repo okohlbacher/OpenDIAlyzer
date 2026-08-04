@@ -338,7 +338,7 @@ cost is a smaller decoy null, which the script's own header already flags as the
 Note the sample was also halved by item 13 (the feature_id join defect), now fixed -- so a re-run
 gets both a larger fraction and twice the joinable data.
 
-## 17. -compact_library: FOUR DEFECTS FIXED, STILL NOT USABLE — the null is degenerate
+## 17. -compact_library: SEVEN DEFECTS, the last of them mine and the worst of them silent
 
 The option's help said "not diagnosed; do not enable" for weeks. It is now diagnosed four times over
 and still must not be enabled, for a fifth reason that is not a loader defect.
@@ -358,23 +358,63 @@ peptide's OWN row, but pairing downstream is by string (`"DECOY_" + target id`),
 matched no target. Fixed by resolving the pairing at load from `TRAML_ID` and storing it as a 4-byte
 index, then releasing the strings.
 
-**What remains, and it is not the loader.** The path now runs end to end and produces:
+**Fixed since, and these are the ones worth reading:**
 
-    381,457 target precursors at q<0.01, from 393,753 retained targets  (97%)
-    ordinary path, same data:  6,980
+| # | commit | defect | how it surfaced |
+|---|---|---|---|
+| 5 | `4bc2aee` | `library_intensity` is **float32**, read as `arrow::DoubleArray` | 97% of targets at q<0.01 |
+| 6 | this | the **unmodified** sequence stored as the peptide identity | nothing — silent wrong mass |
+| 7 | this | null fragment charge defaulted to 1, ordinary uses 0 | nothing — inert today |
 
-All four load assertions pass. Decoy pairing is verified 1:1 over 3,546,541 decoys (all distinct
-after stripping the tag, all matching a target). So the library is correctly loaded and correctly
-paired, and the **scoring** is nonetheless degenerate: decoys sit at the floor, so essentially every
-retained target clears q<0.01. **Not diagnosed.**
+**#5 was mine, twice over.** I narrowed that column from float64 to save 654 MB and never revisited
+the one path that reads it with a hard cast. An 8-byte stride over a 4-byte buffer:
 
-Next step when this is picked up: compare the materialised `LightTargetedExperiment` field by field
-against the ordinary loader's, on a small library where both paths run. The divergence is in what
-materialisation produces, not in what the parquet reader read — the assertions cover the latter.
+    library_intensity : float     one chunk, 78,569,077 rows
+    valid double reads end at row 39,284,538
+    first decoy row               39,589,429
 
-**Guard added so this can never be reported as a result again**: if more than 50% of retained
-targets pass q<0.01, the run fails with `UNEXPECTED_RESULT` and states that the null is degenerate.
-At a nominal 1% FDR that fraction is impossible with a valid null, and the broken run exited 0.
+Targets are written before decoys, so the half-stride boundary falls INSIDE the target block:
+targets read in-buffer (wrong but finite), every decoy read runs off the end of it. One cause, both
+symptoms — in the prefilter intensity only ranks the top-6 fragments, so garbage picked a more
+coincidence-prone decoy subset; in scoring it is used quantitatively, and NaN correlation maps to
+the score floor (`MRMScoring.cpp:579`), which is a degenerate null.
+
+| prefilter evidence | targets | decoys |
+|---|---|---|
+| ordinary | 120,513 | 109,284 |
+| compact, before | 118,902 | **309,344** |
+| compact, after | **120,525** | **109,298** |
+
+Found by codex; kimi reached the same line independently but ranked it second behind a NULL
+hypothesis I had already refuted by measurement. The lesson is in `arrowText()`, which exists in the
+same file for exactly this reason and which I did not generalise to the numeric columns:
+**never cast an Arrow numeric chunk to a fixed width.**
+
+**#6 traded correctness for storage and documented the trade as if it were free.** The line stored
+the unmodified sequence with a comment saying the identity for scoring "is still the modified form,
+which is why a library needs both" — and then stored only one. `OpenSwathScoring.cpp:349` derives
+the peptide formula, and therefore the isotope scores, from `compound.sequence`. On this library
+44.1% of precursors carry a modification, and keying on the unmodified form merged 741,887 distinct
+identities (3,218,138 modified vs 2,476,251 unmodified).
+
+**What is still not at parity, deliberately:** `LightTransition::fragment_nr` is never set (ordinary
+reads the ordinal). Storing it costs 2 B x 78.6M = 157 MB for a field only `MRMAssay`/`MRMIonSeries`
+read, and neither is in this pipeline. Also unset: `peptide_group_label`, `rt_start`, `rt_end`,
+`gene_name`, `sum_formula`, `compound_name`, and `LightCompound::modifications` (read only by
+`MRMDecoy`, which ODIA does not invoke — the library arrives with decoys).
+
+**Separate, still open:** `restoreRealIds_` maps positionally (`exp.compounds[i]` vs `Peptide(i)`)
+while post-prefilter `exp.compounds` is a 786k subset of 7.1M. Latent only because `setOriginalId`
+is never called in production, so the compact path ships synthetic ids in its output bundle.
+
+**Two guards now stand where these got through:**
+
+1. If more than 50% of retained targets pass q<0.01 the run fails with `UNEXPECTED_RESULT`. At a
+   nominal 1% FDR that fraction is impossible with a valid null, and the broken run exited 0.
+   Verified to fire on the known-broken build: `381457 of 393753 (96.8772%) ... Exit status: 13`.
+2. The load check on library intensities is **per-label by construction**. An aggregate check would
+   have passed on #5: it read one label correctly enough to look plausible and the other as garbage.
+   Anything that can be wrong for one label only must be checked for each label separately.
 
 ## 8. Carried over, unrelated to tonight
 
