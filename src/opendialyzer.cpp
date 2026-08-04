@@ -60,6 +60,7 @@
 #include "odia_lda.h"                                          // in-process semi-supervised LDA
 #include "odia_fdr.h"
 #include "odia_library.h"
+#include "odia_prefilter_model.h"                         // learned library prefilter
 #include "odia_split.h"                                   // compact library probe
 #include <OpenMS/FORMAT/FASTAFile.h>
 #include <unordered_set>
@@ -189,6 +190,24 @@ protected:
     // gradient -- measured target:decoy enrichment 1.02x, i.e. none. Requiring the evidence to
     // RECUR costs a real precursor almost nothing (DIA-NN measures FWHM.Scans = 2.53 here) and
     // makes an isolated coincidence fail.
+    // THE LEARNED PREFILTER (src/odia_prefilter_model.h). It existed, tested, and was never wired
+    // in. Measured on this data, ranking candidates by fragment DEPTH retains 6,661 of DIA-NN's
+    // 7,831 peptides (85.1%) at the default budget, and nothing built from the other evidence beats
+    // it there -- because that budget IS the depth>=4 tier. Past it, adding RT agreement reaches
+    // 93.8% at 4.6x the budget where depth alone gives 91.0%. So the gain is real but it is bought
+    // with search space, which is why this is off by default and why keep_fraction is explicit.
+    //
+    // Selection is per-class top-fraction, NOT a score threshold: GBT scores are heavily tied
+    // (integer depths dominate the features) and a `>= cut` rule keeps every tied row, which
+    // measured 28% of targets against 15% of decoys -- asymmetric, the one thing an FDR null
+    // cannot tolerate.
+    registerStringOption_("prefilter_model", "true|false", "false",
+                          "Rank prefilter candidates with the learned model instead of thresholding "
+                          "fragment depth. Keeps -prefilter_keep_fraction of EACH class.", false, true);
+    setValidStrings_("prefilter_model", {"true", "false"});
+    registerDoubleOption_("prefilter_keep_fraction", "<frac>", 0.06,
+                          "Share of each class the learned prefilter retains. 0.06 reproduces the "
+                          "fixed rule's 5.9%; larger trades memory and runtime for recall.", false, true);
     registerIntOption_("prefilter_min_spectra", "<n>", 1,
                        "Number of spectra in which -prefilter_min_fragments must be met. 1 = best "
                        "single spectrum anywhere in the run (not discriminating). >1 requires the "
@@ -3609,8 +3628,78 @@ protected:
       TransitionListEvidenceFilter::Result res_d;
       { PhaseTimer pt("prefilter/scan_decoys");
         res_d = filt.filter(swath_maps, dview, cp_ms1, cp, pasef_, getIntOption_("threads")); }
+
+      // Set once the learned model has produced a selection, so the boolean rule below is skipped
+      // WHOLESALE rather than conditionally -- a model that trained but selected no decoys must not
+      // silently fall through to the rule it replaces.
+      bool model_selected_ref = false;
+      // ---- learned selection, replacing the boolean depth test on BOTH classes ----------------
+      // Placed here because it is the first point at which target and decoy evidence both exist.
+      // The pair-union below is left exactly as it was: that is what makes the selection invariant
+      // under swapping the labels, and the model's own per-class top-fraction is a second,
+      // independent symmetry. Replacing one with the other would be a change to the FDR's null.
+      if (getStringOption_("prefilter_model") == "true")
+      {
+        PhaseTimer pt_m("prefilter/model");
+        auto toEv = [](const TransitionListEvidenceFilter::PrecursorEvidence& e) {
+          odia::PrefilterEvidence x;
+          x.precursor_mz = e.precursor_mz;
+          x.ms2_best_fragment_hits = e.ms2_best_fragment_hits;
+          x.ms2_hit_count = e.ms2_hit_count;
+          x.ms2_qualifying_spectra = e.ms2_qualifying_spectra;
+          x.ms2_max_intensity = e.ms2_max_intensity;
+          x.ms2_sum_intensity = e.ms2_sum_intensity;
+          x.ms1_hit_count = e.ms1_hit_count;
+          x.ms1_max_intensity = e.ms1_max_intensity;
+          x.ms1_sum_intensity = e.ms1_sum_intensity;
+          return x;
+        };
+        std::vector<odia::PrefilterEvidence> ev_all;
+        std::vector<bool> is_dec;
+        ev_all.reserve(res.evidence.size() + res_d.evidence.size());
+        is_dec.reserve(ev_all.capacity());
+        for (const auto& e : res.evidence)   { ev_all.push_back(toEv(e)); is_dec.push_back(false); }
+        for (const auto& e : res_d.evidence) { ev_all.push_back(toEv(e)); is_dec.push_back(true); }
+
+        bool& model_selected = model_selected_ref;
+        odia::PrefilterModelParams mp;
+        mp.keep_fraction = getDoubleOption_("prefilter_keep_fraction");
+        const odia::PrefilterModel model = odia::fitPrefilterModel(ev_all, is_dec, mp);
+        if (!model.trained)
+        {
+          OPENMS_LOG_WARN << "OpenDIAlyzer[prefilter] learned model did not train ("
+                          << ev_all.size() << " rows); falling back to the fixed rule." << std::endl;
+        }
+        else
+        {
+          const std::vector<char> sel = odia::selectPrefilter(model, ev_all, is_dec, mp.keep_fraction);
+          keep.clear();
+          std::size_t n_t = 0, n_d = 0;
+          for (std::size_t i = 0; i < res.evidence.size(); ++i)
+          {
+            if (sel[i] && !res.evidence[i].compound_id.empty())
+            { keep.insert(res.evidence[i].compound_id); ++n_t; }
+          }
+          // Decoy selections are recorded under their TARGET id, matching what the loop below does,
+          // so the pair-union sees the same key space either way.
+          for (std::size_t j = 0; j < res_d.evidence.size(); ++j)
+          {
+            if (!sel[res.evidence.size() + j]) { continue; }
+            const auto it = id_of_alias.find(res_d.evidence[j].compound_id);
+            if (it != id_of_alias.end() && it->second.compare(0, dtag.size(), dtag) == 0)
+            { keep_decoy.insert(it->second.substr(dtag.size())); ++n_d; }
+          }
+          model_selected = true;
+          OPENMS_LOG_INFO << "OpenDIAlyzer[prefilter] learned model: kept " << n_t << " targets and "
+                          << n_d << " decoys at keep_fraction=" << mp.keep_fraction
+                          << " (fixed rule would have kept " << res.supported_precursors
+                          << " targets)." << std::endl;
+        }
+      }
+
       for (const auto& e : res_d.evidence)
       {
+        if (model_selected_ref) { break; }
         const bool sup = (ev == "ms1") ? e.supported_ms1
                        : (ev == "ms2") ? e.supported_ms2
                                        : (e.supported_ms1 || e.supported_ms2);
