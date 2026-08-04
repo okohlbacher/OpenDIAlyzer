@@ -4904,9 +4904,20 @@ protected:
         for (const auto& c : transition_exp.getCompounds()) { survived.insert(c.id); }
 
         // EVERY candidate, with the evidence the decision was made on -- survivors and losses alike.
+        // The five intensity/RT fields below were computed on every candidate and then dropped at
+        // the dump, which is why a ROC over this file could only ever rediscover fragment depth.
+        // Measured at the default operating point, ranking by fragment depth retains 6,661 of
+        // DIA-NN's 7,831 peptides (85.1%) and NOTHING built from the columns that were dumped beats
+        // it -- MS1 corroboration adds 22 true peptides at 4.6x the budget. The signals that should
+        // discriminate are intensity agreement and RT, and neither could be tested without these.
+        // library_rt is joined here because the evidence struct has no notion of predicted RT.
+        std::unordered_map<std::string, double> lib_rt;
+        lib_rt.reserve(transition_exp.getCompounds().size());
+        for (const auto& c : transition_exp.getCompounds()) { lib_rt[c.id] = c.rt; }
         os << "id\tsequence\tdecoy\tsurvived\tsupported_ms2\tms2_best_fragment_hits"
               "\tms2_hit_count\tms2_qualifying_spectra\tms1_hit_count\tms1_max_intensity"
-              "\tprecursor_mz\n";
+              "\tprecursor_mz\tms1_sum_intensity\tms1_best_rt\tms2_max_intensity"
+              "\tms2_sum_intensity\tms2_best_rt\tlibrary_rt\n";
         for (const auto& e : prefilter_evidence_)
         {
           os << e.compound_id << '\t' << e.sequence << '\t' << (dec.count(e.compound_id) ? 1 : 0)
@@ -4917,7 +4928,14 @@ protected:
              << '\t' << e.ms2_qualifying_spectra
              << '\t' << e.ms1_hit_count
              << '\t' << e.ms1_max_intensity
-             << '\t' << e.precursor_mz << '\n';
+             << '\t' << e.precursor_mz
+             << '\t' << e.ms1_sum_intensity
+             << '\t' << e.ms1_best_rt
+             << '\t' << e.ms2_max_intensity
+             << '\t' << e.ms2_sum_intensity
+             << '\t' << e.ms2_best_rt
+             << '\t' << [&]{ const auto it = lib_rt.find(e.compound_id);
+                              return it == lib_rt.end() ? -1.0 : it->second; }() << '\n';
         }
         OPENMS_LOG_INFO << "OpenDIAlyzer: wrote evidence for " << prefilter_evidence_.size()
                         << " candidates (" << transition_exp.getCompounds().size()

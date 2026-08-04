@@ -78,6 +78,10 @@ add_executable(odia-rtaxis-test src/odia_rtaxis_test.cpp)
 # from the Astral benchmark), not synthetic data. Guarded on the fixture: the test is skipped
 # rather than failed when testdata/lda_fixture.txt is absent, so a clone without it still passes.
 add_executable(odia-lda-realdata-test src/odia_lda_realdata_test.cpp)
+# Two test files existed in src/ and were never added here, so they had never been compiled, let
+# alone run. Both cover code that is LIVE in the tool: odia_split.h drives the extraction split and
+# odia_mzpeak_access.h is the mzPeak input layer. "19/19 tests pass" was true and misleading.
+add_executable(odia-split-test src/odia_split_test.cpp)
 
 # The kernels in odia_lda.h / odia_gbt.h contain `#pragma omp` regions. Without linking OpenMP,
 # _OPENMP is undefined, every pragma is ignored, and the tests that set n_threads = 1/8/64 run
@@ -130,6 +134,23 @@ if(MZPEAK_ROOT)
   target_include_directories(OpenDIAlyzer PRIVATE ${MZPEAK_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(OpenDIAlyzer PRIVATE ${MZPEAK_LIB} Arrow::arrow_shared Parquet::parquet_shared)
   target_compile_definitions(OpenDIAlyzer PRIVATE WITH_MZPEAK=1)
+  add_executable(odia-mzpeak-access-test src/odia_mzpeak_access_test.cpp)
+  target_include_directories(odia-mzpeak-access-test PRIVATE ${MZPEAK_ROOT}/include ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(odia-mzpeak-access-test PRIVATE ${MZPEAK_LIB} Arrow::arrow_shared Parquet::parquet_shared OpenMS)
+  target_compile_definitions(odia-mzpeak-access-test PRIVATE WITH_MZPEAK=1)
+  # Needs a real .mzpeak; exits 2 with a usage message when given none. Point it at a fixture if the
+  # environment has one and let ctest SKIP otherwise, rather than fail on a missing file -- the same
+  # arrangement odia-lda-realdata uses. ODIA_MZPEAK_FIXTURE overrides for a different environment.
+  if(NOT DEFINED ODIA_MZPEAK_FIXTURE)
+    set(ODIA_MZPEAK_FIXTURE "$ENV{ODIA_MZPEAK_FIXTURE}")
+  endif()
+  if(ODIA_MZPEAK_FIXTURE AND EXISTS "${ODIA_MZPEAK_FIXTURE}")
+    add_test(NAME odia-mzpeak-access COMMAND odia-mzpeak-access-test "${ODIA_MZPEAK_FIXTURE}")
+    set_tests_properties(odia-mzpeak-access PROPERTIES SKIP_RETURN_CODE 77)
+    message(STATUS "OpenDIAlyzer: mzPeak access test fixture ${ODIA_MZPEAK_FIXTURE}")
+  else()
+    message(STATUS "OpenDIAlyzer: mzPeak access test NOT registered -- set ODIA_MZPEAK_FIXTURE to a .mzpeak")
+  endif()
   message(STATUS "OpenDIAlyzer: mzPeak streaming input ENABLED (${MZPEAK_LIB})")
 endif()
 if(OpenMP_CXX_FOUND)
@@ -179,6 +200,12 @@ add_test(NAME odia-nn COMMAND odia-nn-test)
 add_test(NAME odia-anchor-training COMMAND odia-anchor-training-test)
 add_test(NAME odia-chromstore COMMAND odia-chromstore-test)
 add_test(NAME odia-rtaxis COMMAND odia-rtaxis-test)
+# BUILT BUT NEVER RUN until now -- the same trap the odia-nn comment above records. These two are
+# the designed fixes for the two largest measured problems (feature memory, prefilter recall), so a
+# silent regression in either would have gone unnoticed precisely while they were being wired in.
+add_test(NAME odia-features COMMAND odia-features-test)
+add_test(NAME odia-prefilter-model COMMAND odia-prefilter-model-test)
+add_test(NAME odia-split COMMAND odia-split-test)
 add_test(NAME odia-lda-realdata
          COMMAND odia-lda-realdata-test "${CMAKE_CURRENT_SOURCE_DIR}/testdata/lda_fixture.txt")
 set_tests_properties(odia-lda-realdata PROPERTIES SKIP_RETURN_CODE 77)
