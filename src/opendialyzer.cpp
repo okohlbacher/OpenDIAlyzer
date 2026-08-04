@@ -4052,6 +4052,31 @@ protected:
     bool valid() const { return col != nullptr && col->num_chunks() > 0; }
   };
 
+  /// Value of row `i` as a double, whichever numeric width the writer chose.
+  ///
+  /// The same trap as arrowText below, and it cost far more. `library_intensity` is float32 while
+  /// `product_mz` is float64; casting the intensity chunk to arrow::DoubleArray reads an 8-byte
+  /// stride over a 4-byte buffer, so the first half of the chunk decodes pairs of adjacent floats
+  /// as one garbage double and the second half runs off the end of the buffer entirely. Because the
+  /// writer emits all targets before all decoys (first decoy at row 39,589,429 of 78,569,077, past
+  /// the 39,284,538 half-way point), the out-of-bounds half fell almost exclusively on DECOYS. That
+  /// produced a 2.8x decoy evidence excess (309,344 vs 109,284) which survived into the FDR and
+  /// made every q-value meaningless -- while targets, being in-buffer, looked fine.
+  ///
+  /// Never cast an Arrow numeric chunk to a fixed width. Ask the array what it is.
+  static double arrowNumber(const arrow::Array* a, int64_t i)
+  {
+    if (!a || a->IsNull(i)) { return 0.0; }
+    switch (a->type_id())
+    {
+      case arrow::Type::DOUBLE: return static_cast<const arrow::DoubleArray*>(a)->Value(i);
+      case arrow::Type::FLOAT:  return double(static_cast<const arrow::FloatArray*>(a)->Value(i));
+      case arrow::Type::INT64:  return double(static_cast<const arrow::Int64Array*>(a)->Value(i));
+      case arrow::Type::INT32:  return double(static_cast<const arrow::Int32Array*>(a)->Value(i));
+      default: return 0.0;
+    }
+  }
+
   /// Text of row `r`, handling both utf8 and large_utf8 -- the writer picks either depending on
   /// column size, and a dynamic_cast to only one of them silently yields nothing. That is exactly
   /// how a probe reported "0 distinct fragment annotations" where there were 102.
@@ -4433,8 +4458,8 @@ protected:
             if (cq >= 0) { seg = std::min(seg, qntc.chunkEnd(cq)); }
             if (cdec >= 0) { seg = std::min(seg, decc.chunkEnd(cdec)); }
             const auto* pa = static_cast<const arrow::Int64Array*>(pidc.chunk(ci));
-            const auto* ma = static_cast<const arrow::DoubleArray*>(mzc.chunk(cm));
-            const auto* ia = static_cast<const arrow::DoubleArray*>(inc.chunk(cn));
+            const arrow::Array* ma = mzc.chunk(cm);          // float64 today
+            const arrow::Array* ia = inc.chunk(cn);          // float32 today -- read by type, see arrowNumber
             const arrow::Array* aa = ca >= 0 ? annc.chunk(ca) : nullptr;
             const auto* ga = cg   >= 0 ? static_cast<const arrow::Int32Array*>(chgc.chunk(cg))   : nullptr;
             const auto* da = cd   >= 0 ? static_cast<const arrow::BooleanArray*>(detc.chunk(cd)) : nullptr;
@@ -4470,7 +4495,8 @@ protected:
                 }
               }
               clib.setTransition(std::size_t(g), it->second,
-                                 ma->Value(mzc.local(g, cm)), float(ia->Value(inc.local(g, cn))), aid);
+                                 arrowNumber(ma, mzc.local(g, cm)),
+                                 float(arrowNumber(ia, inc.local(g, cn))), aid);
               // Default DETECTING to true when the column is null: OpenSWATH treats an unset
               // detecting flag as detecting, and a library where nothing is detecting extracts
               // nothing at all -- the failure mode this whole block exists to prevent.
@@ -4491,19 +4517,51 @@ protected:
       {
         // A library with no detecting transitions extracts nothing. Fail here with the reason
         // rather than in the prefilter with "no supported precursors", which points elsewhere.
-        std::size_t det = 0;
+        //
+        // The intensities are checked in the same pass, and checked SEPARATELY PER LABEL. An
+        // aggregate check would have passed on the bug this exists for: the float32 intensity
+        // column was cast to arrow::DoubleArray, a half stride, which left targets in-buffer (wrong
+        // but finite) and ran decoys off the end of it, because the writer emits every target
+        // before every decoy. Decoys are generated from targets and carry their intensities, so the
+        // two distributions must agree; when they disagree by orders of magnitude the column was
+        // misread for one label only, and nothing downstream will say so -- it will just report an
+        // impossible number of identifications.
+        std::size_t det = 0, n[2] = {0, 0}, bad[2] = {0, 0};
+        double sum[2] = {0.0, 0.0};
         for (std::size_t i = 0; i < clib.transitionCount(); ++i)
         {
-          det += (clib.transitionFlags(odia::CompactLibrary::Transition(std::uint32_t(i)))
-                  & odia::CompactLibrary::Detecting) != 0;
+          const auto t = odia::CompactLibrary::Transition(std::uint32_t(i));
+          det += (clib.transitionFlags(t) & odia::CompactLibrary::Detecting) != 0;
+          const int d = clib.isDecoy(clib.peptideOf(t)) ? 1 : 0;
+          const float v = clib.intensity(t);
+          ++n[d];
+          if (!std::isfinite(v) || v < 0.0F) { ++bad[d]; } else { sum[d] += v; }
         }
         if (det == 0)
         {
           throw std::runtime_error("compact library: no transition is marked DETECTING -- the "
                                    "detecting column was not read");
         }
+        const double mt = n[0] ? sum[0] / double(n[0]) : 0.0;
+        const double md = n[1] ? sum[1] / double(n[1]) : 0.0;
         OPENMS_LOG_INFO << "OpenDIAlyzer[compact] transitions: " << det << "/"
-                        << clib.transitionCount() << " detecting." << std::endl;
+                        << clib.transitionCount() << " detecting; mean library intensity "
+                        << mt << " (target) vs " << md << " (decoy)" << std::endl;
+        if (bad[0] || bad[1])
+        {
+          throw std::runtime_error("compact library: " + std::to_string(bad[0] + bad[1])
+                                   + " library intensities are not finite and non-negative ("
+                                   + std::to_string(bad[0]) + " target, " + std::to_string(bad[1])
+                                   + " decoy) -- the intensity column was misread");
+        }
+        if (n[0] && n[1] && mt > 0.0 && md > 0.0
+            && (mt / md > 100.0 || md / mt > 100.0))
+        {
+          throw std::runtime_error("compact library: mean library intensity differs by more than "
+                                   "100x between targets (" + std::to_string(mt) + ") and decoys ("
+                                   + std::to_string(md) + "). Decoys carry their targets' "
+                                   "intensities, so the column was misread for one label");
+        }
       }
       OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << ann_id.size() << " distinct fragment annotations"
                       << (unmapped ? ", " + std::to_string(unmapped.load()) + " transitions with no precursor" : "")
