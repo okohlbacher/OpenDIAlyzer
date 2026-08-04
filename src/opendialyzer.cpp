@@ -4292,6 +4292,16 @@ protected:
         ChunkCursor mzc (tbl->GetColumnByName(OSWTransitionSchema::PRODUCT_MZ));
         ChunkCursor inc (tbl->GetColumnByName(OSWTransitionSchema::LIBRARY_INTENSITY));
         ChunkCursor annc(tbl->GetColumnByName(OSWTransitionSchema::ANNOTATION));
+        // THE FLAGS. setTransitionFlags() existed and was never called, so every transition carried
+        // flags = 0 -- which means DETECTING = false for all 78,569,077 of them. The prefilter and
+        // the extractor only look at detecting transitions, so the scan found "0 targets, 0 decoys"
+        // even after the precursor m/z fix: the library was fully loaded and entirely invisible.
+        // Same shape as that bug, one layer down, and it hid behind it.
+        ChunkCursor chgc(tbl->GetColumnByName(OSWTransitionSchema::CHARGE));
+        ChunkCursor detc(tbl->GetColumnByName(OSWTransitionSchema::DETECTING));
+        ChunkCursor idnc(tbl->GetColumnByName(OSWTransitionSchema::IDENTIFYING));
+        ChunkCursor qntc(tbl->GetColumnByName(OSWTransitionSchema::QUANTIFYING));
+        ChunkCursor decc(tbl->GetColumnByName(OSWTransitionSchema::DECOY));
         if (!pidc.valid() || !mzc.valid() || !inc.valid())
         {
           OPENMS_LOG_ERROR << "OpenDIAlyzer[compact] transitions table is missing a required column."
@@ -4313,12 +4323,34 @@ protected:
             // Resolve every column ONCE for this segment, then walk it.
             const int ci = pidc.chunkOf(r), cm = mzc.chunkOf(r), cn = inc.chunkOf(r);
             const int ca = annc.valid() ? annc.chunkOf(r) : -1;
+            // The flag columns resolve per segment like the rest -- chunk boundaries differ per
+            // column, so the segment is the intersection of all of them.
+            const int cg = chgc.valid() ? chgc.chunkOf(r) : -1;
+            const int cd = detc.valid() ? detc.chunkOf(r) : -1;
+            const int cid = idnc.valid() ? idnc.chunkOf(r) : -1;
+            const int cq = qntc.valid() ? qntc.chunkOf(r) : -1;
+            const int cdec = decc.valid() ? decc.chunkOf(r) : -1;
             int64_t seg = std::min({pidc.chunkEnd(ci), mzc.chunkEnd(cm), inc.chunkEnd(cn), hi});
             if (ca >= 0) { seg = std::min(seg, annc.chunkEnd(ca)); }
+            if (cg >= 0) { seg = std::min(seg, chgc.chunkEnd(cg)); }
+            if (cd >= 0) { seg = std::min(seg, detc.chunkEnd(cd)); }
+            if (cid >= 0) { seg = std::min(seg, idnc.chunkEnd(cid)); }
+            if (cq >= 0) { seg = std::min(seg, qntc.chunkEnd(cq)); }
+            if (cdec >= 0) { seg = std::min(seg, decc.chunkEnd(cdec)); }
             const auto* pa = static_cast<const arrow::Int64Array*>(pidc.chunk(ci));
             const auto* ma = static_cast<const arrow::DoubleArray*>(mzc.chunk(cm));
             const auto* ia = static_cast<const arrow::DoubleArray*>(inc.chunk(cn));
             const arrow::Array* aa = ca >= 0 ? annc.chunk(ca) : nullptr;
+            const auto* ga = cg   >= 0 ? static_cast<const arrow::Int32Array*>(chgc.chunk(cg))   : nullptr;
+            const auto* da = cd   >= 0 ? static_cast<const arrow::BooleanArray*>(detc.chunk(cd)) : nullptr;
+            const auto* na = cid  >= 0 ? static_cast<const arrow::BooleanArray*>(idnc.chunk(cid)): nullptr;
+            const auto* qa = cq   >= 0 ? static_cast<const arrow::BooleanArray*>(qntc.chunk(cq)) : nullptr;
+            const auto* ea = cdec >= 0 ? static_cast<const arrow::BooleanArray*>(decc.chunk(cdec)): nullptr;
+            // A null or absent DETECTING reads as true: OpenSWATH treats an unset flag as
+            // detecting, and a library where nothing detects extracts nothing at all.
+            auto bit = [](const arrow::BooleanArray* a, int64_t i, bool dflt) {
+              return (a && !a->IsNull(i)) ? a->Value(i) : dflt;
+            };
             for (int64_t g = r; g < seg; ++g)
             {
               const auto it = pep_by_id.find(pa->Value(pidc.local(g, ci)));
@@ -4344,11 +4376,39 @@ protected:
               }
               clib.setTransition(std::size_t(g), it->second,
                                  ma->Value(mzc.local(g, cm)), float(ia->Value(inc.local(g, cn))), aid);
+              // Default DETECTING to true when the column is null: OpenSWATH treats an unset
+              // detecting flag as detecting, and a library where nothing is detecting extracts
+              // nothing at all -- the failure mode this whole block exists to prevent.
+              std::uint8_t fl = 0;
+              if (bit(da, detc.local(g, cd),   true))  { fl |= odia::CompactLibrary::Detecting; }
+              if (bit(na, idnc.local(g, cid),  false)) { fl |= odia::CompactLibrary::Identifying; }
+              if (bit(qa, qntc.local(g, cq),   true))  { fl |= odia::CompactLibrary::Quantifying; }
+              if (bit(ea, decc.local(g, cdec), false)) { fl |= odia::CompactLibrary::Decoy; }
+              const std::int8_t fch = (ga && !ga->IsNull(chgc.local(g, cg)))
+                                        ? static_cast<std::int8_t>(ga->Value(chgc.local(g, cg))) : 1;
+              clib.setTransitionFlags(std::size_t(g), fch, fl);
             }
             r = seg;
           }
           unmapped += local_unmapped;
         }
+      }
+      {
+        // A library with no detecting transitions extracts nothing. Fail here with the reason
+        // rather than in the prefilter with "no supported precursors", which points elsewhere.
+        std::size_t det = 0;
+        for (std::size_t i = 0; i < clib.transitionCount(); ++i)
+        {
+          det += (clib.transitionFlags(odia::CompactLibrary::Transition(std::uint32_t(i)))
+                  & odia::CompactLibrary::Detecting) != 0;
+        }
+        if (det == 0)
+        {
+          throw std::runtime_error("compact library: no transition is marked DETECTING -- the "
+                                   "detecting column was not read");
+        }
+        OPENMS_LOG_INFO << "OpenDIAlyzer[compact] transitions: " << det << "/"
+                        << clib.transitionCount() << " detecting." << std::endl;
       }
       OPENMS_LOG_INFO << "OpenDIAlyzer[compact] " << ann_id.size() << " distinct fragment annotations"
                       << (unmapped ? ", " + std::to_string(unmapped.load()) + " transitions with no precursor" : "")
