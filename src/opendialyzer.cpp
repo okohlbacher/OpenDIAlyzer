@@ -420,9 +420,10 @@ protected:
     // on 500 anchors including the CiRT priority set (CalibrationWorkflow.cpp:344,
     // final_result.rt_trafo = nonlinear_trafo). A curved fit on 72 selected points is not
     // self-evidently better than a straight one on 500, and nothing here had ever tested it.
-    registerStringOption_("calibration_nonlinear", "true|false", "true",
-                          "Run the nonlinear iRT refinement after the linear fit. false keeps the "
-                          "linear transform, which is fitted on more anchors.", false, true);
+    registerStringOption_("calibration_nonlinear", "true|false", "false",
+                          "Run the nonlinear iRT refinement after the linear fit. Default false: "
+                          "measured, it fits on FEWER anchors than the linear phase it replaces "
+                          "(65/3897 = 1.7% vs 332/500 = 66.4%) and costs 4 minutes.", false, true);
     setValidStrings_("calibration_nonlinear", {"true", "false"});
     registerDoubleOption_("calibration_quality_cutoff", "<q>", 5.5,
                           "OverallQualityCutoff for nonlinear iRT anchors: a candidate whose best "
