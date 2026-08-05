@@ -360,8 +360,18 @@ public:
     {
       const std::size_t lo = std::size_t(w) * chunk, hi = std::min(all.size(), lo + chunk);
       if (lo >= hi) { continue; }
-      // Rule 4: this worker's OWN handle, so its cache follows its own contiguous range.
-      MzPeak::Spectra spectra = sharedIndex(s_path_).spectra();
+      // Rule 4, and the part that is easy to get wrong: the decoded row-group cache belongs to
+      // the INDEX -- "each open() has its own cache" -- not to the Spectra. Deriving every
+      // worker's Spectra from ONE shared Index gives them all ONE 2-deep cache, and workers
+      // reading distant contiguous ranges then evict each other on every group. Measured that
+      // way: ~1400% CPU with RSS creeping 0.1 GB/min and populate still unfinished at 10:41,
+      // where 14 workers at the measured 382 spectra/s should have finished in about a minute.
+      //
+      // So each worker opens its own Index. That is only affordable because odia_mmap_archive.h
+      // made an Archive a pair of shared_ptrs over one mapping: an extra Index costs a metadata
+      // parse, not a file descriptor and not a second copy of the file.
+      MzPeak::Index widx{archiveView(s_path_)};
+      MzPeak::Spectra spectra = widx.spectra();
       auto& store = parts_[std::size_t(w)];
       auto& mine = local[std::size_t(w)];
       store.reserve(hi - lo, 0);

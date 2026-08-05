@@ -259,7 +259,7 @@ Unsigned indices currently work only for small fixture values. Widening is neede
 
 ## 3. Writer side
 
-### 3.0 REQUIRED: chromatogram writing — the writer cannot do it, and we need it
+### 3.0 REQUIRED: chromatogram writing — the writer cannot do it, and we need it [CORRECTED — see note below]
 
 **This is now a blocking requirement, not an assessment.** OpenDIAlyzer extracts ~4.46M
 chromatograms per run and currently emits **none of them** — its bundles carry features and scores
@@ -493,3 +493,49 @@ Until one exists, mzPeak input cannot feed a full analysis at this scale, and OD
 benchmarks stay on mzML. Everything on the ODIA side is already done: one shared mmap
 (zero descriptors), one shared Index, a compact 8 B/peak spectrum store, and a bounded
 decoder count.
+
+
+## CORRECTION (maintainer handoff item 5): the writer CAN write chromatograms
+
+The section above claiming the writer cannot emit chromatograms is false as of current
+trunk: `write_run_directory(RunContents{...chromatograms...})` exists. What the writer
+refuses is PRODUCT-BEARING (SRM/MRM) chromatograms -- a product-bearing type throws at write
+time, because the Q3 product facet is unwritable in the format today (`has_unreadable_product`
+on read).
+
+That matters for us specifically, because the ~4.46M transition chromatograms this tool would
+write ARE product-bearing. They cannot be stored as SRM chromatograms as-is. Three options,
+and this is a format-direction decision rather than an implementation one:
+
+  1. Plain chromatograms, transition identity in the `id` ("500.2->184.1") and Q1 in the
+     precursor/selected-ion facet. Works with the writer today; Q3 lives only in the id string.
+  2. Push the product facet upstream so SRM chromatograms become first-class. Larger: spec,
+     reference implementation and C++ writer all have to move together.
+  3. Keep transitions in our own sidecar and put only TIC/BPC in mzPeak.
+
+Undecided. It should be settled before the writer is wired, because it is the one place the
+stated goal and the format genuinely collide.
+
+## READ PERFORMANCE, settled (mzPeak c2ffd34, tag perf-no-page-index-2026-08-03)
+
+Root cause of the slow reads was that astral carries NO Parquet page index -- verified here
+independently: all three columns of spectra_peaks.parquet report column_index_offset=None and
+offset_index_offset=None, while the row group DOES declare SortingColumn(column_index=0,
+descending=False). Without a page index the reader could not skip pages, so it full-scanned a
+1,047,605-row group per spectrum. Trunk now binary-searches the declared-sorted index.
+
+Measured here on astral (307,590 spectra, 512,278,842 peaks, 489 row groups):
+
+    1 thread     361 -> 4561 spectra/s     12.6x
+    4 workers          7195 spectra/s      best
+    8 workers          6065 spectra/s
+   16 workers          3915 spectra/s
+
+One qualification for planning: the maintainer handoff predicts ~7,600 spectra/s
+single-thread; measured here is 4,561, about 60% of that. The practical conclusion is
+unaffected -- a single thread now materialises the whole run in 67 s against 104 s for the
+mzML parse ON 224 THREADS, and 43 s at the 4-worker optimum.
+
+Note the knee MOVED from 8 workers to 4 when the reader changed: with the per-spectrum scan
+gone the job becomes memory-bandwidth-bound sooner. A worker count carried over from the old
+reader is quietly wrong.

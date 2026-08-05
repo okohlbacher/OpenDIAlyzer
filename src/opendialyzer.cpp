@@ -217,9 +217,28 @@ protected:
     // Capping is nearly free because populate is the ONLY phase that decodes: once the store is
     // populated, decode() serves from memory and no further Spectra is ever constructed. So this
     // bounds the decoder state for the whole run, not just for this phase.
-    registerIntOption_("mzpeak_decode_threads", "<n>", 16,
-                       "Maximum concurrent mzPeak decoders while filling the spectrum store. Each "
-                       "costs its own parquet row-group buffers.", false, true);
+    // 4 IS MEASURED, and the knee MOVED when the reader changed -- which is why it is not 8.
+    //
+    // Reader-only scaling on astral, contiguous ranges with one Index (hence one decoded-row-group
+    // cache) per worker, against mzPeak c2ffd34 (binary-searches the declared-sorted entity index
+    // instead of full-scanning a 1,047,605-row group per spectrum):
+    //
+    //     1 worker   4561 spectra/s      (was 361 before that fix -- 12.6x)
+    //     4 workers  7195 spectra/s      best
+    //     8 workers  6065 spectra/s
+    //    16 workers  3915 spectra/s
+    //
+    // Past the knee more workers make it SLOWER, not merely no faster. The knee moved from 8 to 4
+    // because each spectrum's work is now a binary search rather than a million-row scan, so the
+    // job becomes memory-bandwidth-bound sooner. A default carried over from the old reader would
+    // have been quietly 16% off.
+    //
+    // At 4561/s a single thread materialises the run's 307,590 spectra in 67 s, against 104 s for
+    // the mzML parse ON 224 THREADS; at the 4-worker optimum, 43 s.
+    registerIntOption_("mzpeak_decode_threads", "<n>", 4,
+                       "Concurrent mzPeak decode workers while filling the spectrum store. Each "
+                       "gets its own Index and therefore its own row-group cache. Measured optimum "
+                       "is 4 on this data; 8 and 16 are progressively slower.", false, true);
     setMinInt_("mzpeak_decode_threads", 1);
     registerStringOption_("prefilter_model", "true|false", "false",
                           "Rank prefilter candidates with the learned model instead of thresholding "
