@@ -191,10 +191,11 @@ int main()
     std::printf("  Float32 encoding: exact (rel err 0)\n");
   }
 
-  // ---- 7. recalibration re-times every chromatogram without touching one of them --------------
-  // The reason chromatograms hold indices rather than seconds: a re-timed run rewrites ~150 small
-  // axes, not 4.46M chromatograms, and nothing can be left on the old calibration because nothing
-  // else stores an RT.
+  // ---- 7. a calibration rewrites ~150 axes, not 4.46M chromatograms ---------------------------
+  // The reason chromatograms hold indices rather than times. Note what is asserted: the SECONDS do
+  // not move. An earlier version of this test required the opposite -- it checked that recalibration
+  // rewrote the acquisition times -- which encoded the wrong model into the suite and would have
+  // kept passing while the tool answered "when was this acquired" with a fitted number.
   {
     ChromStore st;
     const std::uint32_t a = st.addAxis(axis);
@@ -204,15 +205,65 @@ int main()
     const double t_before = r5.front();
     const float  i_before = g5[600];
 
-    st.recalibrateAxes([](double s) { return 1.02 * s - 3.0; });
+    st.setCalibration([](double s) { return 0.001 * s - 0.4; });
 
     std::vector<double> r6; std::vector<float> g6;
     st.get(i5, r6, g6);
     CHECK(r6.size() == r5.size());                       // same points
-    CHECK(std::abs(r6.front() - (1.02 * t_before - 3.0)) < 1e-9);
+    CHECK(r6.front() == t_before);                       // and the same TIMES
     CHECK(g6[600] == i_before);                          // intensities untouched
-    std::printf("  recalibrate: %.2f -> %.2f s, %zu points and all intensities unchanged\n",
-                t_before, r6.front(), r6.size());
+    std::vector<double> ir7;
+    st.getIrt(i5, ir7);
+    CHECK(std::abs(ir7.front() - (0.001 * t_before - 0.4)) < 1e-6);
+    std::printf("  calibrate: %zu points still at %.2f s, iRT now %.4f\n",
+                r6.size(), r6.front(), ir7.front());
+  }
+
+  // ---- 8. RT and iRT from the same stored indices ---------------------------------------------
+  // The store keeps WHICH CYCLES a chromatogram covers. Both time questions are answered from that,
+  // and a recalibration must move the iRT answer while leaving the seconds and the intensities
+  // exactly as they were -- that is the whole reason times are not stored per point.
+  {
+    ChromStore st;
+    const std::uint32_t a = st.addAxis(axis);
+    const std::size_t id8 = st.add(a, start, sig);
+
+    CHECK(!st.hasIrt(id8));                       // uncalibrated: iRT is absent, not zero
+    std::vector<double> ir;
+    st.getIrt(id8, ir);
+    CHECK(ir.empty());
+
+    std::vector<double> r_before; std::vector<float> i_before;
+    st.get(id8, r_before, i_before);
+
+    st.setCalibration([](double s) { return 0.001 * s - 0.4; });
+    CHECK(st.hasIrt(id8));
+    st.getIrt(id8, ir);
+    CHECK(ir.size() == r_before.size());
+    CHECK(std::abs(ir.front() - (0.001 * r_before.front() - 0.4)) < 1e-6);
+    CHECK(std::abs(st.irtAt(id8, 0) - ir.front()) < 1e-9);
+    CHECK(std::abs(st.secondsAt(id8, 0) - r_before.front()) < 1e-12);
+
+    // recalibrate: iRT moves, seconds and intensities do not
+    st.setCalibration([](double s) { return 0.0015 * s - 0.6; });
+    std::vector<double> r_after; std::vector<float> i_after;
+    st.get(id8, r_after, i_after);
+    CHECK(r_after == r_before);                   // acquisition times are physical facts
+    CHECK(i_after == i_before);                   // and not one intensity was rewritten
+    std::vector<double> ir2;
+    st.getIrt(id8, ir2);
+    CHECK(std::abs(ir2.front() - (0.0015 * r_before.front() - 0.6)) < 1e-6);
+    CHECK(ir2.front() != ir.front());
+
+    // a slice's iRT must line up with the same slice's seconds
+    std::vector<double> sr; std::vector<float> si; std::vector<double> sir;
+    st.getSlice(id8, 100, 50, sr, si);
+    st.getIrtSlice(id8, 100, 50, sir);
+    CHECK(sir.size() == sr.size());
+    for (std::size_t k = 0; k < sir.size(); ++k)
+    { CHECK(std::abs(sir[k] - (0.0015 * sr[k] - 0.6)) < 1e-6); }
+    std::printf("  RT/iRT: recalibration moved iRT %.4f -> %.4f, seconds and intensities untouched\n",
+                ir.front(), ir2.front());
   }
 
   if (g_fail) { std::printf("odia_chromstore_test FAILED (%d)\n", g_fail); return 1; }

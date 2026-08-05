@@ -64,27 +64,55 @@ int main()
               q, 100.0 * q / 21.7);
   CHECK(q > 0.5 && q < 0.7);
 
-  // ---- 4. RECALIBRATION: one array changes, every index stays valid ---------------------------
-  // This is the property the representation exists for. Stored indices must survive a re-timing
-  // untouched, and their SECONDS must follow.
+  // ---- 4. RECALIBRATION MUST NOT MOVE THE ACQUISITION TIMES -----------------------------------
+  // The property that matters, and the one an earlier version of this class got wrong by rewriting
+  // the seconds. When a cycle was acquired is a physical fact; a calibration cannot change it. What
+  // a calibration changes is where the LIBRARY thinks that cycle sits, which is the iRT half.
   const std::uint32_t held_a = ax.index(600.0), held_b = ax.index(1800.0);
-  const double before_a = ax.seconds(held_a), before_b = ax.seconds(held_b);
-  ax.recalibrate([](double s) { return 1.05 * s + 7.0; });
-  CHECK(ax.seconds(held_a) == 1.05 * before_a + 7.0);
-  CHECK(ax.seconds(held_b) == 1.05 * before_b + 7.0);
-  std::printf("  recalibrate(1.05x + 7): index %u  %.2f -> %.2f s (index unchanged)\n",
-              held_a, before_a, ax.seconds(held_a));
+  const double sec_a = ax.seconds(held_a), sec_b = ax.seconds(held_b);
+  CHECK(!ax.calibrated());                       // no calibration installed yet
+  CHECK(std::isnan(ax.irt(held_a)));             // and iRT is absent, not 0 -- 0 is a legal iRT
 
-  // ---- 5. a non-monotone transform is a bug, not a recalibration ------------------------------
-  // Reversing the run would leave a binary search over an unsorted array: every lookup silently
-  // wrong. Must throw rather than accept it.
+  ax.setCalibration([](double s) { return 0.001 * s - 0.4; });
+  CHECK(ax.calibrated());
+  CHECK(ax.seconds(held_a) == sec_a);            // seconds UNTOUCHED
+  CHECK(ax.seconds(held_b) == sec_b);
+  CHECK(std::abs(ax.irt(held_a) - (0.001 * sec_a - 0.4)) < 1e-6);
+  std::printf("  calibrate: index %u stays at %.2f s, iRT now %.4f\n",
+              held_a, ax.seconds(held_a), ax.irt(held_a));
+
+  // A SECOND calibration replaces the first and still leaves the seconds alone.
+  ax.recalibrate([](double s) { return 0.0012 * s - 0.5; });
+  CHECK(ax.seconds(held_a) == sec_a);
+  CHECK(std::abs(ax.irt(held_a) - (0.0012 * sec_a - 0.5)) < 1e-6);
+
+  // ---- 4b. the two halves are inverses over the same index ------------------------------------
+  for (std::uint32_t i = 0; i < 1945; i += 53)
+  {
+    CHECK(ax.irtToIndex(ax.irt(i)) == i);        // iRT -> index -> iRT is a fixed point
+  }
+  CHECK(ax.irtToIndex(std::nan("")) == kNoRt);
+  std::printf("  iRT<->index round trip exact over the grid\n");
+
+  // ---- 5. a non-monotone calibration is a bug, not a recalibration ----------------------------
+  // Elution order is physics. A map that reverses it leaves irtToIndex searching an unsorted array,
+  // i.e. every lookup silently wrong.
   bool threw = false;
   try { ax.recalibrate([](double s) { return -s; }); }
   catch (const std::invalid_argument&) { threw = true; }
   CHECK(threw);
-  // and the axis must be unchanged after the rejection
-  CHECK(ax.seconds(held_a) == 1.05 * before_a + 7.0);
-  std::printf("  non-monotone transform rejected, axis intact\n");
+  CHECK(ax.seconds(held_a) == sec_a);                                  // seconds still intact
+  CHECK(std::abs(ax.irt(held_a) - (0.0012 * sec_a - 0.5)) < 1e-6);     // and the good calibration kept
+  std::printf("  non-monotone calibration rejected, both halves intact\n");
+
+  // ---- 5b. re-installing the grid drops a calibration fitted to the old one --------------------
+  {
+    RtAxis fresh(std::vector<double>{0.0, 1.0, 2.0});
+    fresh.setCalibration([](double s) { return s; });
+    CHECK(fresh.calibrated());
+    fresh.reset(std::vector<double>{0.0, 1.0, 2.0, 3.0});
+    CHECK(!fresh.calibrated());                  // stale calibration must not survive a new grid
+  }
 
   // ---- 6. a non-ascending axis is rejected at construction ------------------------------------
   threw = false;
@@ -93,6 +121,7 @@ int main()
   CHECK(threw);
 
   // ---- 7. round trip: index -> seconds -> index is a fixed point ------------------------------
+  // Still exact after calibration, because calibration never touched the seconds.
   for (std::uint32_t i = 0; i < 1945; i += 37)
   {
     CHECK(ax.index(ax.seconds(i)) == i);

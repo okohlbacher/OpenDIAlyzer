@@ -111,14 +111,11 @@ class ChromStore
 public:
   explicit ChromStore(ChromEncoding enc = ChromEncoding::Quantised8Log) : enc_(enc) {}
 
-  /// Recalibrate every axis, keeping all stored (start, length) valid. This is why chromatograms
-  /// hold indices and not times: a re-timed run touches ~150 small arrays, not 4.46M chromatograms,
-  /// and nothing can be left on the old calibration because nothing else stores an RT.
-  template <typename Fn>
-  void recalibrateAxes(Fn&& map)
-  {
-    for (auto& a : axes_) { a.recalibrate(map); }
-  }
+  // recalibrateAxes() is gone deliberately, not renamed. It took a seconds -> seconds map and
+  // REWROTE the acquisition times, which is the wrong model: when a cycle was acquired is a
+  // physical fact and no calibration changes it. Use setCalibration(), which installs the
+  // seconds -> iRT map and leaves the seconds alone. Keeping the old name as an alias would have
+  // let a caller written against the old meaning compile and silently do something else.
 
   /// Register a window's time axis; returns its id. Axes are few (one per SWATH window) and small.
   std::uint32_t addAxis(std::vector<double> rt)
@@ -218,6 +215,61 @@ public:
   void get(std::size_t i, std::vector<double>& rt, std::vector<float>& intensity) const
   {
     getSlice(i, 0, refs_.at(i).length, rt, intensity);
+  }
+
+  // ---- the two time questions, answered from the same stored indices ---------------------------
+  //
+  // A chromatogram stores WHICH CYCLES it covers, not when they happened. That one representation
+  // answers both questions a caller can have -- "when was this acquired" (seconds, fixed) and
+  // "where does the library think this sits" (iRT, whatever the current calibration says) -- and a
+  // recalibration changes the second without touching a single stored point.
+  //
+  // Kept as separate calls rather than one that returns both: a scorer comparing shapes wants
+  // neither, a peak boundary wants seconds, an RT sub-score wants iRT, and materialising the wrong
+  // one is pure cost on 4.46M chromatograms.
+
+  /// iRT of every point of chromatogram @p i, under the current calibration.
+  /// Empty when the axis carries no calibration -- an uncalibrated iRT is absent, not zero.
+  void getIrt(std::size_t i, std::vector<double>& irt) const
+  {
+    getIrtSlice(i, 0, refs_.at(i).length, irt);
+  }
+
+  /// iRT over a sub-range, matching getSlice()'s [from, from + n).
+  void getIrtSlice(std::size_t i, std::uint32_t from, std::uint32_t n,
+                   std::vector<double>& irt) const
+  {
+    const ChromRef& r = refs_.at(i);
+    if (from > r.length) { from = r.length; }
+    if (from + n > r.length) { n = r.length - from; }
+    const ChromAxis& a = axes_.at(r.axis);
+    if (!a.calibrated()) { irt.clear(); return; }
+    irt.resize(n);
+    for (std::uint32_t k = 0; k < n; ++k) { irt[k] = a.irt(r.start + from + k); }
+  }
+
+  /// Is chromatogram @p i's axis calibrated, i.e. can getIrt answer at all?
+  bool hasIrt(std::size_t i) const { return axes_.at(refs_.at(i).axis).calibrated(); }
+
+  /// Seconds and iRT of a single point, without materialising a vector.
+  double secondsAt(std::size_t i, std::uint32_t k) const
+  {
+    const ChromRef& r = refs_.at(i);
+    return axes_.at(r.axis).seconds(r.start + std::min(k, r.length));
+  }
+  double irtAt(std::size_t i, std::uint32_t k) const
+  {
+    const ChromRef& r = refs_.at(i);
+    return axes_.at(r.axis).irt(r.start + std::min(k, r.length));
+  }
+
+  /// Install the seconds -> iRT map on every axis. This is the recalibration: ~150 small arrays are
+  /// rewritten and every one of the millions of stored chromatogram indices follows for free,
+  /// because none of them stores a time.
+  template <typename Fn>
+  void setCalibration(Fn&& to_irt)
+  {
+    for (auto& a : axes_) { a.setCalibration(to_irt); }
   }
 
   /// Decode a SUB-RANGE, [from, from + n) within the chromatogram.

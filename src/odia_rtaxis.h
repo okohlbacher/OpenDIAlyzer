@@ -58,6 +58,7 @@ public:
       throw std::invalid_argument("odia::RtAxis: retention times must be ascending");
     }
     t_ = std::move(seconds);
+    irt_.clear();               // a new grid invalidates any calibration fitted to the old one
   }
 
   bool empty() const { return t_.empty(); }
@@ -96,34 +97,73 @@ public:
     return 0.5 * std::max(a, b);
   }
 
-  /// RECALIBRATE: replace the grid's times, keeping every stored index valid.
-  ///
-  /// This is the operation the whole representation exists for. `map` transforms a time in seconds;
-  /// applying it here re-times the entire run at once, and every index held anywhere -- scored
-  /// rows, features, chromatograms -- follows without being touched. Nothing can be missed, because
-  /// nothing else stores an RT.
-  ///
-  /// The result must stay ascending. A transform that reorders the run is not a recalibration, it
-  /// is a bug, and it is rejected rather than silently producing an axis whose binary search is
-  /// meaningless.
+  // ---- the iRT half of the axis ---------------------------------------------------------------
+  //
+  // TWO PARALLEL ARRAYS OVER THE SAME INDEX. `t_` is when a cycle was acquired, in seconds. `irt_`
+  // is where that cycle sits in the library's iRT space under the CURRENT calibration. One index
+  // addresses both, so a caller asks for whichever it actually needs and never converts.
+  //
+  // An earlier version of this class re-timed the run by rewriting `t_`, which is wrong: the
+  // acquisition times are physical facts and no calibration changes them. What a calibration
+  // changes is the MAP into iRT space. Keeping them apart means a recalibration cannot corrupt the
+  // observed times, and the two questions -- "when was this seen" and "where does the library think
+  // it belongs" -- stop being answerable only by whichever one happened to be stored.
+  //
+  // f32 for iRT, f64 for seconds, deliberately. Seconds span 0..2333 and are compared against
+  // windows a few seconds wide, so the ulp must stay far below that. iRT is a normalised prediction
+  // whose own error is percent-scale, so f32's ~1e-7 relative precision is six orders below the
+  // signal -- and it halves the array. That asymmetry is the point: precision follows what the
+  // number is used for, not what it is called.
+
+  /// Install the iRT for every cycle from a transform seconds -> iRT. Rejects a non-monotone
+  /// result: elution order is physics, and a map that reorders it makes irtToIndex meaningless.
   template <typename Fn>
-  void recalibrate(Fn&& map)
+  void setCalibration(Fn&& to_irt)
   {
-    std::vector<double> out;
+    std::vector<float> out;
     out.reserve(t_.size());
-    for (const double v : t_) { out.push_back(map(v)); }
+    for (const double v : t_) { out.push_back(static_cast<float>(to_irt(v))); }
     if (!std::is_sorted(out.begin(), out.end()))
     {
-      throw std::invalid_argument("odia::RtAxis::recalibrate: transform is not monotone; that "
-                                  "reorders the run rather than re-timing it");
+      throw std::invalid_argument("odia::RtAxis::setCalibration: seconds -> iRT is not monotone; "
+                                  "that reorders the run rather than recalibrating it");
     }
-    t_.swap(out);
+    irt_.swap(out);
   }
 
+  bool calibrated() const { return irt_.size() == t_.size() && !irt_.empty(); }
+
+  /// iRT at a cycle. NaN when uncalibrated or the index is missing -- never 0, which is a legal iRT.
+  double irt(std::uint32_t i) const
+  {
+    if (i == kNoRt || !calibrated()) { return std::numeric_limits<double>::quiet_NaN(); }
+    return irt_[std::min<std::size_t>(i, irt_.size() - 1)];
+  }
+
+  /// Nearest cycle to an iRT, the inverse of irt(). Clamps at both ends; NaN yields kNoRt.
+  std::uint32_t irtToIndex(double v) const
+  {
+    if (!calibrated() || !std::isfinite(v)) { return kNoRt; }
+    const auto it = std::lower_bound(irt_.begin(), irt_.end(), static_cast<float>(v));
+    if (it == irt_.begin()) { return 0; }
+    if (it == irt_.end()) { return static_cast<std::uint32_t>(irt_.size() - 1); }
+    const std::size_t hi = static_cast<std::size_t>(it - irt_.begin());
+    const std::size_t lo = hi - 1;
+    return static_cast<std::uint32_t>((v - irt_[lo] <= irt_[hi] - v) ? lo : hi);
+  }
+
+  /// RECALIBRATE: install a new seconds -> iRT map. Every index held anywhere stays valid and
+  /// keeps meaning the same acquisition cycle; only where the library thinks that cycle belongs
+  /// changes. Nothing else in the tool stores an iRT, so nothing can be left on the old one.
+  template <typename Fn>
+  void recalibrate(Fn&& to_irt) { setCalibration(std::forward<Fn>(to_irt)); }
+
   const std::vector<double>& seconds() const { return t_; }
+  const std::vector<float>& irt() const { return irt_; }
 
 private:
-  std::vector<double> t_;
+  std::vector<double> t_;      ///< acquisition seconds, immutable once installed
+  std::vector<float> irt_;     ///< iRT of each cycle under the current calibration
 };
 
 } // namespace odia
