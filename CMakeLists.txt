@@ -82,6 +82,7 @@ add_executable(odia-lda-realdata-test src/odia_lda_realdata_test.cpp)
 # alone run. Both cover code that is LIVE in the tool: odia_split.h drives the extraction split and
 # odia_mzpeak_access.h is the mzPeak input layer. "19/19 tests pass" was true and misleading.
 add_executable(odia-split-test src/odia_split_test.cpp)
+add_executable(odia-spectrumstore-test src/odia_spectrumstore_test.cpp)
 
 # The kernels in odia_lda.h / odia_gbt.h contain `#pragma omp` regions. Without linking OpenMP,
 # _OPENMP is undefined, every pragma is ignored, and the tests that set n_threads = 1/8/64 run
@@ -206,6 +207,7 @@ add_test(NAME odia-rtaxis COMMAND odia-rtaxis-test)
 add_test(NAME odia-features COMMAND odia-features-test)
 add_test(NAME odia-prefilter-model COMMAND odia-prefilter-model-test)
 add_test(NAME odia-split COMMAND odia-split-test)
+add_test(NAME odia-spectrumstore COMMAND odia-spectrumstore-test)
 add_test(NAME odia-lda-realdata
          COMMAND odia-lda-realdata-test "${CMAKE_CURRENT_SOURCE_DIR}/testdata/lda_fixture.txt")
 set_tests_properties(odia-lda-realdata PROPERTIES SKIP_RETURN_CODE 77)

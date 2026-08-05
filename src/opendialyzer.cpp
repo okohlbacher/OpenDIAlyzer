@@ -202,6 +202,12 @@ protected:
     // (integer depths dominate the features) and a `>= cut` rule keeps every tied row, which
     // measured 28% of targets against 15% of decoys -- asymmetric, the one thing an FDR null
     // cannot tolerate.
+    registerStringOption_("mzpeak_cache_spectra", "true|false", "true",
+                          "Decode every mzPeak spectrum ONCE into a compact in-memory store "
+                          "(8 B/peak) instead of re-decoding on each of the run's five passes. "
+                          "false streams, which is O(one group) in memory but pays the decode "
+                          "five times -- measured 154 MB on a 13.7 GB diaPASEF run.", false, true);
+    setValidStrings_("mzpeak_cache_spectra", {"true", "false"});
     registerStringOption_("prefilter_model", "true|false", "false",
                           "Rank prefilter candidates with the learned model instead of thresholding "
                           "fragment depth. Keeps -prefilter_keep_fraction of EACH class.", false, true);
@@ -1088,6 +1094,20 @@ protected:
     if (in.size() > 7 && in.compare(in.size() - 7, 7, ".mzpeak") == 0)
     {
       swath_maps = odia::loadMzPeakSwathMaps(in, mzpeak_index_);
+      // DECODE ONCE, OR STREAM EVERY TIME. The run walks the spectra five times -- prefilter
+      // targets, prefilter decoys, CiRT calibration, pass 1, pass 2 -- and the streaming reader
+      // re-decodes parquet on each. mzML never showed this because it parses once and leaves
+      // everything resident, so passes 2-5 are walks over RAM; measured, the same analysis ran
+      // 20:16 on mzML and was still inside the PREFILTER after 83 minutes on mzPeak.
+      //
+      // Not defaulted blindly, because streaming exists for a measured reason: it held 154 MB on a
+      // 13.7 GB diaPASEF run where the resident path needed 500 GB - 2.0 TB. Caching trades that
+      // back for time, so the size is logged and the switch is real.
+      if (!swath_maps.empty() && getStringOption_("mzpeak_cache_spectra") != "false")
+      {
+        PhaseTimer pt_pop("mzpeak_populate");
+        mzpeak_index_->populate(getIntOption_("threads"));
+      }
       // exp_meta stays null: mzPeak carries no OpenMS ExperimentalSettings. Downstream only
       // uses it for provenance in the output, and OpenSwathWorkflow tolerates a null here.
       return !swath_maps.empty();

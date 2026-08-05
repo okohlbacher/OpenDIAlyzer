@@ -29,6 +29,7 @@
 #include <mzpeak/open.h>
 
 #include "odia_mmap_archive.h"
+#include "odia_spectrumstore.h"
 #include <mzpeak/index.h>
 #include <mzpeak/spectra.h>
 #include <mzpeak/spectrum.h>
@@ -296,7 +297,97 @@ public:
   /// Decode one group into a fresh OpenSWATH spectrum (mz / intensity / drift arrays).
   /// Thread-safe: mzPeak decoding is serialised here because the reader is not documented
   /// as concurrently reentrant. Chunked callers therefore parallelise over *work*, not IO.
+  /// Decode EVERY group of every window once, into per-window SpectrumStores.
+  ///
+  /// The run walks the spectra five times (prefilter targets, prefilter decoys, calibration,
+  /// pass 1, pass 2). mzML parsed once and left them resident, so passes 2-5 were walks over RAM;
+  /// mzPeak streams, so each pass genuinely re-decoded parquet -- the same analysis went from
+  /// 20:16 to over 83 minutes still inside the prefilter. Decoding once here restores the property
+  /// mzML had by accident, at 8 B/peak instead of 16.
+  ///
+  /// Parallel over WINDOWS, serial within one: each store is filled by exactly one thread, so no
+  /// locking and no shared append. ~150 windows over the available workers.
+  void populate(int threads)
+  {
+    std::vector<long> keys;
+    keys.reserve(windows_.size() + 1);
+    for (const auto& kv : groups_) { keys.push_back(kv.first); }
+    stores_.clear();
+    for (long k : keys) { stores_.emplace(k, odia::SpectrumStore{}); }
+
+    std::size_t n_spec = 0, n_peak = 0;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) num_threads(std::max(1, threads)) \
+        reduction(+ : n_spec, n_peak)
+#endif
+    for (std::size_t ki = 0; ki < keys.size(); ++ki)
+    {
+      const long wkey = keys[ki];
+      auto& store = stores_.at(wkey);
+      const auto& gs = groups_.at(wkey);
+      store.reserve(gs.size(), 0);
+      for (std::size_t gi = 0; gi < gs.size(); ++gi)
+      {
+        OpenSwath::SpectrumPtr sp = decodeRaw(wkey, gi);
+        odia::SpectrumStore::Meta m;
+        m.rt = gs[gi].rt;
+        m.ms_level = (wkey == kMs1Key) ? 1 : 2;
+        const auto wit = windows_.find(wkey);
+        if (wit != windows_.end())
+        {
+          m.iso_lower = wit->second.lower;
+          m.iso_upper = wit->second.upper;
+          m.precursor_mz = 0.5 * (wit->second.lower + wit->second.upper);
+        }
+        const auto& mzv = sp->getMZArray()->data;
+        const auto& inv = sp->getIntensityArray()->data;
+        std::vector<float> fi(inv.size());
+        for (std::size_t k = 0; k < inv.size(); ++k) { fi[k] = static_cast<float>(inv[k]); }
+        const auto dtp = sp->getDriftTimeArray();
+        const bool has_dt = dtp && dtp->data.size() == mzv.size() &&
+                            std::any_of(dtp->data.begin(), dtp->data.end(),
+                                        [](double x) { return x >= 0.0; });
+        store.add(mzv.data(), fi.data(), static_cast<std::uint32_t>(mzv.size()), m,
+                  has_dt ? dtp->data.data() : nullptr);
+        n_spec += 1;
+        n_peak += mzv.size();
+      }
+    }
+    populated_ = true;
+    std::size_t b = 0;
+    for (const auto& kv : stores_) { b += kv.second.bytes(); }
+    std::fprintf(stderr,
+                 "OpenDIAlyzer[mzpeak] decoded %zu spectra, %zu peaks ONCE into %.2f GB "
+                 "(%.2f GB as double pairs, %.2fx); later passes read memory\n",
+                 n_spec, n_peak, b / 1073741824.0, n_peak * 16.0 / 1073741824.0,
+                 (n_peak * 16.0) / std::max<double>(1.0, double(b)));
+  }
+
+  bool populated() const { return populated_; }
+
+  /// Serve from the store when it is populated; otherwise decode.
   OpenSwath::SpectrumPtr decode(long wkey, std::size_t gi)
+  {
+    if (populated_)
+    {
+      const auto it = stores_.find(wkey);
+      if (it != stores_.end() && gi < it->second.size())
+      {
+        OpenSwath::SpectrumPtr out(new OpenSwath::Spectrum);
+        OpenSwath::BinaryDataArrayPtr mz(new OpenSwath::BinaryDataArray);
+        OpenSwath::BinaryDataArrayPtr in(new OpenSwath::BinaryDataArray);
+        OpenSwath::BinaryDataArrayPtr dt(new OpenSwath::BinaryDataArray);
+        it->second.widen(gi, mz->data, in->data, &dt->data);
+        out->setMZArray(mz);
+        out->setIntensityArray(in);
+        out->setDriftTimeArray(dt);
+        return out;
+      }
+    }
+    return decodeRaw(wkey, gi);
+  }
+
+  OpenSwath::SpectrumPtr decodeRaw(long wkey, std::size_t gi)
   {
     OpenSwath::SpectrumPtr out(new OpenSwath::Spectrum);
     OpenSwath::BinaryDataArrayPtr mz(new OpenSwath::BinaryDataArray);
@@ -431,6 +522,8 @@ private:
   static inline std::string s_path_;
   MzPeak::Index index_;
   MzPeak::Spectra spectra_;      ///< index-build only; decode() uses a thread_local Spectra
+  std::map<long, odia::SpectrumStore> stores_;   ///< per window; filled once by populate()
+  bool populated_ = false;
   std::map<long, std::vector<MzPeakGroup>> groups_;
   std::map<long, Window> windows_;
   std::map<long, std::pair<double,double>> im_range_{};
