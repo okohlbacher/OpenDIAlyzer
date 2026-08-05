@@ -208,6 +208,19 @@ protected:
                           "false streams, which is O(one group) in memory but pays the decode "
                           "five times -- measured 154 MB on a 13.7 GB diaPASEF run.", false, true);
     setValidStrings_("mzpeak_cache_spectra", {"true", "false"});
+    // CONCURRENT DECODERS, capped independently of -threads. Each worker that decodes gets a
+    // thread_local MzPeak::Spectra holding parquet row-group buffers, and that state -- not the
+    // store -- is what dominates: at 224 threads the populate phase peaked at 105.8 GB, at 8
+    // threads the same work sat near 21.8 GB, and the UNCACHED streaming runs hit 123-127 GB for
+    // the same reason. The store was never the cause; it slightly reduced the peak.
+    //
+    // Capping is nearly free because populate is the ONLY phase that decodes: once the store is
+    // populated, decode() serves from memory and no further Spectra is ever constructed. So this
+    // bounds the decoder state for the whole run, not just for this phase.
+    registerIntOption_("mzpeak_decode_threads", "<n>", 16,
+                       "Maximum concurrent mzPeak decoders while filling the spectrum store. Each "
+                       "costs its own parquet row-group buffers.", false, true);
+    setMinInt_("mzpeak_decode_threads", 1);
     registerStringOption_("prefilter_model", "true|false", "false",
                           "Rank prefilter candidates with the learned model instead of thresholding "
                           "fragment depth. Keeps -prefilter_keep_fraction of EACH class.", false, true);
@@ -1106,7 +1119,8 @@ protected:
       if (!swath_maps.empty() && getStringOption_("mzpeak_cache_spectra") != "false")
       {
         PhaseTimer pt_pop("mzpeak_populate");
-        mzpeak_index_->populate(getIntOption_("threads"));
+        mzpeak_index_->populate(std::min(getIntOption_("threads"),
+                                         getIntOption_("mzpeak_decode_threads")));
       }
       // exp_meta stays null: mzPeak carries no OpenMS ExperimentalSettings. Downstream only
       // uses it for provenance in the output, and OpenSwathWorkflow tolerates a null here.

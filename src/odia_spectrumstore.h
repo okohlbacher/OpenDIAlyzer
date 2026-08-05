@@ -102,6 +102,44 @@ public:
     return meta_.size() - 1;
   }
 
+  /// Append from float32 that is ALREADY sorted by m/z. The population path decodes straight to
+  /// float32, so widening to double just to narrow again here would be the exact waste this store
+  /// exists to remove.
+  std::size_t addFloat(const float* mz, const float* intensity, const float* drift,
+                       std::uint32_t n, const Meta& m)
+  {
+    for (std::uint32_t k = 1; k < n; ++k)
+    {
+      if (mz[k] < mz[k - 1])
+      {
+        throw std::invalid_argument("odia::SpectrumStore: m/z array is not ascending");
+      }
+    }
+    Meta e = m;
+    e.offset = mz_.size();
+    e.count = n;
+    if (drift && dt_.empty() && !mz_.empty()) { dt_.resize(mz_.size(), -1.0F); }
+    mz_.insert(mz_.end(), mz, mz + n);
+    in_.insert(in_.end(), intensity, intensity + n);
+    if (!dt_.empty() || drift)
+    {
+      if (drift) { dt_.insert(dt_.end(), drift, drift + n); }
+      else { dt_.insert(dt_.end(), n, -1.0F); }
+    }
+    meta_.push_back(e);
+    return meta_.size() - 1;
+  }
+
+  /// Hand the arrays back their exact size. push_back growth leaves up to 2x overshoot, which on
+  /// hundreds of millions of peaks is gigabytes of capacity nothing will ever use.
+  void compact()
+  {
+    mz_.shrink_to_fit();
+    in_.shrink_to_fit();
+    dt_.shrink_to_fit();
+    meta_.shrink_to_fit();
+  }
+
   std::size_t size() const { return meta_.size(); }
   std::size_t peakCount() const { return mz_.size(); }
   const Meta& meta(std::size_t i) const { return meta_.at(i); }

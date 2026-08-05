@@ -325,10 +325,23 @@ public:
       const long wkey = keys[ki];
       auto& store = stores_.at(wkey);
       const auto& gs = groups_.at(wkey);
+      // Scratch reused for every spectrum of this window: allocate three times per WINDOW, not
+      // three times per spectrum. ~150 windows instead of ~587,000 spectra.
+      std::vector<float> dmz, din, ddt;
+      std::vector<std::uint32_t> ord;
       store.reserve(gs.size(), 0);
       for (std::size_t gi = 0; gi < gs.size(); ++gi)
       {
-        OpenSwath::SpectrumPtr sp = decodeRaw(wkey, gi);
+        // decodeRaw() is the WRONG tool here and this is the whole cost. Per spectrum it holds
+        // mz/in/dt built by push_back (24 B/peak, up to 48 with doubling overshoot), a
+        // vector<size_t> permutation (8 B/peak), and then THREE MORE reserved vector<double> to
+        // emit the sorted copy (24 B/peak) -- ~84 B/peak live, in 8 allocations, for data whose
+        // stored form is 8 B/peak. Ten times what it keeps, all in doubles, all immediately
+        // narrowed and thrown away.
+        //
+        // decodeFloat() collects float32 directly and sorts a uint32 permutation, so the transient
+        // is ~12 B/peak in 3 allocations that are REUSED across the whole window rather than
+        // reallocated per spectrum.
         odia::SpectrumStore::Meta m;
         m.rt = gs[gi].rt;
         m.ms_level = (wkey == kMs1Key) ? 1 : 2;
@@ -339,20 +352,14 @@ public:
           m.iso_upper = wit->second.upper;
           m.precursor_mz = 0.5 * (wit->second.lower + wit->second.upper);
         }
-        const auto& mzv = sp->getMZArray()->data;
-        const auto& inv = sp->getIntensityArray()->data;
-        std::vector<float> fi(inv.size());
-        for (std::size_t k = 0; k < inv.size(); ++k) { fi[k] = static_cast<float>(inv[k]); }
-        const auto dtp = sp->getDriftTimeArray();
-        const bool has_dt = dtp && dtp->data.size() == mzv.size() &&
-                            std::any_of(dtp->data.begin(), dtp->data.end(),
-                                        [](double x) { return x >= 0.0; });
-        store.add(mzv.data(), fi.data(), static_cast<std::uint32_t>(mzv.size()), m,
-                  has_dt ? dtp->data.data() : nullptr);
+        decodeFloat(wkey, gi, dmz, din, ddt, ord);
+        store.addFloat(dmz.data(), din.data(), ddt.empty() ? nullptr : ddt.data(),
+                       static_cast<std::uint32_t>(dmz.size()), m);
         n_spec += 1;
-        n_peak += mzv.size();
+        n_peak += dmz.size();
       }
     }
+    for (auto& kv : stores_) { kv.second.compact(); }   // hand back push_back's overshoot
     populated_ = true;
     std::size_t b = 0;
     for (const auto& kv : stores_) { b += kv.second.bytes(); }
@@ -385,6 +392,80 @@ public:
       }
     }
     return decodeRaw(wkey, gi);
+  }
+
+  /// Decode one group straight into float32, sorted by m/z, reusing the caller's scratch.
+  ///
+  /// Same semantics as decodeRaw -- the ion-mobility band is half-open [lo, hi) so sibling windows
+  /// partition the axis, and a NaN mobility is excluded rather than kept everywhere -- but nothing
+  /// is ever materialised as double. Transient is ~12 B/peak in three vectors that live for a whole
+  /// WINDOW, against ~84 B/peak in eight per-spectrum allocations through decodeRaw.
+  ///
+  /// `dt` is left EMPTY when the run has no per-peak mobility. decodeRaw fills a drift array
+  /// unconditionally, using the spectrum's scalar mobility as a stand-in, and a scalar >= 0 would
+  /// otherwise be stored as if it were per-peak -- 4 B/peak for a constant, on an instrument
+  /// (Astral) that reports no mobility at all.
+  void decodeFloat(long wkey, std::size_t gi,
+                   std::vector<float>& mz, std::vector<float>& in, std::vector<float>& dt,
+                   std::vector<std::uint32_t>& ord)
+  {
+    mz.clear(); in.clear(); dt.clear();
+    const auto& gs = groups(wkey);
+    if (gi >= gs.size()) { return; }
+    thread_local MzPeak::Spectra t_spectra = sharedIndex(s_path_).spectra();
+    for (uint64_t si : gs[gi].slices)
+    {
+      try
+      {
+        auto sp = t_spectra[static_cast<std::size_t>(si)];
+        const std::vector<double>& m = sp.mz();
+        const std::vector<float>& y = sp.intensity();
+        const std::size_t n = std::min(m.size(), y.size());
+        const std::vector<double>& imv = sp.ion_mobility_array();
+        const bool per_peak_im = imv.size() >= n;
+        const double lo = gs[gi].im_lo, hi = gs[gi].im_hi;
+        const bool banded = per_peak_im && (std::isfinite(lo) || std::isfinite(hi));
+        for (std::size_t k = 0; k < n; ++k)
+        {
+          if (banded && !(imv[k] >= lo && imv[k] < hi)) { continue; }
+          mz.push_back(static_cast<float>(m[k]));
+          in.push_back(y[k]);
+          if (per_peak_im) { dt.push_back(static_cast<float>(imv[k])); }
+        }
+      }
+      catch (const std::exception& e)
+      {
+        if (!decode_error_reported_)
+        {
+          decode_error_reported_ = true;
+          std::fprintf(stderr, "OpenDIAlyzer/mzPeak: cannot decode spectrum %llu (%s).\n",
+                       (unsigned long long) si, e.what());
+        }
+      }
+    }
+    if (!dt.empty() && dt.size() != mz.size()) { dt.clear(); }   // partial IM is no IM
+    // Concatenated slices are not globally sorted and OpenSWATH requires ascending m/z. Permute a
+    // uint32 index (4 B/peak, not the 8 B a size_t costs) and apply it in place.
+    const std::size_t n = mz.size();
+    bool sorted = true;
+    for (std::size_t k = 1; k < n && sorted; ++k) { sorted = mz[k] >= mz[k - 1]; }
+    if (!sorted)
+    {
+      ord.resize(n);
+      for (std::size_t k = 0; k < n; ++k) { ord[k] = static_cast<std::uint32_t>(k); }
+      std::sort(ord.begin(), ord.end(),
+                [&](std::uint32_t a, std::uint32_t b) { return mz[a] < mz[b]; });
+      std::vector<float> tmp(n);
+      for (std::size_t k = 0; k < n; ++k) { tmp[k] = mz[ord[k]]; }
+      mz.swap(tmp);
+      for (std::size_t k = 0; k < n; ++k) { tmp[k] = in[ord[k]]; }
+      in.swap(tmp);
+      if (!dt.empty())
+      {
+        for (std::size_t k = 0; k < n; ++k) { tmp[k] = dt[ord[k]]; }
+        dt.swap(tmp);
+      }
+    }
   }
 
   OpenSwath::SpectrumPtr decodeRaw(long wkey, std::size_t gi)
