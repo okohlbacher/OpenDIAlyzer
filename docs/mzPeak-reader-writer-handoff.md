@@ -416,3 +416,54 @@ Items 1–4 of the original list are done upstream. What remains:
 Deliberately *not* recommended: reimplementing the format from the paper. The Rust reference is the
 conformance oracle and the C++ roadmap is accurate about its own gaps; both are better inputs than a
 fresh reading of the specification.
+
+
+## BLOCKING: bulk spectrum reads. A point query per spectrum makes a full scan quadratic
+
+Measured on astral.mzpeak (3.09 GB, 307,590 spectra) with the reader at trunk:
+
+    3,000 SEQUENTIAL spectra did not decode in 900 s   -> under 3.3 spectra/s
+    the same analysis reading mzML parses the whole file in 104 s
+
+At that rate one pass over the run's spectra is ~15 h single-threaded. Raising concurrency
+trades it straight back for memory: 224 decoders peaked at 105.8 GB, 16 decoders at
+30.6 GB but did not finish in 40 minutes. Time and memory are in direct opposition and
+neither end is usable.
+
+### Why
+
+`spectra_peaks.parquet` holds 512,278,842 rows in 489 row groups, averaging 1,047,605 rows
+per group. A spectrum is ~1,666 of those rows.
+
+`Spectra::fetch(index)` issues a POINT QUERY for one spectrum:
+
+    signals_->select(dims_, signals_->index().eq(index_))      // spectrum.cpp:56
+
+and `Signals::select` builds a fresh Planner and Executor for every call
+(data/signals.cpp:165-187), consulting parquet statistics and the row-group page index.
+So each spectrum costs a plan across 489 row groups plus a page read out of a 1,047,605-row
+group -- roughly 630x more decoded rows than the caller asked for -- and nothing is cached
+between calls: 3,000 sequential spectra span ~5 row groups but triggered ~3,000 row-group
+decodes, about 37 GB of redundant work.
+
+Iteration does not help. `Spectra` is an `EnumerableProxy<Spectrum>` whose Iterator holds
+`fetch_t = std::function<V(std::size_t)>` and calls it per element, so iterating is the same
+point query. `get_spectra_batch` sorts indices ascending "so file access is sequential" --
+an acknowledgement of the cost -- but still calls `fetch()` per index, so it issues N plans.
+
+### What is needed, and why it cannot be done by the caller
+
+A bulk sequential read that plans ONCE and streams row groups in order, yielding spectra as
+it goes: 489 planned reads instead of 307,590, with peaks arriving already grouped. The
+query API can express it -- `index().ge(a).and_then(index().le(b))` -- but `Spectra::data_`
+and `Spectra::peaks_` are PRIVATE, so no caller can issue a range select. Either
+
+  1. a public bulk/streaming entry point on Spectra (preferred: preload metadata once, then
+     walk row groups and hand back spectra), or
+  2. a decoded-row-group cache inside Spectra so sorted access reuses a group across the
+     ~630 spectra that share it.
+
+Until one exists, mzPeak input cannot feed a full analysis at this scale, and ODIA
+benchmarks stay on mzML. Everything on the ODIA side is already done: one shared mmap
+(zero descriptors), one shared Index, a compact 8 B/peak spectrum store, and a bounded
+decoder count.
