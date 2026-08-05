@@ -3717,6 +3717,32 @@ protected:
         }
       }
     }
+    // COMPONENT ACCOUNTING FOR THE PREFILTER. The retained-memory jump across this phase is
+    // +13.50 GB measured, and nothing said what it was made of -- the 471M-allocation figure in the
+    // comments is DERIVED arithmetic (78.6M transitions x ~6 strings) for the ORDINARY reader, and
+    // -compact_library already removed it (in_use 0.85 GB after load). So the number everyone
+    // quotes describes a path this configuration does not take. Measure what this one actually
+    // allocates instead of inheriting an explanation.
+    {
+      auto strb = [](const std::string& x) {
+        return sizeof(std::string) + (x.capacity() > 15 ? x.capacity() + 1 : 0);   // SSO threshold
+      };
+      std::size_t ev_b = res.evidence.capacity() * sizeof(TransitionListEvidenceFilter::PrecursorEvidence);
+      std::size_t ev_heap = 0;
+      for (const auto& e : res.evidence) { ev_heap += strb(e.compound_id) + strb(e.sequence) - 2 * sizeof(std::string); }
+      std::size_t keep_b = 0;
+      for (const auto& k : keep) { keep_b += strb(k) + 32; }                       // + node overhead
+      std::size_t dv_b = dview.compounds.capacity() * sizeof(OpenSwath::LightCompound)
+                       + dview.transitions.capacity() * sizeof(OpenSwath::LightTransition);
+      std::size_t dv_heap = 0;
+      for (const auto& t : dview.transitions) { dv_heap += strb(t.transition_name) + strb(t.peptide_ref) - 2 * sizeof(std::string); }
+      const double gb = 1073741824.0;
+      OPENMS_LOG_INFO << "OpenDIAlyzer[mem/component] prefilter: evidence " << res.evidence.size()
+                      << " rows " << (ev_b + ev_heap) / gb << " GB (" << ev_heap / gb << " GB heap strings); "
+                      << "decoy view " << dview.transitions.size() << " transitions "
+                      << (dv_b + dv_heap) / gb << " GB (" << dv_heap / gb << " GB heap strings); "
+                      << "keep-set " << keep.size() << " ids " << keep_b / gb << " GB" << std::endl;
+    }
     OPENMS_LOG_INFO << "OpenDIAlyzer[prefilter] evidence: " << keep.size() << " targets, "
                     << keep_decoy.size() << " decoys pass the same criterion (label-symmetric "
                     << "selection; a large asymmetry here means the criterion is not discriminating)."
@@ -4257,16 +4283,76 @@ protected:
   /// The "DECOY_" prefix is preserved deliberately: prefilterLibrary_ pairs decoys to targets by
   /// exactly that convention, so the pairing logic needs no change. The real ids live on in the
   /// compact library and are restored for output.
-  void materializeFromCompact_(const odia::CompactLibrary& clib,
-                               OpenSwath::LightTargetedExperiment& exp) const
+  /// Peptide -> [first, last) over the transition array.
+  ///
+  /// The parquet is written grouped by precursor, so a peptide's transitions are contiguous. That
+  /// is ASSERTED rather than assumed: if it were false the ranges would silently address the wrong
+  /// fragments, and the failure would look like a scoring problem three phases later.
+  std::vector<std::uint32_t> transitionRanges_(const odia::CompactLibrary& clib) const
   {
     using CL = odia::CompactLibrary;
-    exp.compounds.reserve(clib.peptideCount());
-    exp.transitions.reserve(clib.transitionCount());
+    const std::size_t np = clib.peptideCount(), nt = clib.transitionCount();
+    std::vector<std::uint32_t> first(np + 1, 0);
+    std::uint32_t prev = 0;
+    bool contiguous = true;
+    for (std::size_t i = 0; i < nt; ++i)
+    {
+      const std::uint32_t pi = static_cast<std::uint32_t>(clib.peptideOf(CL::Transition(std::uint32_t(i))));
+      if (i == 0) { prev = pi; first[pi] = 0; }
+      else if (pi != prev)
+      {
+        if (pi < prev) { contiguous = false; break; }
+        for (std::uint32_t k = prev + 1; k <= pi; ++k) { first[k] = std::uint32_t(i); }
+        prev = pi;
+      }
+    }
+    if (!contiguous) { return {}; }
+    for (std::uint32_t k = prev + 1; k <= np; ++k) { first[k] = std::uint32_t(nt); }
+    return first;
+  }
+
+  /// Materialise a LightTargetedExperiment from the compact library.
+  ///
+  /// THE POINT OF top_k AND keep. Measured on this library, 117,548,725 LightTransitions are
+  /// constructed across the load and the decoy view, and 4,464,515 survive the prefilter -- 3.8%.
+  /// The other 96% are built, never looked at again, and freed, which is where the retained-memory
+  /// high-water mark comes from: it is allocate/free churn, not live data.
+  ///
+  /// So the order is inverted. Build ONLY what the filter reads (top_k = 6, because
+  /// TransitionListEvidenceFilter indexes exactly ms2_top_transitions_per_precursor fragments and
+  /// never touches the rest), filter, then build the FULL transition set for survivors alone.
+  ///
+  ///   top_k > 0   emit only the top_k transitions per peptide, by library intensity
+  ///   keep        per-peptide flags; emit only peptides whose flag is set
+  ///
+  /// Parallel over CONTIGUOUS peptide ranges with per-thread output buffers concatenated in range
+  /// order, so the result is byte-identical to the serial one regardless of thread count. That
+  /// matters here more than usual: this feeds a target-decoy FDR, and a library whose row order
+  /// depends on the scheduler would make the null non-reproducible.
+  void materializeFromCompact_(const odia::CompactLibrary& clib,
+                               OpenSwath::LightTargetedExperiment& exp,
+                               std::size_t top_k = 0,
+                               const std::vector<char>* keep = nullptr) const
+  {
+    using CL = odia::CompactLibrary;
+    std::vector<std::uint32_t> tr_first;
+    if (top_k > 0 || keep) { tr_first = transitionRanges_(clib); }
+    if ((top_k > 0 || keep) && tr_first.empty())
+    {
+      OPENMS_LOG_WARN << "OpenDIAlyzer[compact] transitions are not grouped by peptide; "
+                      << "materialising in full." << std::endl;
+      top_k = 0; keep = nullptr;
+    }
+    exp.compounds.reserve(keep ? std::size_t(std::count(keep->begin(), keep->end(), 1))
+                               : clib.peptideCount());
+    exp.transitions.reserve(top_k > 0 ? std::min<std::size_t>(clib.transitionCount(),
+                                                              clib.peptideCount() * top_k)
+                                      : clib.transitionCount());
 
     std::unordered_map<std::string, std::size_t> prot_seen;
     for (std::size_t i = 0; i < clib.peptideCount(); ++i)
     {
+      if (keep && !(*keep)[i]) { continue; }          // survivors only
       const auto p = CL::Peptide(std::uint32_t(i));
       OpenSwath::LightCompound c;
       // A decoy is named for its TARGET, which is what makes "DECOY_" + target id pair.
@@ -4286,41 +4372,135 @@ protected:
       }
       exp.compounds.push_back(std::move(c));
     }
-    for (std::size_t i = 0; i < clib.transitionCount(); ++i)
+    // Per PEPTIDE, so top_k can be applied and survivors skipped. Parallel over contiguous peptide
+    // ranges, each thread appending to its own buffer, concatenated in range order -- identical
+    // output for any thread count.
+    if (tr_first.empty())
     {
-      const auto t = CL::Transition(std::uint32_t(i));
-      const auto pep = clib.peptideOf(t);
-      const std::uint32_t pi = static_cast<std::uint32_t>(pep);
-      const std::uint8_t fl = clib.transitionFlags(t);
-      OpenSwath::LightTransition tr;
-      // "t" + base-36 index: <= 8 chars, always SSO.
-      tr.transition_name = "t" + CL::syntheticId(std::uint32_t(i), false).substr(1);
-      const bool tdec = clib.isDecoy(pep);
-      const std::uint32_t tpr = clib.pairedTarget(pep);
-      tr.peptide_ref = CL::syntheticId((tdec && tpr != CL::no_pair) ? tpr : pi, tdec);
-      tr.precursor_mz = clib.precursorMz(pep);
-      tr.product_mz = clib.productMz(t);
-      tr.library_intensity = clib.intensity(t);
-      tr.precursor_im = clib.driftTime(pep);
-      tr.fragment_charge = clib.fragmentCharge(t);
-      // FROM THE PEPTIDE, not the transition's own DECOY column.
-      //
-      // Downstream derives a precursor's decoy status by scanning its TRANSITIONS
-      // (buildPrecursorIndex_ / the prefilter both do `if (t.getDecoy()) decoy_refs.insert(...)`),
-      // so a decoy peptide whose transitions are not flagged is invisible AS A DECOY -- which is
-      // what produced "118,902 target / 0 decoy" here even with 3,546,541 decoy peptides correctly
-      // loaded. The transition table's own DECOY column is not reliably populated in this library.
-      //
-      // The peptide's flag is authoritative and the invariant is exact: every transition of a decoy
-      // peptide is a decoy transition. Deriving it removes the dependency on a column that may not
-      // be there.
-      tr.setDecoy(clib.isDecoy(pep));
-      tr.setDetectingTransition((fl & CL::Detecting) != 0);
-      tr.setIdentifyingTransition((fl & CL::Identifying) != 0);
-      tr.setQuantifyingTransition((fl & CL::Quantifying) != 0);
-      const auto ann = clib.annotation(t);
-      if (!ann.empty()) { tr.setFragmentType(std::string(ann)); }
-      exp.transitions.push_back(std::move(tr));
+      for (std::size_t i = 0; i < clib.transitionCount(); ++i)
+      {
+          const auto t = CL::Transition(std::uint32_t(i));
+          const auto pep = clib.peptideOf(t);
+          const std::uint32_t pi = static_cast<std::uint32_t>(pep);
+          const std::uint8_t fl = clib.transitionFlags(t);
+          OpenSwath::LightTransition tr;
+          // "t" + base-36 index: <= 8 chars, always SSO.
+          tr.transition_name = "t" + CL::syntheticId(std::uint32_t(i), false).substr(1);
+          const bool tdec = clib.isDecoy(pep);
+          const std::uint32_t tpr = clib.pairedTarget(pep);
+          tr.peptide_ref = CL::syntheticId((tdec && tpr != CL::no_pair) ? tpr : pi, tdec);
+          tr.precursor_mz = clib.precursorMz(pep);
+          tr.product_mz = clib.productMz(t);
+          tr.library_intensity = clib.intensity(t);
+          tr.precursor_im = clib.driftTime(pep);
+          tr.fragment_charge = clib.fragmentCharge(t);
+          // FROM THE PEPTIDE, not the transition's own DECOY column.
+          //
+          // Downstream derives a precursor's decoy status by scanning its TRANSITIONS
+          // (buildPrecursorIndex_ / the prefilter both do `if (t.getDecoy()) decoy_refs.insert(...)`),
+          // so a decoy peptide whose transitions are not flagged is invisible AS A DECOY -- which is
+          // what produced "118,902 target / 0 decoy" here even with 3,546,541 decoy peptides correctly
+          // loaded. The transition table's own DECOY column is not reliably populated in this library.
+          //
+          // The peptide's flag is authoritative and the invariant is exact: every transition of a decoy
+          // peptide is a decoy transition. Deriving it removes the dependency on a column that may not
+          // be there.
+          tr.setDecoy(clib.isDecoy(pep));
+          tr.setDetectingTransition((fl & CL::Detecting) != 0);
+          tr.setIdentifyingTransition((fl & CL::Identifying) != 0);
+          tr.setQuantifyingTransition((fl & CL::Quantifying) != 0);
+          const auto ann = clib.annotation(t);
+          if (!ann.empty()) { tr.setFragmentType(std::string(ann)); }
+        exp.transitions.push_back(std::move(tr));
+      }
+    }
+    else
+    {
+      const std::size_t np = clib.peptideCount();
+      int nthr = 1;
+#ifdef _OPENMP
+      nthr = std::max(1, omp_get_max_threads());
+#endif
+      std::vector<std::vector<OpenSwath::LightTransition>> parts{std::size_t(nthr)};
+      const std::size_t chunk = (np + std::size_t(nthr) - 1) / std::size_t(nthr);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static, 1)
+#endif
+      for (int th = 0; th < nthr; ++th)
+      {
+        const std::size_t lo = std::size_t(th) * chunk, hi = std::min(np, lo + chunk);
+        auto& out = parts[std::size_t(th)];
+        std::vector<std::pair<float, std::uint32_t>> order;   // (intensity, transition index)
+        for (std::size_t pi = lo; pi < hi; ++pi)
+        {
+          if (keep && !(*keep)[pi]) { continue; }
+          const std::uint32_t b = tr_first[pi], e = tr_first[pi + 1];
+          order.clear();
+          for (std::uint32_t j = b; j < e; ++j)
+          { order.emplace_back(clib.intensity(CL::Transition(j)), j); }
+          if (top_k > 0 && order.size() > top_k)
+          {
+            // Same rule the evidence filter uses: highest library intensity first. The tie-break is
+            // the transition INDEX, i.e. library order -- deterministic and independent of the id
+            // strings, which is what the filter ties on and what differs between the compact and
+            // ordinary paths.
+            std::partial_sort(order.begin(), order.begin() + std::ptrdiff_t(top_k), order.end(),
+                              [](const auto& x, const auto& y) {
+                                if (x.first != y.first) { return x.first > y.first; }
+                                return x.second < y.second;
+                              });
+            order.resize(top_k);
+            std::sort(order.begin(), order.end(),
+                      [](const auto& x, const auto& y) { return x.second < y.second; });
+          }
+          for (const auto& oi : order)
+          {
+            const std::size_t i = oi.second;
+              const auto t = CL::Transition(std::uint32_t(i));
+              const auto pep = clib.peptideOf(t);
+              const std::uint32_t pi = static_cast<std::uint32_t>(pep);
+              const std::uint8_t fl = clib.transitionFlags(t);
+              OpenSwath::LightTransition tr;
+              // "t" + base-36 index: <= 8 chars, always SSO.
+              tr.transition_name = "t" + CL::syntheticId(std::uint32_t(i), false).substr(1);
+              const bool tdec = clib.isDecoy(pep);
+              const std::uint32_t tpr = clib.pairedTarget(pep);
+              tr.peptide_ref = CL::syntheticId((tdec && tpr != CL::no_pair) ? tpr : pi, tdec);
+              tr.precursor_mz = clib.precursorMz(pep);
+              tr.product_mz = clib.productMz(t);
+              tr.library_intensity = clib.intensity(t);
+              tr.precursor_im = clib.driftTime(pep);
+              tr.fragment_charge = clib.fragmentCharge(t);
+              // FROM THE PEPTIDE, not the transition's own DECOY column.
+              //
+              // Downstream derives a precursor's decoy status by scanning its TRANSITIONS
+              // (buildPrecursorIndex_ / the prefilter both do `if (t.getDecoy()) decoy_refs.insert(...)`),
+              // so a decoy peptide whose transitions are not flagged is invisible AS A DECOY -- which is
+              // what produced "118,902 target / 0 decoy" here even with 3,546,541 decoy peptides correctly
+              // loaded. The transition table's own DECOY column is not reliably populated in this library.
+              //
+              // The peptide's flag is authoritative and the invariant is exact: every transition of a decoy
+              // peptide is a decoy transition. Deriving it removes the dependency on a column that may not
+              // be there.
+              tr.setDecoy(clib.isDecoy(pep));
+              tr.setDetectingTransition((fl & CL::Detecting) != 0);
+              tr.setIdentifyingTransition((fl & CL::Identifying) != 0);
+              tr.setQuantifyingTransition((fl & CL::Quantifying) != 0);
+              const auto ann = clib.annotation(t);
+              if (!ann.empty()) { tr.setFragmentType(std::string(ann)); }
+            out.push_back(std::move(tr));
+          }
+        }
+      }
+      std::size_t total = 0;
+      for (const auto& v : parts) { total += v.size(); }
+      exp.transitions.reserve(total);
+      for (auto& v : parts)
+      {
+        exp.transitions.insert(exp.transitions.end(),
+                               std::make_move_iterator(v.begin()), std::make_move_iterator(v.end()));
+        std::vector<OpenSwath::LightTransition>().swap(v);
+      }
     }
     // Proteins: one entry per distinct accession actually referenced.
     for (std::size_t i = 0; i < clib.proteinCount(); ++i)

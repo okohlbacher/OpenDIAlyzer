@@ -67,6 +67,27 @@ struct MzPeakGroup
 /// One thread's decoder: an Index and the Spectra over it, constructed in place. Neither type
 /// is movable (Spectra binds its fetch callback to `this`), so they are built directly into
 /// this aggregate and only ever accessed by reference.
+/// THE ONE INDEX FOR THE PROCESS. Metadata is parsed once and the archive is opened once.
+///
+/// Measured on the Astral benchmark before this existed: one Index per worker thread meant 1,060
+/// open file descriptors (each Reader opens the archive plus several parquet members) and 224
+/// metadata-footer parses, and the run peaked at 127.6 GB -- against 74.5 GB for the SAME analysis
+/// reading mzML. The columnar input, which should be the cheap path, was 71% more expensive than
+/// XML because of how it was opened.
+///
+/// A function-local static is the right shape here and not merely convenient: MzPeak::Index has a
+/// user-declared destructor and holds a unique_ptr, so it is neither movable nor copyable and
+/// cannot be put in an optional, a vector, or on the heap from a returned prvalue. Copy-
+/// initialising a static from the prvalue elides the move, and C++11 magic statics make the
+/// initialisation thread-safe and exactly-once without a lock of our own.
+///
+/// s_path_ must be set before any worker calls this -- there is one input per run, so it is.
+inline const MzPeak::Index& sharedIndex(const std::string& path)
+{
+  static MzPeak::Index idx = MzPeak::open(path);
+  return idx;
+}
+
 struct Reader
 {
   explicit Reader(const std::string& path) : index(MzPeak::open(path)), spectra(index.spectra()) {}
@@ -289,9 +310,16 @@ public:
       // chromatograms and features in memory; it is independent of the input backend and is not
       // something this adapter can fix. Do not re-add recycling without first measuring where
       // the memory actually goes (massif/heaptrack), or it is complexity for nothing.
-      thread_local std::optional<Reader> t_reader;
-      if (!t_reader) { t_reader.emplace(s_path_); }
-      auto& t_spectra = t_reader->spectra;
+      // CENTRALISED METADATA, PER-THREAD STREAMING. Index::spectra() is const, so one shared Index
+      // serves every worker: the archive is opened once and the footer parsed once, while each
+      // thread still gets its own Spectra and therefore its own decode state, so no lock is needed
+      // and the 1-core-of-224 regression that per-thread Readers were introduced to avoid does not
+      // come back. What goes away is 1,060 file descriptors and 223 redundant metadata parses.
+      //
+      // Spectra is non-copyable AND non-movable (it binds its fetch callback to `this`), so it is
+      // COPY-INITIALISED from the prvalue, where the move is elided -- the same reason the Index
+      // above is a static rather than an optional. It must not be wrapped in optional/unique_ptr.
+      thread_local MzPeak::Spectra t_spectra = sharedIndex(s_path_).spectra();
       // Use the LONG-LIVED Spectra (spectra_) rather than a fresh index_.spectra() per call.
       // Rationale: MzPeak::Spectra binds its fetch callback to `this`
       // (`std::bind(std::mem_fn(&Spectra::fetch), this, _1)`, src/spectra.cpp), so any Spectra
