@@ -145,6 +145,66 @@ int main()
     CHECK(s2.sumRange(1, 0.0, 1e6) == 0.0);
   }
 
+  // ---- 8. a drift-less spectrum must NOT inherit the arena's back-filled -1 -------------------
+  // The arena `dt_` is shared and gets back-filled with -1 as soon as ANY spectrum supplies
+  // mobility. If drift() keyed on "the arena is non-empty", every drift-less spectrum in the same
+  // store would report a full array of -1 -- which passes a null check and then fails every real
+  // 1/K0 band (0.6-1.4), excluding all of its peaks from every window. Silently: the run finishes
+  // and those scans simply contribute nothing. So drift() must key on the SPECTRUM.
+  {
+    SpectrumStore s3;
+    const double a[3] = {100.0, 200.0, 300.0};
+    const float b[3] = {1.0F, 2.0F, 3.0F};
+    const double d[3] = {0.9, 1.0, 1.1};
+
+    SpectrumStore::Meta m0;
+    m0.drift = 0.95;                                  // per-slice layout: a SCALAR mobility
+    const std::size_t no_im = s3.add(a, b, 3, m0);    // no per-peak array
+    const std::size_t with  = s3.add(a, b, 3, {}, d); // per-peak array -> back-fills the arena
+    const std::size_t after = s3.add(a, b, 3, {});    // drift-less again, arena now non-empty
+
+    CHECK(s3.hasDrift());                             // the arena does hold mobility...
+    CHECK(s3.drift(no_im) == nullptr);                // ...but these two spectra do not
+    CHECK(s3.drift(after) == nullptr);
+    CHECK(s3.drift(with) != nullptr);
+    CHECK(s3.drift(with)[0] == 0.9F && s3.drift(with)[2] == 1.1F);
+    CHECK(s3.meta(no_im).per_peak_drift == false && s3.meta(with).per_peak_drift == true);
+
+    // A banded consumer keeps every peak of a drift-less spectrum, exactly as the raw path does.
+    int kept = 0;
+    const float* pd = s3.drift(after);
+    for (std::uint32_t k = 0; k < s3.count(after); ++k)
+    {
+      if (pd && !(pd[k] >= 0.6F && pd[k] < 1.4F)) { continue; }
+      ++kept;
+    }
+    CHECK(kept == 3);
+
+    // widen() falls back to the SCALAR, not to a hard -1: that is what the raw path emits.
+    std::vector<double> wm2, wi2, wd2;
+    s3.widen(no_im, wm2, wi2, &wd2);
+    CHECK(wd2.size() == 3 && wd2[0] == 0.95 && wd2[2] == 0.95);
+    s3.widen(with, wm2, wi2, &wd2);
+    CHECK(std::abs(wd2[1] - 1.0) < 1e-6);
+  }
+
+  // ---- 9. the window edge is not narrowed to float ---------------------------------------------
+  // Narrowing the edge rounds it to nearest, which can move it INWARD by half a float ulp and drop
+  // a peak that is genuinely inside the window. Widening the stored value instead is exact.
+  {
+    SpectrumStore s4;
+    const double one = 1000.0009999;                  // sits between two float32 neighbours
+    const float iv = 42.0F;
+    s4.add(&one, &iv, 1, {});
+    const float stored = s4.mz(0)[0];
+    const double lo = std::nextafter(double(stored), 0.0);          // just below the stored value
+    const double hi = std::nextafter(double(stored), 1e9);          // just above
+    CHECK(s4.lowerBound(0, lo) == 0);                 // the peak is found...
+    CHECK(s4.sumRange(0, lo, hi) == 42.0);            // ...and summed
+    // An edge exactly AT the stored value is inclusive at both ends.
+    CHECK(s4.sumRange(0, double(stored), double(stored)) == 42.0);
+  }
+
   if (g_fail) { std::printf("odia_spectrumstore_test FAILED (%d)\n", g_fail); return 1; }
   std::printf("odia_spectrumstore_test OK\n");
   return 0;

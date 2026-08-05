@@ -55,10 +55,17 @@ public:
     double precursor_mz = 0.0;    ///< isolation window centre; 0 for MS1
     double iso_lower = 0.0;       ///< isolation window, absolute Th (not offsets)
     double iso_upper = 0.0;
-    double drift = -1.0;          ///< ion mobility, or -1
+    double drift = -1.0;          ///< the spectrum's SCALAR ion mobility, or -1
     std::uint64_t offset = 0;     ///< first peak in the arena
     std::uint32_t count = 0;      ///< peaks
     std::uint8_t ms_level = 0;
+    /// Did THIS spectrum supply a per-peak mobility array? The arena-wide `dt_` is shared, and it
+    /// is back-filled with -1 as soon as any one spectrum contributes drift -- so "dt_ is
+    /// non-empty" says nothing about this spectrum. Without the distinction a back-filled -1 is
+    /// indistinguishable from a real mobility, and a caller applying a mobility band (typically
+    /// 0.6-1.4 1/K0) excludes every peak of every drift-less spectrum in the same store. Silently:
+    /// the run completes and those spectra simply contribute nothing.
+    bool per_peak_drift = false;
   };
 
   void reserve(std::size_t n_spectra, std::size_t n_peaks)
@@ -87,6 +94,7 @@ public:
     Meta e = m;
     e.offset = mz_.size();
     e.count = n;
+    e.per_peak_drift = (drift != nullptr);
     if (drift && dt_.empty() && !mz_.empty()) { dt_.resize(mz_.size(), -1.0F); }   // back-fill
     for (std::uint32_t k = 0; k < n; ++k)
     {
@@ -118,6 +126,7 @@ public:
     Meta e = m;
     e.offset = mz_.size();
     e.count = n;
+    e.per_peak_drift = (drift != nullptr);
     if (drift && dt_.empty() && !mz_.empty()) { dt_.resize(mz_.size(), -1.0F); }
     mz_.insert(mz_.end(), mz, mz + n);
     in_.insert(in_.end(), intensity, intensity + n);
@@ -148,8 +157,13 @@ public:
   const float* mz(std::size_t i) const { return mz_.data() + meta_.at(i).offset; }
   const float* intensity(std::size_t i) const { return in_.data() + meta_.at(i).offset; }
   bool hasDrift() const { return !dt_.empty(); }
+  /// Per-peak mobility of spectrum @p i, or nullptr if THIS spectrum supplied none. Keyed on the
+  /// per-spectrum flag, never on `dt_` being non-empty -- see Meta::per_peak_drift.
   const float* drift(std::size_t i) const
-  { return dt_.empty() ? nullptr : dt_.data() + meta_.at(i).offset; }
+  {
+    const Meta& e = meta_.at(i);
+    return (e.per_peak_drift && !dt_.empty()) ? dt_.data() + e.offset : nullptr;
+  }
   std::uint32_t count(std::size_t i) const { return meta_.at(i).count; }
 
   /// Widen into the double arrays the OpenSwath interface requires.
@@ -170,9 +184,31 @@ public:
     if (dt_out)
     {
       dt_out->resize(e.count);
-      const float* d = dt_.empty() ? nullptr : dt_.data() + e.offset;
-      for (std::uint32_t k = 0; k < e.count; ++k) { (*dt_out)[k] = d ? d[k] : -1.0; }
+      const float* d = drift(i);                    // nullptr unless THIS spectrum supplied one
+      for (std::uint32_t k = 0; k < e.count; ++k) { (*dt_out)[k] = d ? d[k] : e.drift; }
     }
+  }
+
+  /// Largest float <= @p v / smallest float >= @p v.
+  ///
+  /// A window edge must be moved OUTWARD when it is narrowed to float, never inward. Plain
+  /// `static_cast<float>` rounds to NEAREST, so it moves the edge either way by up to half an ulp:
+  /// outward is harmless (it can admit a peak ~0.03 ppm outside a 10 ppm window, which is noise),
+  /// inward silently drops a peak that is genuinely inside it, which is signal. Comparing in
+  /// double instead does not fix this -- it just relocates the same loss, since a stored value
+  /// that rounded below `lo` is then excluded even though its true m/z was inside. Directed
+  /// rounding is the only variant that cannot lose a peak.
+  static float floorFloat(double v)
+  {
+    float f = static_cast<float>(v);
+    if (static_cast<double>(f) > v) { f = std::nextafter(f, -std::numeric_limits<float>::infinity()); }
+    return f;
+  }
+  static float ceilFloat(double v)
+  {
+    float f = static_cast<float>(v);
+    if (static_cast<double>(f) < v) { f = std::nextafter(f, std::numeric_limits<float>::infinity()); }
+    return f;
   }
 
   /// First peak with m/z >= @p lo, by binary search over the stored float32 values.
@@ -180,7 +216,7 @@ public:
   {
     const Meta& e = meta_.at(i);
     const float* b = mz_.data() + e.offset;
-    return static_cast<std::uint32_t>(std::lower_bound(b, b + e.count, static_cast<float>(lo)) - b);
+    return static_cast<std::uint32_t>(std::lower_bound(b, b + e.count, floorFloat(lo)) - b);
   }
 
   /// Summed intensity in [lo, hi], the operation extraction actually performs.
@@ -190,7 +226,8 @@ public:
     const float* m = mz_.data() + e.offset;
     const float* v = in_.data() + e.offset;
     double s = 0.0;
-    for (std::uint32_t k = lowerBound(i, lo); k < e.count && m[k] <= static_cast<float>(hi); ++k)
+    const float hi_f = ceilFloat(hi);
+    for (std::uint32_t k = lowerBound(i, lo); k < e.count && m[k] <= hi_f; ++k)
     {
       s += v[k];
     }

@@ -43,6 +43,7 @@
 #include <OpenMS/ANALYSIS/OPENSWATH/OpenSwathWorkflow.h>   // OpenSwath::SwathMap
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -351,10 +352,11 @@ public:
     local.resize(static_cast<std::size_t>(nthr));   // NOT local(n): that declares a function
 
     const std::size_t chunk = (all.size() + std::size_t(nthr) - 1) / std::size_t(nthr);
-    std::size_t n_peak_total = 0;
+    std::size_t n_peak_total = 0, n_failed = 0, n_empty = 0;
     const auto t0 = std::chrono::steady_clock::now();
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static, 1) num_threads(nthr) reduction(+ : n_peak_total)
+#pragma omp parallel for schedule(static, 1) num_threads(nthr) \
+    reduction(+ : n_peak_total, n_failed, n_empty)
 #endif
     for (int w = 0; w < nthr; ++w)
     {
@@ -386,13 +388,15 @@ public:
         for (std::size_t k = 0; k < batch.size(); ++k)
         {
           fmz.clear(); fin.clear(); fdt.clear();
+          odia::SpectrumStore::Meta meta;
+          bool ok = true;
           try
           {
             const std::vector<double>& m = batch[k].mz();
             const std::vector<float>& y = batch[k].intensity();
             const std::vector<double>& imv = batch[k].ion_mobility_array();
             const std::size_t n = std::min(m.size(), y.size());
-            const bool per_peak_im = imv.size() >= n;
+            const bool per_peak_im = imv.size() >= n && n > 0;
             fmz.reserve(n); fin.reserve(n);
             if (per_peak_im) { fdt.reserve(n); }
             for (std::size_t q = 0; q < n; ++q)
@@ -401,9 +405,29 @@ public:
               fin.push_back(y[q]);
               if (per_peak_im) { fdt.push_back(static_cast<float>(imv[q])); }
             }
+            // The SCALAR mobility, for the per-slice layout that has no per-peak array. decodeRaw
+            // pushes exactly this value; storing it keeps the two paths agreeing on IM input.
+            if (!per_peak_im && batch[k].ion_mobility()) { meta.drift = *batch[k].ion_mobility(); }
           }
-          catch (const std::exception&) { /* reported once by decodeRaw's path */ }
-          odia::SpectrumStore::Meta meta;
+          catch (const std::exception& e)
+          {
+            // NOT harmless, and NOT reported elsewhere: once populated_ is set, decode() never
+            // reaches decodeRaw, so its loud-once message can never fire. A spectrum swallowed
+            // here is stored EMPTY and the run completes reporting success, simply missing those
+            // scans. The known trigger is upstream: Spectrum::intensity() throws TypeError on
+            // int32-stored intensities, which mzML permits and real files use. Partial failure --
+            // one row group, one int32 chunk -- is invisible without this count.
+            ok = false;
+            fmz.clear(); fin.clear(); fdt.clear();   // never store a half-copied spectrum
+            if (!decode_error_reported_.exchange(true))
+            {
+              std::fprintf(stderr, "OpenDIAlyzer/mzPeak: cannot decode spectrum %zu (%s). "
+                                   "Unsupported intensity encoding -- needs a type-agnostic "
+                                   "accessor in mzPeak.\n", ids[k], e.what());
+            }
+          }
+          if (!ok) { ++n_failed; }
+          else if (fmz.empty()) { ++n_empty; }
           const std::size_t sl = store.addFloat(fmz.data(), fin.data(),
                                                 fdt.empty() ? nullptr : fdt.data(),
                                                 static_cast<std::uint32_t>(fmz.size()), meta);
@@ -430,6 +454,10 @@ public:
                  all.size(), n_peak_total, el, all.size() / std::max(0.001, el), nthr,
                  b / 1073741824.0, n_peak_total * 16.0 / 1073741824.0,
                  (n_peak_total * 16.0) / std::max<double>(1.0, double(b)));
+    // Always reported, including the zero case: "0 undecodable" is the evidence that the run saw
+    // every spectrum. A partial decode failure is otherwise indistinguishable from a sparse run.
+    std::fprintf(stderr, "OpenDIAlyzer[mzpeak] %zu undecodable, %zu decoded empty (of %zu)\n",
+                 n_failed, n_empty, all.size());
   }
 
   bool populated() const { return populated_; }
@@ -461,14 +489,20 @@ public:
           const std::uint32_t n = st.count(idx);
           const float* pm = st.mz(idx);
           const float* pv = st.intensity(idx);
+          // `drift()` is nullptr unless THIS spectrum supplied a per-peak array, so a drift-less
+          // spectrum sharing a store with drift-bearing ones is banded exactly as decodeRaw bands
+          // it: not at all. Keying on the arena being non-empty instead would give every such
+          // spectrum a back-filled -1, which fails any real 1/K0 band (0.6-1.4) for every peak --
+          // silently contributing nothing to any window.
           const float* pd = st.drift(idx);
+          const double scalar_im = st.meta(idx).drift;    // the per-slice layout's value, or -1
           const bool banded = pd && (std::isfinite(lo) || std::isfinite(hi_im));
           for (std::uint32_t k = 0; k < n; ++k)
           {
             if (banded && !(pd[k] >= lo && pd[k] < hi_im)) { continue; }
             mz->data.push_back(pm[k]);
             in->data.push_back(pv[k]);
-            dt->data.push_back(pd ? pd[k] : -1.0);
+            dt->data.push_back(pd ? pd[k] : scalar_im);
           }
         }
         // Concatenated slices are not globally sorted and OpenSWATH requires ascending m/z.
@@ -718,7 +752,9 @@ private:
   bool im_split_warned_ = false;
   bool im_tie_warned_ = false;
   // (io_mutex_ removed: decoding is per-thread, so there is nothing left to serialise)
-  bool decode_error_reported_ = false;
+  /// Atomic: populate() reports from inside an OpenMP region, so the loud-once guard is written
+  /// concurrently. A plain bool would be a data race and could print once per worker.
+  std::atomic<bool> decode_error_reported_{false};
 };
 
 using MzPeakIndexPtr = std::shared_ptr<MzPeakIndex>;

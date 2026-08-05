@@ -166,6 +166,11 @@ public:
 private:
   static std::uint32_t u32(const std::uint8_t* p) { return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) | (std::uint32_t(p[2]) << 16) | (std::uint32_t(p[3]) << 24); }
   static std::uint16_t u16(const std::uint8_t* p) { return std::uint16_t(std::uint16_t(p[0]) | (std::uint16_t(p[1]) << 8)); }
+  /// Byte-wise like its siblings. The obvious `*reinterpret_cast<const uint64_t*>(p)` is unaligned
+  /// UB -- a ZIP field lands wherever the preceding variable-length parts leave it -- and it also
+  /// assumes little-endian, which the format fixes but the host does not.
+  static std::uint64_t u64(const std::uint8_t* p)
+  { return std::uint64_t(u32(p)) | (std::uint64_t(u32(p + 4)) << 32); }
 
   /// Locate the end-of-central-directory record, walk the central directory, and record each
   /// member's DATA offset (past its local header, whose extra field may differ from the central
@@ -194,16 +199,22 @@ private:
       if (eocd < 20) { throw std::runtime_error("odia::MmapArchive: truncated zip64 locator"); }
       const std::size_t loc = eocd - 20;
       if (u32(b + loc) != 0x07064b50) { throw std::runtime_error("odia::MmapArchive: missing zip64 locator"); }
-      const std::uint64_t z64 = *reinterpret_cast<const std::uint64_t*>(b + loc + 8);
-      if (z64 + 56 > n || u32(b + z64) != 0x06064b50) { throw std::runtime_error("odia::MmapArchive: bad zip64 EOCD"); }
-      count = *reinterpret_cast<const std::uint64_t*>(b + z64 + 32);
-      cd_off = *reinterpret_cast<const std::uint64_t*>(b + z64 + 48);
+      const std::uint64_t z64 = u64(b + loc + 8);
+      // `z64 + 56 > n` is the natural way to write this and is wrong: z64 comes straight from the
+      // file, so a corrupt value near 2^64 wraps the sum small, passes, and the loads below read
+      // outside the mapping. Subtract instead -- n - 56 cannot wrap because n >= 22 was checked.
+      if (z64 > n || n - z64 < 56 || u32(b + z64) != 0x06064b50)
+      { throw std::runtime_error("odia::MmapArchive: bad zip64 EOCD"); }
+      count = u64(b + z64 + 32);
+      cd_off = u64(b + z64 + 48);
     }
 
     Directory dir;
-    dir.reserve(static_cast<std::size_t>(count) * 2);
+    // A member needs a 46-byte header, so `count` above n/46 is impossible; a corrupt count would
+    // otherwise reserve arbitrarily. The loop condition is what really bounds the walk.
+    dir.reserve(static_cast<std::size_t>(std::min<std::uint64_t>(count, n / 46 + 1)));
     std::size_t p = static_cast<std::size_t>(cd_off);
-    for (std::uint64_t k = 0; k < count && p + 46 <= n; ++k)
+    for (std::uint64_t k = 0; k < count && p <= n && n - p >= 46; ++k)
     {
       if (u32(b + p) != 0x02014b50) { break; }
       const std::uint16_t method = u16(b + p + 10);
@@ -212,6 +223,12 @@ private:
       const std::uint16_t clen = u16(b + p + 32);
       std::uint64_t usize = u32(b + p + 24);
       std::uint64_t lho = u32(b + p + 42);
+      // The fixed header is bounded above, the VARIABLE parts are not: nlen and elen are 16-bit
+      // fields read from the file, so a truncated or corrupt directory can point the name and the
+      // extra-field walk past the end of the mapping. Reading past a mapping is a SIGSEGV, not an
+      // exception -- and a corrupt file is exactly where a named error is worth having.
+      if (n - p < std::size_t(46) + nlen + elen)
+      { throw std::runtime_error("odia::MmapArchive: central directory entry runs past end of file"); }
       const std::string name(reinterpret_cast<const char*>(b + p + 46), nlen);
 
       // ZIP64 extra field: sizes and the local-header offset move here once they exceed 32 bits.
@@ -225,9 +242,9 @@ private:
           if (tag == 0x0001)
           {
             const std::uint8_t* q = ex + 4;
-            if (usize == 0xFFFFFFFFu && q + 8 <= ex_end) { usize = *reinterpret_cast<const std::uint64_t*>(q); q += 8; }
+            if (usize == 0xFFFFFFFFu && q + 8 <= ex_end) { usize = u64(q); q += 8; }
             if (u32(b + p + 20) == 0xFFFFFFFFu && q + 8 <= ex_end) { q += 8; }   // compressed size
-            if (lho == 0xFFFFFFFFu && q + 8 <= ex_end) { lho = *reinterpret_cast<const std::uint64_t*>(q); }
+            if (lho == 0xFFFFFFFFu && q + 8 <= ex_end) { lho = u64(q); }
             break;
           }
           ex += 4 + sz;
@@ -243,14 +260,16 @@ private:
                                  "' is compressed (method " + std::to_string(method) +
                                  "); mzPeak members must be STORED to be read in place");
       }
-      if (lho + 30 <= n)
+      if (lho <= n && n - lho >= 30)
       {
         // The LOCAL header's name/extra lengths are authoritative for where the data begins; they
         // are permitted to differ from the central directory's.
         const std::uint16_t lnlen = u16(b + lho + 26);
         const std::uint16_t lelen = u16(b + lho + 28);
         const std::size_t data = static_cast<std::size_t>(lho) + 30 + lnlen + lelen;
-        if (data + usize <= n) { dir.emplace(name, Entry{data, static_cast<std::size_t>(usize)}); }
+        // usize is the raw 64-bit field; `data + usize` can wrap for a corrupt value near 2^64.
+        if (data <= n && usize <= n - data)
+        { dir.emplace(name, Entry{data, static_cast<std::size_t>(usize)}); }
       }
       p += 46 + nlen + elen + clen;
     }
