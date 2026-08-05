@@ -30,6 +30,9 @@
 
 #include "odia_mmap_archive.h"
 #include "odia_spectrumstore.h"
+
+#include <chrono>
+#include <unordered_map>
 #include <mzpeak/index.h>
 #include <mzpeak/spectra.h>
 #include <mzpeak/spectrum.h>
@@ -309,65 +312,89 @@ public:
   /// locking and no shared append. ~150 windows over the available workers.
   void populate(int threads)
   {
-    std::vector<long> keys;
-    keys.reserve(windows_.size() + 1);
-    for (const auto& kv : groups_) { keys.push_back(kv.first); }
-    stores_.clear();
-    for (long k : keys) { stores_.emplace(k, odia::SpectrumStore{}); }
-
-    std::size_t n_spec = 0, n_peak = 0;
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic, 1) num_threads(std::max(1, threads)) \
-        reduction(+ : n_spec, n_peak)
-#endif
-    for (std::size_t ki = 0; ki < keys.size(); ++ki)
+    // PHYSICAL spectra, once each, in ASCENDING index order via the reader's batch accessor.
+    //
+    // Two things this gets right that the per-window version did not. A frame shared by several
+    // isolation windows is stored ONCE, not once per window -- the groups reference it by slice
+    // index and apply their own mobility band at read time. And the read order is the file's own
+    // order, which is what Spectra::get_spectra_batch sorts for ("so file access is sequential").
+    //
+    // Batched rather than one call for all 307k: get_spectra_batch returns lazy Spectrum objects
+    // and the decode happens on first array access, so a single giant batch would hold every
+    // decoded spectrum live at once. Batch size bounds that.
+    std::vector<std::uint64_t> all;
+    for (const auto& kv : groups_)
     {
-      const long wkey = keys[ki];
-      auto& store = stores_.at(wkey);
-      const auto& gs = groups_.at(wkey);
-      // Scratch reused for every spectrum of this window: allocate three times per WINDOW, not
-      // three times per spectrum. ~150 windows instead of ~587,000 spectra.
-      std::vector<float> dmz, din, ddt;
-      std::vector<std::uint32_t> ord;
-      store.reserve(gs.size(), 0);
-      for (std::size_t gi = 0; gi < gs.size(); ++gi)
+      for (const auto& g : kv.second) { for (std::uint64_t si : g.slices) { all.push_back(si); } }
+    }
+    std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
+    if (all.empty()) { populated_ = true; return; }
+
+    store_.reserve(all.size(), 0);
+    slot_.clear();
+    slot_.reserve(all.size() * 2);
+
+    const std::size_t kBatch = 2048;
+    std::size_t n_peak = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    MzPeak::Spectra spectra = sharedIndex(s_path_).spectra();
+    std::vector<float> fmz, fin, fdt;
+    for (std::size_t b = 0; b < all.size(); b += kBatch)
+    {
+      const std::size_t hi = std::min(all.size(), b + kBatch);
+      std::vector<std::size_t> ids(all.begin() + std::ptrdiff_t(b), all.begin() + std::ptrdiff_t(hi));
+      std::vector<MzPeak::Spectrum> batch = spectra.get_spectra_batch(ids);
+      for (std::size_t k = 0; k < batch.size(); ++k)
       {
-        // decodeRaw() is the WRONG tool here and this is the whole cost. Per spectrum it holds
-        // mz/in/dt built by push_back (24 B/peak, up to 48 with doubling overshoot), a
-        // vector<size_t> permutation (8 B/peak), and then THREE MORE reserved vector<double> to
-        // emit the sorted copy (24 B/peak) -- ~84 B/peak live, in 8 allocations, for data whose
-        // stored form is 8 B/peak. Ten times what it keeps, all in doubles, all immediately
-        // narrowed and thrown away.
-        //
-        // decodeFloat() collects float32 directly and sorts a uint32 permutation, so the transient
-        // is ~12 B/peak in 3 allocations that are REUSED across the whole window rather than
-        // reallocated per spectrum.
-        odia::SpectrumStore::Meta m;
-        m.rt = gs[gi].rt;
-        m.ms_level = (wkey == kMs1Key) ? 1 : 2;
-        const auto wit = windows_.find(wkey);
-        if (wit != windows_.end())
+        fmz.clear(); fin.clear(); fdt.clear();
+        try
         {
-          m.iso_lower = wit->second.lower;
-          m.iso_upper = wit->second.upper;
-          m.precursor_mz = 0.5 * (wit->second.lower + wit->second.upper);
+          const std::vector<double>& m = batch[k].mz();
+          const std::vector<float>& y = batch[k].intensity();
+          const std::vector<double>& imv = batch[k].ion_mobility_array();
+          const std::size_t n = std::min(m.size(), y.size());
+          const bool per_peak_im = imv.size() >= n;
+          fmz.reserve(n); fin.reserve(n);
+          if (per_peak_im) { fdt.reserve(n); }
+          for (std::size_t q = 0; q < n; ++q)
+          {
+            fmz.push_back(static_cast<float>(m[q]));
+            fin.push_back(y[q]);
+            if (per_peak_im) { fdt.push_back(static_cast<float>(imv[q])); }
+          }
         }
-        decodeFloat(wkey, gi, dmz, din, ddt, ord);
-        store.addFloat(dmz.data(), din.data(), ddt.empty() ? nullptr : ddt.data(),
-                       static_cast<std::uint32_t>(dmz.size()), m);
-        n_spec += 1;
-        n_peak += dmz.size();
+        catch (const std::exception& e)
+        {
+          if (!decode_error_reported_)
+          {
+            decode_error_reported_ = true;
+            std::fprintf(stderr, "OpenDIAlyzer/mzPeak: cannot decode spectrum %zu (%s).\n", ids[k], e.what());
+          }
+        }
+        // Physical spectra are stored as read; a group sorts its own concatenation later.
+        odia::SpectrumStore::Meta meta;
+        slot_[ids[k]] = store_.addFloat(fmz.data(), fin.data(), fdt.empty() ? nullptr : fdt.data(),
+                                        static_cast<std::uint32_t>(fmz.size()), meta);
+        n_peak += fmz.size();
+      }
+      if ((b / kBatch) % 20 == 0)
+      {
+        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "OpenDIAlyzer[mzpeak] %zu/%zu spectra, %.0f/s\n",
+                     hi, all.size(), hi / std::max(0.001, el));
       }
     }
-    for (auto& kv : stores_) { kv.second.compact(); }   // hand back push_back's overshoot
+    store_.compact();
     populated_ = true;
-    std::size_t b = 0;
-    for (const auto& kv : stores_) { b += kv.second.bytes(); }
+    const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr,
-                 "OpenDIAlyzer[mzpeak] decoded %zu spectra, %zu peaks ONCE into %.2f GB "
-                 "(%.2f GB as double pairs, %.2fx); later passes read memory\n",
-                 n_spec, n_peak, b / 1073741824.0, n_peak * 16.0 / 1073741824.0,
-                 (n_peak * 16.0) / std::max<double>(1.0, double(b)));
+                 "OpenDIAlyzer[mzpeak] materialised %zu physical spectra, %zu peaks in %.0f s "
+                 "into %.2f GB (%.2f GB as double pairs, %.2fx)\n",
+                 all.size(), n_peak, el, store_.bytes() / 1073741824.0,
+                 n_peak * 16.0 / 1073741824.0,
+                 (n_peak * 16.0) / std::max<double>(1.0, double(store_.bytes())));
+    (void) threads;   // the batch read is sequential by design; concurrency is what exploded memory
   }
 
   bool populated() const { return populated_; }
@@ -377,14 +404,55 @@ public:
   {
     if (populated_)
     {
-      const auto it = stores_.find(wkey);
-      if (it != stores_.end() && gi < it->second.size())
+      const auto& gs = groups(wkey);
+      if (gi < gs.size())
       {
         OpenSwath::SpectrumPtr out(new OpenSwath::Spectrum);
         OpenSwath::BinaryDataArrayPtr mz(new OpenSwath::BinaryDataArray);
         OpenSwath::BinaryDataArrayPtr in(new OpenSwath::BinaryDataArray);
         OpenSwath::BinaryDataArrayPtr dt(new OpenSwath::BinaryDataArray);
-        it->second.widen(gi, mz->data, in->data, &dt->data);
+        // Gather this group's slices from the PHYSICAL store and apply THIS window's mobility
+        // band. The band is applied here, not at population time, precisely so a frame shared by
+        // several isolation windows is stored once and each window takes its own share --
+        // half-open [lo, hi) so siblings partition the axis without double-counting a boundary
+        // peak, and a NaN mobility is excluded rather than kept in every window.
+        const double lo = gs[gi].im_lo, hi_im = gs[gi].im_hi;
+        for (std::uint64_t si : gs[gi].slices)
+        {
+          const auto sit = slot_.find(si);
+          if (sit == slot_.end()) { continue; }
+          const std::size_t idx = sit->second;
+          const std::uint32_t n = store_.count(idx);
+          const float* pm = store_.mz(idx);
+          const float* pv = store_.intensity(idx);
+          const float* pd = store_.drift(idx);
+          const bool banded = pd && (std::isfinite(lo) || std::isfinite(hi_im));
+          for (std::uint32_t k = 0; k < n; ++k)
+          {
+            if (banded && !(pd[k] >= lo && pd[k] < hi_im)) { continue; }
+            mz->data.push_back(pm[k]);
+            in->data.push_back(pv[k]);
+            dt->data.push_back(pd ? pd[k] : -1.0);
+          }
+        }
+        // Concatenated slices are not globally sorted and OpenSWATH requires ascending m/z.
+        const std::size_t n = mz->data.size();
+        bool sorted = true;
+        for (std::size_t k = 1; k < n && sorted; ++k) { sorted = mz->data[k] >= mz->data[k - 1]; }
+        if (!sorted)
+        {
+          std::vector<std::uint32_t> ord(n);
+          for (std::size_t k = 0; k < n; ++k) { ord[k] = static_cast<std::uint32_t>(k); }
+          std::sort(ord.begin(), ord.end(),
+                    [&](std::uint32_t a2, std::uint32_t b2) { return mz->data[a2] < mz->data[b2]; });
+          std::vector<double> tmp(n);
+          for (std::size_t k = 0; k < n; ++k) { tmp[k] = mz->data[ord[k]]; }
+          mz->data.swap(tmp);
+          for (std::size_t k = 0; k < n; ++k) { tmp[k] = in->data[ord[k]]; }
+          in->data.swap(tmp);
+          for (std::size_t k = 0; k < n; ++k) { tmp[k] = dt->data[ord[k]]; }
+          dt->data.swap(tmp);
+        }
         out->setMZArray(mz);
         out->setIntensityArray(in);
         out->setDriftTimeArray(dt);
@@ -603,7 +671,8 @@ private:
   static inline std::string s_path_;
   MzPeak::Index index_;
   MzPeak::Spectra spectra_;      ///< index-build only; decode() uses a thread_local Spectra
-  std::map<long, odia::SpectrumStore> stores_;   ///< per window; filled once by populate()
+  odia::SpectrumStore store_;                    ///< ALL physical spectra, each stored once
+  std::unordered_map<std::uint64_t, std::size_t> slot_;   ///< mzPeak spectrum index -> store slot
   bool populated_ = false;
   std::map<long, std::vector<MzPeakGroup>> groups_;
   std::map<long, Window> windows_;
