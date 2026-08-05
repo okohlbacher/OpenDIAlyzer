@@ -418,7 +418,19 @@ conformance oracle and the C++ roadmap is accurate about its own gaps; both are 
 fresh reading of the specification.
 
 
-## BLOCKING: bulk spectrum reads. A point query per spectrum makes a full scan quadratic
+## RESOLVED (was: BLOCKING) -- the measurements below were taken against a STALE SNAPSHOT
+##
+## The reader on current trunk (c230228) keeps a 2-deep decoded row-group cache and a typed
+## EqualityScan. Re-measured on the same file: 3,000 sequential spectra in 7.86 s (382/s)
+## against >900 s before, ~115x. Scattered access is 46/s, 8.3x slower than sequential, which
+## is the reader's rule 3 showing up directly. Per-peak throughput matches the maintainer's
+## own fixture, so there is no residual to report.
+##
+## What follows is kept for the record of what the pre-cache cost model looked like, and
+## because the ACCESS RULES it motivated are still the rules: ascending order, never random,
+## contiguous ranges per worker, one Spectra per worker.
+##
+## SUPERSEDED: bulk spectrum reads. A point query per spectrum makes a full scan quadratic
 
 Measured on astral.mzpeak (3.09 GB, 307,590 spectra) with the reader at trunk:
 

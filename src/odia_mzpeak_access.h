@@ -312,16 +312,19 @@ public:
   /// locking and no shared append. ~150 windows over the available workers.
   void populate(int threads)
   {
-    // PHYSICAL spectra, once each, in ASCENDING index order via the reader's batch accessor.
+    // THE READER'S FOUR RULES (mzPeak trunk c230228 and later). The reader keeps a 2-deep decoded
+    // row-group cache, so cost is set by ACCESS ORDER, not by the number of fetches. Measured on
+    // this file: 382 spectra/s sequential against 46/s scattered -- 8.3x for order alone, and 115x
+    // against the pre-cache snapshot this code was originally written for.
     //
-    // Two things this gets right that the per-window version did not. A frame shared by several
-    // isolation windows is stored ONCE, not once per window -- the groups reference it by slice
-    // index and apply their own mobility band at read time. And the read order is the file's own
-    // order, which is what Spectra::get_spectra_batch sorts for ("so file access is sequential").
+    //   1. plan from metadata, decode peaks only for what is kept   -- we keep everything here
+    //   2. ascending index order                                    -- indices are sorted below
+    //   3. never random-access; get_spectra_batch sorts internally  -- used, on sorted input
+    //   4. contiguous range per worker, ONE Spectra per worker      -- the partition below
     //
-    // Batched rather than one call for all 307k: get_spectra_batch returns lazy Spectrum objects
-    // and the decode happens on first array access, so a single giant batch would hold every
-    // decoded spectrum live at once. Batch size bounds that.
+    // Rule 4 is why the ranges are contiguous rather than striped: striping (i % T) gives every
+    // worker the whole file and each thrashes its own 2-group cache. And one Spectra per worker,
+    // never a shared one, because decodes serialise on the reader's mutex.
     std::vector<std::uint64_t> all;
     for (const auto& kv : groups_)
     {
@@ -331,70 +334,92 @@ public:
     all.erase(std::unique(all.begin(), all.end()), all.end());
     if (all.empty()) { populated_ = true; return; }
 
-    store_.reserve(all.size(), 0);
+    int nthr = std::max(1, threads);
+#ifdef _OPENMP
+    nthr = std::min(nthr, std::max(1, omp_get_max_threads()));
+#endif
+    nthr = std::min<int>(nthr, static_cast<int>((all.size() + 4095) / 4096));   // >=4096 per worker
+    nthr = std::max(1, nthr);
+
+    // One store per worker, kept as-is rather than merged: concatenating would copy every peak a
+    // second time (~4 GB here) for no benefit, since a slot lookup can name the store.
+    parts_.clear();
+    parts_.resize(static_cast<std::size_t>(nthr));
     slot_.clear();
     slot_.reserve(all.size() * 2);
+    std::vector<std::vector<std::pair<std::uint64_t, std::uint32_t>>> local;
+    local.resize(static_cast<std::size_t>(nthr));   // NOT local(n): that declares a function
 
-    const std::size_t kBatch = 2048;
-    std::size_t n_peak = 0;
+    const std::size_t chunk = (all.size() + std::size_t(nthr) - 1) / std::size_t(nthr);
+    std::size_t n_peak_total = 0;
     const auto t0 = std::chrono::steady_clock::now();
-    MzPeak::Spectra spectra = sharedIndex(s_path_).spectra();
-    std::vector<float> fmz, fin, fdt;
-    for (std::size_t b = 0; b < all.size(); b += kBatch)
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static, 1) num_threads(nthr) reduction(+ : n_peak_total)
+#endif
+    for (int w = 0; w < nthr; ++w)
     {
-      const std::size_t hi = std::min(all.size(), b + kBatch);
-      std::vector<std::size_t> ids(all.begin() + std::ptrdiff_t(b), all.begin() + std::ptrdiff_t(hi));
-      std::vector<MzPeak::Spectrum> batch = spectra.get_spectra_batch(ids);
-      for (std::size_t k = 0; k < batch.size(); ++k)
+      const std::size_t lo = std::size_t(w) * chunk, hi = std::min(all.size(), lo + chunk);
+      if (lo >= hi) { continue; }
+      // Rule 4: this worker's OWN handle, so its cache follows its own contiguous range.
+      MzPeak::Spectra spectra = sharedIndex(s_path_).spectra();
+      auto& store = parts_[std::size_t(w)];
+      auto& mine = local[std::size_t(w)];
+      store.reserve(hi - lo, 0);
+      mine.reserve(hi - lo);
+      std::vector<float> fmz, fin, fdt;
+      const std::size_t kBatch = 512;              // bounds live decoded spectra, not cache reuse
+      for (std::size_t b = lo; b < hi; b += kBatch)
       {
-        fmz.clear(); fin.clear(); fdt.clear();
-        try
+        const std::size_t e = std::min(hi, b + kBatch);
+        std::vector<std::size_t> ids(all.begin() + std::ptrdiff_t(b), all.begin() + std::ptrdiff_t(e));
+        std::vector<MzPeak::Spectrum> batch = spectra.get_spectra_batch(ids);
+        for (std::size_t k = 0; k < batch.size(); ++k)
         {
-          const std::vector<double>& m = batch[k].mz();
-          const std::vector<float>& y = batch[k].intensity();
-          const std::vector<double>& imv = batch[k].ion_mobility_array();
-          const std::size_t n = std::min(m.size(), y.size());
-          const bool per_peak_im = imv.size() >= n;
-          fmz.reserve(n); fin.reserve(n);
-          if (per_peak_im) { fdt.reserve(n); }
-          for (std::size_t q = 0; q < n; ++q)
+          fmz.clear(); fin.clear(); fdt.clear();
+          try
           {
-            fmz.push_back(static_cast<float>(m[q]));
-            fin.push_back(y[q]);
-            if (per_peak_im) { fdt.push_back(static_cast<float>(imv[q])); }
+            const std::vector<double>& m = batch[k].mz();
+            const std::vector<float>& y = batch[k].intensity();
+            const std::vector<double>& imv = batch[k].ion_mobility_array();
+            const std::size_t n = std::min(m.size(), y.size());
+            const bool per_peak_im = imv.size() >= n;
+            fmz.reserve(n); fin.reserve(n);
+            if (per_peak_im) { fdt.reserve(n); }
+            for (std::size_t q = 0; q < n; ++q)
+            {
+              fmz.push_back(static_cast<float>(m[q]));
+              fin.push_back(y[q]);
+              if (per_peak_im) { fdt.push_back(static_cast<float>(imv[q])); }
+            }
           }
+          catch (const std::exception&) { /* reported once by decodeRaw's path */ }
+          odia::SpectrumStore::Meta meta;
+          const std::size_t sl = store.addFloat(fmz.data(), fin.data(),
+                                                fdt.empty() ? nullptr : fdt.data(),
+                                                static_cast<std::uint32_t>(fmz.size()), meta);
+          mine.emplace_back(ids[k], static_cast<std::uint32_t>(sl));
+          n_peak_total += fmz.size();
         }
-        catch (const std::exception& e)
-        {
-          if (!decode_error_reported_)
-          {
-            decode_error_reported_ = true;
-            std::fprintf(stderr, "OpenDIAlyzer/mzPeak: cannot decode spectrum %zu (%s).\n", ids[k], e.what());
-          }
-        }
-        // Physical spectra are stored as read; a group sorts its own concatenation later.
-        odia::SpectrumStore::Meta meta;
-        slot_[ids[k]] = store_.addFloat(fmz.data(), fin.data(), fdt.empty() ? nullptr : fdt.data(),
-                                        static_cast<std::uint32_t>(fmz.size()), meta);
-        n_peak += fmz.size();
+        // A decoded Spectrum owns its vectors; dropping the batch here bounds live memory to the
+        // reader's two cached groups (~40 MB) plus this batch.
       }
-      if ((b / kBatch) % 20 == 0)
-      {
-        const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "OpenDIAlyzer[mzpeak] %zu/%zu spectra, %.0f/s\n",
-                     hi, all.size(), hi / std::max(0.001, el));
-      }
+      store.compact();
     }
-    store_.compact();
+    for (int w = 0; w < nthr; ++w)
+    {
+      for (const auto& pr : local[std::size_t(w)])
+      { slot_[pr.first] = Slot{static_cast<std::uint32_t>(w), pr.second}; }
+    }
     populated_ = true;
+    std::size_t b = 0;
+    for (const auto& st : parts_) { b += st.bytes(); }
     const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr,
-                 "OpenDIAlyzer[mzpeak] materialised %zu physical spectra, %zu peaks in %.0f s "
-                 "into %.2f GB (%.2f GB as double pairs, %.2fx)\n",
-                 all.size(), n_peak, el, store_.bytes() / 1073741824.0,
-                 n_peak * 16.0 / 1073741824.0,
-                 (n_peak * 16.0) / std::max<double>(1.0, double(store_.bytes())));
-    (void) threads;   // the batch read is sequential by design; concurrency is what exploded memory
+                 "OpenDIAlyzer[mzpeak] materialised %zu physical spectra, %zu peaks in %.1f s "
+                 "(%.0f spectra/s, %d workers) into %.2f GB (%.2f GB as double pairs, %.2fx)\n",
+                 all.size(), n_peak_total, el, all.size() / std::max(0.001, el), nthr,
+                 b / 1073741824.0, n_peak_total * 16.0 / 1073741824.0,
+                 (n_peak_total * 16.0) / std::max<double>(1.0, double(b)));
   }
 
   bool populated() const { return populated_; }
@@ -421,11 +446,12 @@ public:
         {
           const auto sit = slot_.find(si);
           if (sit == slot_.end()) { continue; }
-          const std::size_t idx = sit->second;
-          const std::uint32_t n = store_.count(idx);
-          const float* pm = store_.mz(idx);
-          const float* pv = store_.intensity(idx);
-          const float* pd = store_.drift(idx);
+          const odia::SpectrumStore& st = parts_[sit->second.part];
+          const std::size_t idx = sit->second.idx;
+          const std::uint32_t n = st.count(idx);
+          const float* pm = st.mz(idx);
+          const float* pv = st.intensity(idx);
+          const float* pd = st.drift(idx);
           const bool banded = pd && (std::isfinite(lo) || std::isfinite(hi_im));
           for (std::uint32_t k = 0; k < n; ++k)
           {
@@ -671,8 +697,9 @@ private:
   static inline std::string s_path_;
   MzPeak::Index index_;
   MzPeak::Spectra spectra_;      ///< index-build only; decode() uses a thread_local Spectra
-  odia::SpectrumStore store_;                    ///< ALL physical spectra, each stored once
-  std::unordered_map<std::uint64_t, std::size_t> slot_;   ///< mzPeak spectrum index -> store slot
+  struct Slot { std::uint32_t part, idx; };
+  std::vector<odia::SpectrumStore> parts_;                ///< one per populate worker
+  std::unordered_map<std::uint64_t, Slot> slot_;          ///< mzPeak spectrum index -> (part, slot)
   bool populated_ = false;
   std::map<long, std::vector<MzPeakGroup>> groups_;
   std::map<long, Window> windows_;
