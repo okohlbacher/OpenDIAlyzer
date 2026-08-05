@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace odia
@@ -254,6 +255,113 @@ private:
   std::vector<std::uint8_t> isotope_;
   std::vector<float> area_;
   std::vector<double> apex_;
+};
+
+/// Everything a scored `FeatureMap` contributes to CLASSIFICATION, and nothing else.
+///
+/// WHY THIS IS NOT `FeatureRows`. FeatureRows mirrors `features.parquet` -- 65 columns, RT as
+/// float32 -- because that is what the writer must emit. This one exists for pass 1, whose
+/// FeatureMap is NEVER written: it feeds anchor selection and then dies. Its consumer reads
+/// exactly four things per feature (PeptideRef, getUniqueId, getRT, the VAR_* scores), so the
+/// other 61 columns and all 21.9M subordinate rows are pure carrying cost.
+///
+/// RT IS DOUBLE ON PURPOSE. Narrowing it would be physically harmless -- float32 resolves ~0.5 ms
+/// at a 7200 s gradient, against a p95 anchor residual measured in seconds -- but the acceptance
+/// test for this whole change is BIT-IDENTICAL identifications. A perturbed RT shifts the
+/// calibration fit, which shifts pass 2's extraction windows, which can move IDs. That would make
+/// a representation swap indistinguishable from a regression, which is the one outcome worth
+/// designing against. Precision changes belong in their own measured step.
+///
+/// The transition-group id is INTERNED. There are ~2.07M features over ~400k precursors, so the
+/// string repeats ~5x; stored per row it is 32 B of std::string (or a heap allocation when it does
+/// not fit SSO), against 4 B for a dense index.
+class ScoreRows
+{
+public:
+  /// The VAR_ column names, in column order. Fixed before the first append -- every row is a slice
+  /// of one flat block, so the width cannot change afterwards.
+  void setColumns(std::vector<std::string> names)
+  {
+    if (!feature_id_.empty())
+    { throw std::logic_error("odia::ScoreRows: columns fixed after the first row"); }
+    names_ = std::move(names);
+  }
+  const std::vector<std::string>& columns() const { return names_; }
+  std::size_t width() const { return names_.size(); }
+
+  void reserve(std::size_t n)
+  {
+    feature_id_.reserve(n);
+    gid_.reserve(n);
+    exp_rt_.reserve(n);
+    scores_.reserve(n * width());
+  }
+
+  /// PeptideRef -> dense index. Repeated ids collapse to one string.
+  std::uint32_t intern(const std::string& gid)
+  {
+    const auto it = gid_index_.find(gid);
+    if (it != gid_index_.end()) { return it->second; }
+    const std::uint32_t id = static_cast<std::uint32_t>(gid_name_.size());
+    gid_name_.push_back(gid);
+    gid_index_.emplace(gid, id);
+    return id;
+  }
+
+  /// One feature. @p row must hold width() values, already NaN-filled for missing scores.
+  std::size_t append(std::int64_t feature_id, std::uint32_t gid, double exp_rt, const double* row)
+  {
+    feature_id_.push_back(feature_id);
+    gid_.push_back(gid);
+    exp_rt_.push_back(exp_rt);
+    scores_.insert(scores_.end(), row, row + width());
+    return feature_id_.size() - 1;
+  }
+
+  std::size_t size() const { return feature_id_.size(); }
+  std::int64_t featureId(std::size_t i) const { return feature_id_.at(i); }
+  std::uint32_t gid(std::size_t i) const { return gid_.at(i); }
+  const std::string& gidName(std::uint32_t g) const { return gid_name_.at(g); }
+  std::size_t groups() const { return gid_name_.size(); }
+  double expRt(std::size_t i) const { return exp_rt_.at(i); }
+  /// This row's scores, as a span into the flat block. No allocation, no copy.
+  const double* scores(std::size_t i) const { return scores_.data() + i * width(); }
+
+  std::size_t bytes() const
+  {
+    std::size_t s = feature_id_.capacity() * sizeof(std::int64_t)
+                  + gid_.capacity() * sizeof(std::uint32_t)
+                  + exp_rt_.capacity() * sizeof(double)
+                  + scores_.capacity() * sizeof(double);
+    for (const auto& n : gid_name_) { s += n.capacity() + sizeof(std::string); }
+    return s;
+  }
+  double bytesPerRow() const { return size() ? double(bytes()) / double(size()) : 0.0; }
+  void compact()
+  {
+    feature_id_.shrink_to_fit(); gid_.shrink_to_fit();
+    exp_rt_.shrink_to_fit(); scores_.shrink_to_fit();
+  }
+  /// Release everything, capacity included. Used where the rows die before the next pass allocates.
+  void clear()
+  {
+    std::vector<std::int64_t>().swap(feature_id_);
+    std::vector<std::uint32_t>().swap(gid_);
+    std::vector<double>().swap(exp_rt_);
+    std::vector<double>().swap(scores_);
+    std::vector<std::string>().swap(gid_name_);
+    std::unordered_map<std::string, std::uint32_t>().swap(gid_index_);
+    names_.clear();
+  }
+
+private:
+  std::vector<std::string> names_;
+  std::vector<std::int64_t> feature_id_;
+  std::vector<std::uint32_t> gid_;
+  std::vector<double> exp_rt_;
+  std::vector<double> scores_;                       // size() x width(), row-major, one allocation
+  std::vector<std::string> gid_name_;                // dense index -> PeptideRef
+  std::unordered_map<std::string, std::uint32_t> gid_index_;
 };
 
 } // namespace odia

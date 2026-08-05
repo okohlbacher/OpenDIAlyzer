@@ -62,6 +62,7 @@
 #include "odia_library.h"
 #include "odia_prefilter_model.h"                         // learned library prefilter
 #include "odia_rtaxis.h"                                   // the run's validated RT grid
+#include "odia_scored.h"                                  // compact scored tables
 #include "odia_split.h"                                   // compact library probe
 #include <OpenMS/FORMAT/FASTAFile.h>
 #include <unordered_set>
@@ -1573,6 +1574,14 @@ protected:
   bool parquet_out_ = false;
   /// Features retained by the parquet path, handed straight to scoring instead of a disk round trip.
   FeatureMap pass_features_;
+  /// Pass 1's features, in the only form anything downstream reads them in.
+  ///
+  /// A non-final pass's FeatureMap is never written -- it feeds anchor selection and dies -- and its
+  /// single consumer reads four things per feature. Keeping 2.07M `Feature` objects with ~30
+  /// subordinates each alive for that is 20.55 GB of live data (measured: releasing it drops
+  /// mallinfo2 in_use 29.64 -> 9.09 GB) held across `setup/mass_calibration`, which is where the
+  /// run's peak is. So pass 1 converts to this and frees the FeatureMap immediately.
+  odia::ScoreRows pass_scores_;
   UInt64 run_id_ = 0;
   /// What the sqlite path obtained by joining PRECURSOR / PEPTIDE / PROTEIN. Without a database the
   /// same facts have to come from the library -- which is where they originated, so this is the
@@ -1771,55 +1780,23 @@ protected:
     //
     // A sample rather than all 2M features: the union saturates almost immediately, and scanning
     // every feature's key list to build a set costs more than it can possibly add.
-    std::set<std::string> keyset;
-    const std::size_t probe = std::min<std::size_t>(fmap.size(), 4096);
-    for (std::size_t i = 0; i < probe; ++i)
+    // Column selection lives in scoreColumnsOf_ so this and the compact reader cannot drift
+    // apart; the anchor exclusion is applied on top, because it is per-consumer.
+    std::size_t probe = 0;
+    std::vector<std::string> vkeys;
+    for (const auto& sname : scoreColumnsOf_(fmap, &probe))
     {
-      std::vector<std::string> keys;
-      fmap[i].getKeys(keys);
-      for (const auto& k : keys) { keyset.insert(std::string(k)); }
-    }
-    // MS1 SUB-SCOPE. loadOswScores_ reads FEATURE_MS2, so it sees MS2-level sub-scores only;
-    // OpenSWATH keeps the MS1-level ones (var_ms1_*) in a separate FEATURE_MS1 table. This path has
-    // both on the Feature and can use either scope.
-    //
-    // THE EVIDENCE THAT ORIGINALLY JUSTIFIED DROPPING THEM WAS CONFOUNDED. It was: "identical
-    // settings, only the -out extension differing: sqlite (29 sub-scores) gave 6,607 identifications,
-    // this path (35-36 sub-scores) gave 4,913 -- 26% fewer for having MORE features", concluding the
-    // MS1 columns were sparse noise the fit wasted capacity on.
-    //
-    // That 4,913 is now explained by a different defect entirely: this path read `library_rt` from
-    // the feature's norm_RT (the OBSERVED rt in iRT space) instead of the library's PREDICTION, so
-    // recalibrate_ fitted a function of exp_rt against exp_rt and pass 2 extracted on a corrupted RT
-    // axis. With that fixed the same path reaches 6,522 -- WITHOUT any MS1 scores. So the MS1
-    // columns were never shown to hurt; they were blamed for a deficit another bug caused.
-    //
-    // MEASURED 2026-08-01, controlled A/B on the Astral benchmark, both arms on one node:
-    //     MS2 scope   (24 features)  6,506 IDs   5,699 peptides   583 proteins
-    //     MS1+MS2     (36 features)  6,574 IDs   5,709 peptides   628 proteins
-    //   +68 precursors against a measured noise floor of +/-83
-    // i.e. NO MEASURABLE EFFECT. The MS1 sub-scores neither help nor hurt. Default stays 'false'
-    // because 12 more features cost compute for nothing -- which is the right conclusion for a
-    // reason the original comment got wrong.
-    // -ms1_scores true hands the classifier ~12 more features (isotope correlation/overlap, mass
-    // deviation, MS1 xcorr shape/coelution): a real precursor has the right isotope envelope at MS1,
-    // which is information the MS2-only scope discards. The GBT treats missing as its own category
-    // (odia_gbt_test T5), so sparsity is handled rather than imputed.
-    const bool use_ms1_scores = getFlag_("ms1_scores");
-    std::vector<std::string> vkeys, dropped;
-    for (const auto& s : keyset)
-    {
-      std::string up = s;
+      std::string up = sname;
       std::transform(up.begin(), up.end(), up.begin(), ::toupper);
-      if (up.rfind("VAR_", 0) != 0) { continue; }
-      if (!use_ms1_scores && up.rfind("VAR_MS1_", 0) == 0) { dropped.push_back(s); continue; }
       if (for_anchors && up == "VAR_NORM_RT_SCORE") { continue; }   // circular for RT anchors (C8)
-      vkeys.push_back(s);
+      vkeys.push_back(sname);
     }
-    OPENMS_LOG_INFO << "OpenDIAlyzer: in-memory scoring found " << vkeys.size() << " VAR_ sub-scores ("
-                    << (use_ms1_scores ? "MS1+MS2 scope" : "MS2 scope; " + std::to_string(dropped.size())
-                                                           + " var_ms1_* excluded, -ms1_scores to include")
-                    << ") across " << probe << " probed features (of " << fmap.size() << ")." << std::endl;
+    OPENMS_LOG_INFO << "OpenDIAlyzer: in-memory scoring found " << vkeys.size()
+                    << " VAR_ sub-scores ("
+                    << (getFlag_("ms1_scores") ? "MS1+MS2 scope"
+                                               : "MS2 scope; var_ms1_* excluded, -ms1_scores to include")
+                    << ") across " << probe << " probed features (of " << fmap.size() << ")."
+                    << std::endl;
     if (vkeys.empty()) { return R; }
     R.names = vkeys;
 
@@ -1902,6 +1879,157 @@ protected:
     return R;
   }
 
+  /// The VAR_ columns a scored FeatureMap carries, in the order loadScoresFromFeatureMap_ picks
+  /// them. Factored out so the compact path CANNOT drift from the FeatureMap path -- the two
+  /// producing different column sets would look exactly like a scoring regression.
+  ///
+  /// VAR_NORM_RT_SCORE is deliberately NOT filtered here. It is excluded only for anchors (it is
+  /// circular for RT recalibration, C8), and that is the consumer's business: the store is written
+  /// once and must not bake in which consumer reads it.
+  std::vector<std::string> scoreColumnsOf_(const FeatureMap& fmap, std::size_t* n_probed = nullptr)
+  {
+    std::set<std::string> keyset;
+    const std::size_t probe = std::min<std::size_t>(fmap.size(), 4096);
+    for (std::size_t i = 0; i < probe; ++i)
+    {
+      std::vector<std::string> keys;
+      fmap[i].getKeys(keys);
+      for (const auto& k : keys) { keyset.insert(std::string(k)); }
+    }
+    if (n_probed) { *n_probed = probe; }
+    const bool use_ms1_scores = getFlag_("ms1_scores");
+    std::vector<std::string> vkeys;
+    for (const auto& s : keyset)
+    {
+      std::string up = s;
+      std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      if (up.rfind("VAR_", 0) != 0) { continue; }
+      if (!use_ms1_scores && up.rfind("VAR_MS1_", 0) == 0) { continue; }
+      vkeys.push_back(s);
+    }
+    return vkeys;
+  }
+
+  /// Convert a scored FeatureMap into the compact rows, so the OpenMS objects can be released.
+  ///
+  /// Keeps every feature that carries a PeptideRef, in extraction order. The remaining filters
+  /// (unmapped precursor, bad decoy flag) stay with the READER, because they depend on the library
+  /// index rather than on the features -- doing them here would fork the logic and make the two
+  /// paths capable of disagreeing about which rows exist.
+  void buildPassScores_(const FeatureMap& fmap)
+  {
+    pass_scores_.clear();
+    if (fmap.empty()) { return; }
+    std::size_t probe = 0;
+    std::vector<std::string> vkeys = scoreColumnsOf_(fmap, &probe);
+    if (vkeys.empty()) { return; }
+    pass_scores_.setColumns(vkeys);
+    pass_scores_.reserve(fmap.size());
+
+    std::vector<double> x(vkeys.size());
+    std::size_t skip_nogid = 0;
+    for (const Feature& f : fmap)
+    {
+      const std::string gid =
+        f.metaValueExists("PeptideRef") ? std::string(f.getMetaValue("PeptideRef").toString())
+                                        : std::string();
+      if (gid.empty()) { ++skip_nogid; continue; }
+      for (std::size_t j = 0; j < vkeys.size(); ++j)
+      {
+        // Same missing-value convention as the FeatureMap path: absent / empty / non-finite all
+        // become NaN, which the classifiers treat as missing rather than as zero.
+        x[j] = std::numeric_limits<double>::quiet_NaN();
+        if (!f.metaValueExists(vkeys[j])) { continue; }
+        const DataValue& dv = f.getMetaValue(vkeys[j]);
+        if (dv.isEmpty()) { continue; }
+        const double v = static_cast<double>(dv);
+        if (std::isfinite(v)) { x[j] = v; }
+      }
+      pass_scores_.append(static_cast<std::int64_t>(f.getUniqueId()),
+                          pass_scores_.intern(gid), f.getRT(), x.data());
+    }
+    pass_scores_.compact();
+    OPENMS_LOG_INFO << "OpenDIAlyzer[scoreload/compact] " << pass_scores_.size() << " of "
+                    << fmap.size() << " features (" << skip_nogid << " without a group id), "
+                    << vkeys.size() << " VAR_ sub-scores probed over " << probe << ", "
+                    << pass_scores_.groups() << " distinct groups interned; "
+                    << (pass_scores_.bytes() / 1048576.0) << " MB ("
+                    << pass_scores_.bytesPerRow() << " B/row)." << std::endl;
+  }
+
+  /// The compact counterpart of loadScoresFromFeatureMap_. Same rows, same columns, same order.
+  OswRows loadScoresFromCompact_(const odia::ScoreRows& S,
+                                 const std::map<std::string, PrecursorMeta>& prec_of_id,
+                                 bool for_anchors = false)
+  {
+    OswRows R;
+    if (S.size() == 0 || S.width() == 0) { return R; }
+
+    // Column projection, applied here rather than at build time: for_anchors drops
+    // VAR_NORM_RT_SCORE only. `take` maps output column -> stored column, preserving order.
+    std::vector<std::size_t> take;
+    for (std::size_t j = 0; j < S.width(); ++j)
+    {
+      std::string up = S.columns()[j];
+      std::transform(up.begin(), up.end(), up.begin(), ::toupper);
+      if (for_anchors && up == "VAR_NORM_RT_SCORE") { continue; }
+      take.push_back(j);
+      R.names.push_back(S.columns()[j]);
+    }
+    if (take.empty()) { return R; }
+    OPENMS_LOG_INFO << "OpenDIAlyzer: compact scoring found " << take.size()
+                    << " VAR_ sub-scores across " << S.size() << " features." << std::endl;
+
+    R.feats.reserve(S.size());
+    std::size_t skip_unmapped = 0, skip_baddecoy = 0;
+    for (std::size_t i = 0; i < S.size(); ++i)
+    {
+      const std::string& gid = S.gidName(S.gid(i));
+      const auto it = prec_of_id.find(gid);
+      if (it == prec_of_id.end()) { ++skip_unmapped; continue; }
+      const int dec = it->second.decoy;
+      if (dec != 0 && dec != 1) { ++skip_baddecoy; continue; }
+
+      const double* src = S.scores(i);
+      std::vector<double> x(take.size());
+      for (std::size_t j = 0; j < take.size(); ++j) { x[j] = src[take[j]]; }
+
+      R.feature_id.push_back(static_cast<long long>(S.featureId(i)));
+      R.group.push_back(it->second.id);
+      R.exp_rt.push_back(S.expRt(i));
+      R.labels.push_back(dec == 0 ? 1 : 0);
+      R.library_rt.push_back(it->second.library_rt);
+      R.traml_id.push_back(gid);
+      R.feats.push_back(std::move(x));
+    }
+    // The RT position/deviation pair is anchor-path-excluded upstream and this store only ever
+    // serves anchors; mirroring the branch keeps the two readers textually comparable.
+    if (!for_anchors && getStringOption_("rt_features") == "true" && !R.exp_rt.empty())
+    {
+      double lo = std::numeric_limits<double>::max(), hi = std::numeric_limits<double>::lowest();
+      for (const double t : R.exp_rt) { if (std::isfinite(t)) { lo = std::min(lo, t); hi = std::max(hi, t); } }
+      const double span = (hi > lo) ? (hi - lo) : 1.0;
+      for (std::size_t i = 0; i < R.feats.size(); ++i)
+      {
+        const double pos = std::isfinite(R.exp_rt[i]) ? (R.exp_rt[i] - lo) / span : 0.5;
+        const double dev = std::isfinite(R.library_rt[i])
+                         ? std::sqrt(std::min(1.0, std::fabs(pos - R.library_rt[i]))) : 0.0;
+        R.feats[i].push_back(pos);
+        R.feats[i].push_back(dev);
+      }
+    }
+    const std::size_t before_mem = R.feats.empty() ? 0 : R.feats[0].size();
+    dropUninformativeColumns_(R);
+    OPENMS_LOG_INFO << "OpenDIAlyzer[scoreload/memory] rows " << R.feats.size() << "/" << S.size()
+                    << " (skipped: unmapped " << skip_unmapped
+                    << ", bad decoy " << skip_baddecoy << "); columns " << before_mem << " -> "
+                    << (R.feats.empty() ? 0 : R.feats[0].size())
+                    << " after dropping uninformative; targets "
+                    << std::count(R.labels.begin(), R.labels.end(), 1) << std::endl;
+    R.canonicalize();
+    return R;
+  }
+
   // best-scoring row per precursor group (max d-score); returns group -> row index
   static std::unordered_map<long long, size_t> bestPerGroup_(const OswRows& R, const std::vector<double>& dscore)
   {
@@ -1939,8 +2067,13 @@ protected:
   {
     n_anchors = 0;
     pass_confident_ids_.clear();
+    // The compact rows are the ONLY form a non-final pass's features survive in -- the FeatureMap
+    // was released the moment extraction returned. Fall back to it only if the conversion did not
+    // run (an empty pass), so this never silently scores nothing.
     OswRows R = parquet_out_
-                  ? loadScoresFromFeatureMap_(pass_features_, precursor_index_, /*for_anchors=*/true)
+                  ? (pass_scores_.size() > 0
+                       ? loadScoresFromCompact_(pass_scores_, precursor_index_, /*for_anchors=*/true)
+                       : loadScoresFromFeatureMap_(pass_features_, precursor_index_, /*for_anchors=*/true))
                   : loadOswScores_(osw, /*for_anchors=*/true);   // exclude RT scores (C8)
     if (R.feats.size() < 50 || R.feats[0].empty() || !hasBothClasses_(R))
     {
@@ -5542,6 +5675,33 @@ protected:
     MemProbe::logAllocator(p == 1 ? "after extract pass1" : "after extract pass2");
       if (rc != EXECUTION_OK) { return rc; }
 
+      // A NON-FINAL PASS'S FEATURES DIE HERE, not after mass calibration.
+      //
+      // They are never written -- only the FINAL pass reaches the parquet writer -- and their one
+      // consumer is recalibrate_ below, which reads four values per feature. Everything else about
+      // those 2.07M Features and their ~30 subordinates each is carrying cost: 20.55 GB of live
+      // data (releasing it drops mallinfo2 in_use 29.64 -> 9.09 GB) that used to stay resident
+      // through setup/mass_calibration, which is exactly where the run's peak sits (64.23 GB).
+      //
+      // So convert to the compact rows and drop the OpenMS objects immediately. clear() alone
+      // would not return anything -- FeatureMap keeps its capacity -- hence swap-with-empty, and
+      // malloc_trim to hand the pages back rather than leave them in glibc's arena free-lists.
+      if (p < passes && parquet_out_ && !pass_features_.empty())
+      {
+        PhaseTimer pt_cs("setup/compact_pass_features");
+        const std::size_t n = pass_features_.size();
+        buildPassScores_(pass_features_);
+        FeatureMap().swap(pass_features_);
+#ifdef __GLIBC__
+        malloc_trim(0);
+#endif
+        OPENMS_LOG_INFO << "OpenDIAlyzer: pass-" << p << " features compacted (" << n
+                        << " -> " << pass_scores_.size() << " rows, "
+                        << (pass_scores_.bytes() / 1073741824.0)
+                        << " GB) and the FeatureMap released." << std::endl;
+        MemProbe::logAllocator("after compact pass features");
+      }
+
       if (p < passes)
       {
         int n_anchors = 0;
@@ -5661,15 +5821,26 @@ protected:
         // outright, and malloc_trim then hands the pages back -- without it glibc keeps them in the
         // arena free-lists, which is where this run's 73.5 GB of retained-but-unused memory comes
         // from in the first place.
+        //
+        // The FeatureMap is normally already gone by here -- it is converted and released the
+        // moment extraction returns (setup/compact_pass_features), so this now mostly frees the
+        // COMPACT rows, whose last reader was recalibrate_ above. The FeatureMap branch stays for
+        // the case where the conversion did not run.
         {
           PhaseTimer pt_fr("setup/free_pass1_features");
           const std::size_t n_freed = pass_features_.size();
+          const std::size_t n_rows = pass_scores_.size();
+          const double gb = pass_scores_.bytes() / 1073741824.0;
           FeatureMap().swap(pass_features_);
+          pass_scores_.clear();
 #ifdef __GLIBC__
           malloc_trim(0);
 #endif
-          OPENMS_LOG_INFO << "OpenDIAlyzer: released " << n_freed
-                          << " pass-" << p << " features before the next extraction." << std::endl;
+          OPENMS_LOG_INFO << "OpenDIAlyzer: released " << n_rows << " compact pass-" << p
+                          << " score rows (" << gb << " GB)"
+                          << (n_freed ? ", plus " + std::to_string(n_freed) + " unconverted features"
+                                      : "")
+                          << " before the next extraction." << std::endl;
         }
         MemProbe::logAllocator("after free pass1 features");
         // Diagnostic only: this is the IN-SAMPLE anchor residual (small); it is NOT the

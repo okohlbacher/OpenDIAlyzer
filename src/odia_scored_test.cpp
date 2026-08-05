@@ -144,6 +144,59 @@ int main()
     CHECK(gb < 3.0);
   }
 
+  // ---- 7. ScoreRows: the pass-1 replacement for a scored FeatureMap ----------------------------
+  // What matters here is that a row's scores are addressed per ROW, that the interned group id
+  // round-trips, and that RT survives as double -- the whole acceptance test for wiring this in is
+  // bit-identical identifications, and a silently narrowed RT would break that in a way that looks
+  // like a scoring regression rather than a storage bug.
+  {
+    ScoreRows sr;
+    sr.setColumns({"var_xcorr_shape", "var_library_corr", "var_massdev_score"});
+    CHECK(sr.width() == 3);
+    bool threw2 = false;
+
+    const std::size_t kRows = 50000;
+    sr.reserve(kRows);
+    std::mt19937 r2(7);
+    std::uniform_real_distribution<double> u2(-5.0, 5.0);
+    double row3[3];
+    // ~5 features per precursor, as measured (2.07M features over ~400k precursors).
+    for (std::size_t i = 0; i < kRows; ++i)
+    {
+      const std::string gid = "PEPTIDE_" + std::to_string(i / 5);
+      for (double& v : row3) { v = u2(r2); }
+      row3[0] = double(i) + 0.5;                       // marker: must come back exactly
+      // An RT that is NOT representable in float32 -- this is the precision claim under test.
+      const double rt = 1000.0 + double(i) * 0.000123456789;
+      sr.append(std::int64_t(i) * 31, sr.intern(gid), rt, row3);
+    }
+    sr.compact();
+    CHECK(sr.size() == kRows);
+    CHECK(sr.groups() == kRows / 5);                   // interning collapsed the repeats
+    CHECK(sr.featureId(1234) == 1234 * 31);
+    CHECK(sr.gidName(sr.gid(1234)) == "PEPTIDE_" + std::to_string(1234 / 5));
+    CHECK(sr.scores(1234)[0] == 1234.5);               // per-row addressing, not per-column
+    CHECK(sr.scores(kRows - 1)[0] == double(kRows - 1) + 0.5);
+
+    // RT is double: the value round-trips EXACTLY. Through float32 it would not.
+    const double want_rt = 1000.0 + double(4321) * 0.000123456789;
+    CHECK(sr.expRt(4321) == want_rt);
+    CHECK(double(float(want_rt)) != want_rt);          // ...and float32 really would have lost it
+
+    // Columns are fixed once rows exist -- a later change would resize every row's slice.
+    try { sr.setColumns({"a"}); } catch (const std::logic_error&) { threw2 = true; }
+    CHECK(threw2);
+
+    std::printf("  ScoreRows          %6.1f B/row  (%zu groups interned from %zu rows)\n",
+                sr.bytesPerRow(), sr.groups(), sr.size());
+    // A scored Feature is 296 B plus ~76 MetaInfo heap allocations; this must be far under that
+    // even before the subordinates it drops entirely.
+    CHECK(sr.bytesPerRow() < 100.0);
+
+    sr.clear();
+    CHECK(sr.size() == 0 && sr.bytes() == 0);          // capacity released, not just cleared
+  }
+
   if (g_fail) { std::printf("odia_scored_test FAILED (%d)\n", g_fail); return 1; }
   std::printf("odia_scored_test OK\n");
   return 0;
