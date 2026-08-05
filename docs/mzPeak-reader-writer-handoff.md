@@ -451,6 +451,20 @@ Iteration does not help. `Spectra` is an `EnumerableProxy<Spectrum>` whose Itera
 point query. `get_spectra_batch` sorts indices ascending "so file access is sequential" --
 an acknowledgement of the cost -- but still calls `fetch()` per index, so it issues N plans.
 
+### The batch accessor was tried, as intended, and is ~2x -- not the ~420x needed
+
+Measured directly, reading in the file's own ascending order in batches of 2,048:
+
+    Spectra::get_spectra_batch, file order      7 spectra/s
+    Spectra::operator[], sequential           ~3.3 spectra/s
+    ->  307,590 spectra at 7/s = 12.2 HOURS for one pass
+    ->  mzML parses the same run in 104 s
+
+Sorting helps by about 2x, which is what avoiding some seek cost buys, and no more. It
+cannot help further: get_spectra_batch calls fetch() per index internally
+(spectra.cpp:186), so the per-spectrum plan is still issued 307,590 times. The ordering was
+never the dominant term; the per-call plan is.
+
 ### What is needed, and why it cannot be done by the caller
 
 A bulk sequential read that plans ONCE and streams row groups in order, yielding spectra as
