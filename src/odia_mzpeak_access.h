@@ -27,6 +27,8 @@
 #pragma once
 
 #include <mzpeak/open.h>
+
+#include "odia_mmap_archive.h"
 #include <mzpeak/index.h>
 #include <mzpeak/spectra.h>
 #include <mzpeak/spectrum.h>
@@ -82,9 +84,30 @@ struct MzPeakGroup
 /// initialisation thread-safe and exactly-once without a lock of our own.
 ///
 /// s_path_ must be set before any worker calls this -- there is one input per run, so it is.
+/// One mapping and one parsed central directory for the whole process.
+inline const odia::MmapArchive& sharedArchive(const std::string& path)
+{
+  static odia::MmapArchive a(path);          // magic static: once, thread-safe, no lock of ours
+  return a;
+}
+
+/// A fresh Archive over the SHARED mapping. Index takes ownership of an Archive, so each Index
+/// needs its own object -- but the object is now a pair of shared_ptrs, not a file open and not a
+/// directory scan.
+inline std::unique_ptr<MzPeak::IO::Archive> archiveView(const std::string& path)
+{
+  const auto& a = sharedArchive(path);
+  return std::make_unique<odia::MmapArchive>(a.mapping(), a.directory());
+}
+
+/// THE one Index. Metadata parsed once, over the shared mapping.
+///
+/// Centralising this ALONE was measured and was not enough: descriptors went 1,060 -> 911 because
+/// the handles come from the per-thread Spectra, not from the Index. What fixes it is that every
+/// File handed out below is a span of the mapping, so no Spectra can open anything.
 inline const MzPeak::Index& sharedIndex(const std::string& path)
 {
-  static MzPeak::Index idx = MzPeak::open(path);
+  static MzPeak::Index idx{archiveView(path)};
   return idx;
 }
 
