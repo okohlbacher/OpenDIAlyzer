@@ -86,9 +86,12 @@ public:
   {
     for (std::uint32_t k = 1; k < n; ++k)
     {
-      if (mz[k] < mz[k - 1])
+      // `!(a >= b)` rather than `a < b`: NaN fails every comparison, so the naive test ACCEPTS a
+      // NaN and the array then breaks std::lower_bound's strict weak ordering -- a binary search
+      // over it returns arbitrary peaks rather than failing.
+      if (!(mz[k] >= mz[k - 1]))
       {
-        throw std::invalid_argument("odia::SpectrumStore: m/z array is not ascending");
+        throw std::invalid_argument("odia::SpectrumStore: m/z array is not ascending (or holds NaN)");
       }
     }
     Meta e = m;
@@ -118,9 +121,12 @@ public:
   {
     for (std::uint32_t k = 1; k < n; ++k)
     {
-      if (mz[k] < mz[k - 1])
+      // `!(a >= b)` rather than `a < b`: NaN fails every comparison, so the naive test ACCEPTS a
+      // NaN and the array then breaks std::lower_bound's strict weak ordering -- a binary search
+      // over it returns arbitrary peaks rather than failing.
+      if (!(mz[k] >= mz[k - 1]))
       {
-        throw std::invalid_argument("odia::SpectrumStore: m/z array is not ascending");
+        throw std::invalid_argument("odia::SpectrumStore: m/z array is not ascending (or holds NaN)");
       }
     }
     Meta e = m;

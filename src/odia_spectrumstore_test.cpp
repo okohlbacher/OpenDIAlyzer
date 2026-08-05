@@ -205,6 +205,26 @@ int main()
     CHECK(s4.sumRange(0, double(stored), double(stored)) == 42.0);
   }
 
+  // ---- 10. NaN must not pass the ascending check ------------------------------------------------
+  // NaN fails every comparison, so `mz[k] < mz[k-1]` ACCEPTS it. The array then breaks the strict
+  // weak ordering std::lower_bound needs, and a binary search returns arbitrary peaks instead of
+  // failing -- the worst outcome, since nothing downstream can tell.
+  {
+    SpectrumStore bad2;
+    const double dm[3] = {100.0, std::numeric_limits<double>::quiet_NaN(), 99.0};
+    const float di[3] = {1.0F, 1.0F, 1.0F};
+    bool threw = false;
+    try { bad2.add(dm, di, 3, {}); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+
+    SpectrumStore bad3;                                  // same via the float32 entry point
+    const float fm[2] = {100.0F, std::numeric_limits<float>::quiet_NaN()};
+    const float fi[2] = {1.0F, 1.0F};
+    threw = false;
+    try { bad3.addFloat(fm, fi, nullptr, 2, {}); } catch (const std::invalid_argument&) { threw = true; }
+    CHECK(threw);
+  }
+
   if (g_fail) { std::printf("odia_spectrumstore_test FAILED (%d)\n", g_fail); return 1; }
   std::printf("odia_spectrumstore_test OK\n");
   return 0;

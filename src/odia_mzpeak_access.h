@@ -352,11 +352,11 @@ public:
     local.resize(static_cast<std::size_t>(nthr));   // NOT local(n): that declares a function
 
     const std::size_t chunk = (all.size() + std::size_t(nthr) - 1) / std::size_t(nthr);
-    std::size_t n_peak_total = 0, n_failed = 0, n_empty = 0;
+    std::size_t n_peak_total = 0, n_failed = 0, n_empty = 0, n_resorted = 0;
     const auto t0 = std::chrono::steady_clock::now();
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static, 1) num_threads(nthr) \
-    reduction(+ : n_peak_total, n_failed, n_empty)
+    reduction(+ : n_peak_total, n_failed, n_empty, n_resorted)
 #endif
     for (int w = 0; w < nthr; ++w)
     {
@@ -404,6 +404,36 @@ public:
               fmz.push_back(static_cast<float>(m[q]));
               fin.push_back(y[q]);
               if (per_peak_im) { fdt.push_back(static_cast<float>(imv[q])); }
+            }
+            // A PHYSICAL SPECTRUM IS NOT NECESSARILY m/z-SORTED, and this path REQUIRES it.
+            //
+            // Bruker ims-compact stores peaks mobility-major then TOF order, so a frame's m/z
+            // restarts at every mobility bin. This repo measured exactly that -- OVERNIGHT-LOG
+            // records `sorted=0` on S08 and retracts an earlier plan to drop decodeRaw's re-sort
+            // because "removing the sort would have broken every diaPASEF run". decodeRaw sorts
+            // the concatenated arrays for that reason; population fed them straight to addFloat,
+            // whose ascending precondition would then throw -- inside an OpenMP region, i.e.
+            // std::terminate, on every ims-compact file. The Astral benchmark never caught it
+            // because Astral spectra arrive sorted.
+            bool asc = true;
+            for (std::size_t q = 1; q < fmz.size() && asc; ++q) { asc = fmz[q] >= fmz[q - 1]; }
+            if (!asc)
+            {
+              std::vector<std::uint32_t> ord(fmz.size());
+              for (std::uint32_t q = 0; q < ord.size(); ++q) { ord[q] = q; }
+              std::sort(ord.begin(), ord.end(),
+                        [&](std::uint32_t a2, std::uint32_t b2) { return fmz[a2] < fmz[b2]; });
+              std::vector<float> t_mz(fmz.size()), t_in(fin.size());
+              for (std::size_t q = 0; q < ord.size(); ++q)
+              { t_mz[q] = fmz[ord[q]]; t_in[q] = fin[ord[q]]; }
+              fmz.swap(t_mz); fin.swap(t_in);
+              if (!fdt.empty())
+              {
+                std::vector<float> t_dt(fdt.size());
+                for (std::size_t q = 0; q < ord.size(); ++q) { t_dt[q] = fdt[ord[q]]; }
+                fdt.swap(t_dt);
+              }
+              ++n_resorted;
             }
             // The SCALAR mobility, for the per-slice layout that has no per-peak array. decodeRaw
             // pushes exactly this value; storing it keeps the two paths agreeing on IM input.
@@ -456,8 +486,9 @@ public:
                  (n_peak_total * 16.0) / std::max<double>(1.0, double(b)));
     // Always reported, including the zero case: "0 undecodable" is the evidence that the run saw
     // every spectrum. A partial decode failure is otherwise indistinguishable from a sparse run.
-    std::fprintf(stderr, "OpenDIAlyzer[mzpeak] %zu undecodable, %zu decoded empty (of %zu)\n",
-                 n_failed, n_empty, all.size());
+    std::fprintf(stderr,
+                 "OpenDIAlyzer[mzpeak] %zu undecodable, %zu decoded empty, %zu re-sorted (of %zu)\n",
+                 n_failed, n_empty, n_resorted, all.size());
   }
 
   bool populated() const { return populated_; }
