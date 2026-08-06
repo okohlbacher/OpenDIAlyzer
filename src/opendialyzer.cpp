@@ -362,6 +362,22 @@ protected:
                           "Write the surviving precursors (id, sequence, decoy) here and EXIT "
                           "before extraction. For tuning/validating -prefilter without paying for "
                           "a full run.", false, true);
+    // DIAGNOSTIC, not a search setting. This deliberately breaks the prefilter's selectivity in
+    // order to measure the CEILING of any possible prefilter improvement: admit a known list of
+    // precursors the filter would delete, run the pipeline unchanged, and count how many actually
+    // reach q<0.01. If almost none do, no amount of smarter filtering can pay, because the
+    // downstream classifier -- not the candidate set -- is the binding constraint.
+    //
+    // Admission is by STRIPPED sequence + charge, and it goes through the normal pair-union, so
+    // each admitted target brings its decoy partner. That symmetry is not optional: the union is
+    // what makes selection label-blind, and admitting targets alone would inflate identifications
+    // while quietly invalidating the q-values.
+    registerStringOption_("prefilter_force_ids", "<txt>", "",
+                          "DIAGNOSTIC: force-admit these precursors past the prefilter, one "
+                          "STRIPPED_SEQUENCE_CHARGE key per line (e.g. 'AAAATGTIFTFR_2'). Every "
+                          "modified form matching a key is admitted, and the usual pair-union "
+                          "attaches each one's decoy partner. Measures the upper bound on prefilter "
+                          "recovery; not for production searches.", false, true);
     registerStringOption_("mz_extraction_window_unit", "ppm|Th", "ppm",
                           "Unit for -mz_extraction_window / -mz_extraction_window_ms1.", false);
     setValidStrings_("mz_extraction_window_unit", {"ppm", "Th"});
@@ -3753,6 +3769,58 @@ protected:
                            : (ev == "ms2") ? e.supported_ms2
                                            : (e.supported_ms1 || e.supported_ms2);
       if (supported && !e.compound_id.empty()) { keep.insert(e.compound_id); }
+    }
+
+    // ORACLE ADMISSION (diagnostic). Inserted here, into the TARGET keep-set, so everything
+    // downstream -- the pair-union, the ratio guard, the rebuild -- treats these exactly like
+    // precursors the filter supported on its own. Nothing else in the pipeline learns that they
+    // were forced.
+    {
+      const std::string force_path = getStringOption_("prefilter_force_ids");
+      if (!force_path.empty())
+      {
+        auto strip = [](const std::string& s) {
+          std::string o; o.reserve(s.size());
+          for (std::size_t k = 0; k < s.size(); ++k)
+          {
+            if (s[k] == '(')                                  // drop a (UniMod:nn) group entirely
+            { while (k < s.size() && s[k] != ')') { ++k; } continue; }
+            if (s[k] == '.') { continue; }
+            o.push_back(s[k]);
+          }
+          return o;
+        };
+        std::unordered_set<std::string> want;
+        std::ifstream fin(force_path);
+        if (!fin)
+        {
+          OPENMS_LOG_ERROR << "OpenDIAlyzer: cannot read -prefilter_force_ids " << force_path
+                           << std::endl;
+        }
+        else
+        {
+          for (std::string line; std::getline(fin, line);)
+          {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) { line.pop_back(); }
+            if (!line.empty()) { want.insert(strip(line)); }
+          }
+          std::size_t forced = 0, already = 0;
+          for (const auto& c : transition_exp.getCompounds())
+          {
+            // LightCompound carries no decoy flag: decoy identity IS the id prefix, which is also
+            // how the pair-union below pairs them ("DECOY_" + target id).
+            if (!dtag.empty() && c.id.rfind(dtag, 0) == 0) { continue; }   // union adds the decoys
+            if (!want.count(strip(c.id))) { continue; }
+            if (keep.count(c.id)) { ++already; continue; }     // the filter supported it anyway
+            keep.insert(c.id);
+            ++forced;
+          }
+          OPENMS_LOG_INFO << "OpenDIAlyzer[prefilter/oracle] force-admitted " << forced
+                          << " target compounds from " << want.size() << " keys in " << force_path
+                          << " (" << already << " were already supported). Their decoy partners "
+                          << "follow via the pair-union. THIS IS A DIAGNOSTIC RUN." << std::endl;
+        }
+      }
     }
 
     // Check the pairing PRECONDITION before spending the two extraction passes below. Pairing is by
