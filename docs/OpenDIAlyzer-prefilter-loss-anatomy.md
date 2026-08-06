@@ -1,7 +1,17 @@
 # Anatomy of the prefilter's losses
 
-**2026-08-06.** Measured on the Astral benchmark against the DIA-NN reference list
-(`/scratch/kohlbach/bench/diann_ids.txt`, 7,787 precursors, same run, same library). Evidence
+> **CORRECTED 2026-08-06, after adversarial review (Codex).** The first version of this document
+> used `bench/diann_ids.txt` (7,787 entries) as the reference. That list is **known-bad and this
+> repository already documented it** — `docs/OpenDIAlyzer-classifier-backlog.md` §14: it omits
+> **1,230 real DIA-NN 2.0 IDs** and contains **205 entries that were not IDs at q<0.01**. The
+> corrected list is `bench/diann_ids_correct.txt` (8,812 stripped-sequence+charge keys). §1–§3
+> below are re-run against it. **§4 and §5 have been withdrawn**: they rested on evidence columns
+> that do not mean what I assumed — see §4.
+>
+> The headline conclusion is unchanged by the correction, which is the one reassuring part.
+
+**2026-08-06.** Measured on the Astral benchmark against the corrected DIA-NN reference list
+(`/scratch/kohlbach/bench/diann_ids_correct.txt`, 8,812 precursors, same run, same library). Evidence
 dumped at `-prefilter_min_fragments 1` so that **sub-threshold** hit counts are recorded — at the
 default 4 the filter short-circuits and every failure reports depth 0, which makes the losses
 unattributable. `experiments/run_pfdiag1.sh`; dump is 382 MB, 3,603,425 candidate rows.
@@ -18,30 +28,34 @@ top-1000 peaks of a single spectrum, at ±5 ppm. The rule keeps `depth >= 4`.
 | depth | reference precursors | | full target population |
 |---:|---:|---|---:|
 | 0 | 0 | | 847,154 |
-| 1 | 3 | | 75,563 |
-| 2 | 188 | | 1,645,520 |
-| 3 | **766** | | 914,675 |
-| 4 | 1,237 | | 107,686 |
-| 5 | 1,612 | | 8,059 |
-| 6 | 3,981 | | 4,768 |
+| 1 | 4 | | 75,563 |
+| 2 | 335 | | 1,645,520 |
+| 3 | **1,091** | | 914,675 |
+| 4 | 1,528 | | 107,686 |
+| 5 | 1,757 | | 8,059 |
+| 6 | 4,097 | | 4,768 |
 
-**957 reference precursors are deleted by the default rule. 80.0% of them sit at depth 3 — one
-fragment short. 19.6% at depth 2. Only 3 (0.3%) below depth 2.**
+**1,430 reference precursors are deleted by the default rule. 76.3% of them sit at depth 3 — one
+fragment short. 23.4% at depth 2. Only 4 (0.3%) below depth 2.**
 
-All 7,787 reference precursors are present in the dump as candidates, so none of the gap is a
+All 8,812 reference precursors are present in the dump as candidates, so none of the gap is a
 naming or modification artefact.
 
-This is the answer to the question that gated the whole line of work: **99.7% of the losses have
-at least 2 matched fragments**, so evidence that needs matched fragments — a spectral dot product
+This is the answer to the question that gated the whole line of work, and it is **robust to the
+reference correction** — it was 99.7% against the bad list too, and the shape barely moved:
+**99.7% of the losses have at least 2 matched fragments**, so evidence that needs matched fragments — a spectral dot product
 against the library, a mass-error spread across matched fragments — is *defined* for essentially
 all of them. Had they sat at depth 0–1 there would have been nothing to score.
 
 ## 2. Two hypotheses killed outright
 
-- **`depth >= 4` but only ONE qualifying spectrum: 0.** The single-qualifying-spectrum criterion
-  removes nothing on this run. `experiments/pf_lost.py` lists it as a distinct recovery axis; it
-  is empty.
-- **Losses with MS1 evidence despite failing MS2: 0.** There is no MS1 rescue route here.
+- ~~**`depth >= 4` but only ONE qualifying spectrum: 0.**~~ **WITHDRAWN.** `ms2_qualifying_spectra`
+  counts spectra meeting the *configured* threshold, which in this dump is 1 — so the measurement
+  actually says "no precursor at depth >= 4 had only one spectrum with at least ONE hit", which is
+  near-trivially true and not the intended test. This axis is **untested**, not empty. Testing it
+  needs a dump at `min_fragments=3` or separate >=1/>=2/>=3 counters.
+- **Losses with MS1 evidence despite failing MS2: 0.** This one stands — `ms1_hit_count` is
+  accumulated independently of the MS2 threshold. There is no MS1 rescue route here.
 
 ## 3. The budget already contains the room
 
@@ -61,51 +75,44 @@ admitted candidates enlarge the target-decoy null faster than they add true posi
 Corollary: the retained set is 212,292 target vs 210,787 decoy, a **target/decoy ratio of 1.007**.
 At population level the current criterion barely distinguishes a real peptide from a shuffled one.
 
-## 4. Ranking by existing evidence is worse than random
+## 4. WITHDRAWN — the ranking experiment and the "pool purity" reading
 
-Ranking the 786,187 target precursors whose best depth is exactly 3, taking the top 91,779 (the
-reallocatable budget, 11.7% of the pool), and counting how many of the 766 reference losses are
-captured. **Random selection captures 89.**
+The first version reported that ranking the depth-3 pool by `ms2_qualifying_spectra`,
+`ms2_hit_count`, `ms2_sum_intensity`, `ms2_max_intensity` and `ms1_max_intensity` captured
+22/23/42/42/76 of the losses against a random expectation of 89 — i.e. **every ranking worse than
+random** — and concluded from a follow-up test that this reflected *pool purity*: the noise is
+high-intensity, so intensity ranking promotes coincidences.
 
-| ranked by | captured of 766 | vs random |
-|---|---:|---:|
-| qualifying spectra (recurrence) | 22 | **0.25×** |
-| ms2 hit count | 23 | 0.26× |
-| ms2 summed intensity | 42 | 0.47× |
-| ms2 max intensity | 42 | 0.47× |
-| ms1 max intensity | 76 | 0.85× |
+**Both are withdrawn. The columns do not mean what I assumed.** The accumulator increments
+`ms2_qualifying_spectra` only when a spectrum has already met the *configured* `min_fragment_hits`
+— stated in the vendored patch itself:
 
-Every one is *worse than random*. This directly kills the recurrence term (`run_len`) that was
-proposed as a cheap co-elution surrogate: on this data it would actively harm.
+> Called only when this spectrum already met min_fragment_hits, so this counts SPECTRA in which the
+> precursor qualified -- i.e. how often the evidence RECURRED.
 
-## 5. The correction: it is pool purity, not "weak losses"
+This dump was taken at `min_fragments=1`. So "qualifying spectra" counts spectra with **at least
+one** fragment hit, and `ms2_hit_count` / the intensity accumulators aggregate that same ≥1-hit
+background across the whole run — potentially hundreds of unrelated events. **None of it is the
+evidence belonging to the spectrum that established depth 3.** I ranked candidates by a whole-run
+abundance proxy and then interpreted the result as a statement about coincidence structure.
 
-The first reading of §4 was **"the depth-3 pool is dominated by high-abundance spurious matches
-and the real weak peptides sit underneath them."** That is half right, and the conclusion drawn
-from it was wrong. The falsification test — do reference precursors that *pass* also look weak? —
-settles it:
+The same defect voids the depth-stratified median comparison that produced the "ratio tracks pool
+purity" reading. Whether real weak peptides genuinely sit beneath abundant coincidences is, as of
+now, **unmeasured**.
 
-| depth | pool | reference | pool purity | ref/pool median summed intensity |
-|---:|---:|---:|---:|---:|
-| 3 | 786,187 | 766 | 0.1% | 0.53 |
-| 4 | 102,723 | 1,237 | 1.2% | **0.18** |
-| 5 | 7,861 | 1,612 | 21% | **0.17** |
-| 6 | 4,482 | 3,981 | **89%** | 0.88 |
+What it would take to measure it properly: a dump at `min_fragments=3` (so the accumulators count
+the ≥3-hit event), or separate ≥1/≥2/≥3 counters, and evidence recorded from the *argmax-depth*
+spectrum rather than summed over the run.
 
-Reference precursors are weaker than the pool median at **every** depth, and most extremely at
-depths 4 and 5 — where they *pass*. And the ratio tracks **pool purity**: at depth 6 the pool is
-89% reference precursors and the ratio converges to 0.88.
+Two further confounds, raised in the same review and not yet controlled:
 
-So the effect is not a property of the losses. **The pool median is dominated by whatever noise it
-contains, and that noise is high-intensity** — abundant peaks generate many chance 3-of-6 matches.
-Intensity ranking promotes coincidences wherever noise dominates, which is every depth below 6.
-
-The useful consequence: any ranking term that scales with **magnitude** is contaminated by this.
-What survives is evidence that is **scale-free by construction** — the agreement between observed
-and predicted fragment *ratios* (restricted to matched fragments, since the top-6 are chosen *by*
-predicted intensity and an unrestricted dot product just re-encodes depth), and the *consistency*
-of mass error across a candidate's matched fragments. Neither is a function of how intense the
-peaks are.
+- **Depth < 4 is not the same as deletion.** The pair-union keeps a target if *either* it or its
+  decoy passes, so some "losses" were searchable through their partner. Separating "own target
+  passed" / "partner rescued it" / "actually extracted" / "identified" needs a join against a
+  default-threshold dump.
+- **Max-over-modified-forms is the wrong unit.** Forms differ in precursor m/z, fragments and RT;
+  taking the max gives groups with more enumerated forms more chances, and presence of *some* form
+  does not show the reference peptidoform was present.
 
 ## 6. What cannot be measured yet
 
