@@ -917,6 +917,21 @@ protected:
   mutable bool compact_lib_used_ = false;
   /// Per-candidate prefilter evidence, retained so -prefilter_out can report the LOSSES.
   mutable std::vector<TransitionListEvidenceFilter::PrecursorEvidence> prefilter_evidence_;
+  /// The DECOY scan's evidence, kept for -prefilter_out only.
+  ///
+  /// Without it the dump is target-only, and the single measurement that can honestly gate a new
+  /// prefilter score -- the TARGET FRACTION among the top-N by that score -- is uncomputable. That
+  /// measure matters because it is REFERENCE-FREE: it needs no DIA-NN list, so it is immune to the
+  /// positive-unlabelled problem that makes every recall number here suspect (our reference omits
+  /// real IDs and contains non-IDs, and ODIA finds many precursors DIA-NN does not). The decoy scan
+  /// already runs every time; its evidence was simply discarded.
+  mutable std::vector<TransitionListEvidenceFilter::PrecursorEvidence> prefilter_evidence_decoy_;
+  /// Library RT of EVERY candidate, captured before the prefilter rebuilds the experiment.
+  ///
+  /// The dump used to join library_rt against the already-filtered experiment, so every DISCARDED
+  /// candidate -- exactly the ones a recovery analysis is about -- got -1. Populated only when
+  /// -prefilter_out is set, so a normal run pays nothing.
+  mutable std::unordered_map<std::string, double> prefilter_lib_rt_;
 
   /// Load an .oswpq library through CompactLibrary and materialise a targeted experiment whose
   /// compound ids are synthetic (base-36, <=14 chars, inside the SSO buffer).
@@ -3737,6 +3752,13 @@ protected:
     // deleted here, and relaxing the threshold makes identifications WORSE (6930 -> 5580 at 3-of-6),
     // so the useful thing to know is how far the losses miss and on which criterion.
     prefilter_evidence_ = res.evidence;
+    // Capture library RT for ALL candidates now, while the experiment is still complete.
+    if (!getStringOption_("prefilter_out").empty())
+    {
+      prefilter_lib_rt_.clear();
+      prefilter_lib_rt_.reserve(transition_exp.getCompounds().size());
+      for (const auto& c : transition_exp.getCompounds()) { prefilter_lib_rt_[c.id] = c.rt; }
+    }
 
     // Decoy status lives on the TRANSITION (getDecoy()), not on LightCompound, so derive it per
     // peptide ref first -- the evidence split below needs it.
@@ -3886,6 +3908,19 @@ protected:
       TransitionListEvidenceFilter::Result res_d;
       { PhaseTimer pt("prefilter/scan_decoys");
         res_d = filt.filter(swath_maps, dview, cp_ms1, cp, pasef_, getIntOption_("threads")); }
+      // Kept for the dump: the decoy arm is what makes a reference-free enrichment measure
+      // possible. dview RENAMES each decoy to "PFD<n>" (OpenMS refuses a flagged decoy library),
+      // so the evidence carries the alias and has to be translated back through id_of_alias --
+      // otherwise every decoy row in the dump is keyed on a synthetic name that joins to nothing.
+      if (!getStringOption_("prefilter_out").empty())
+      {
+        prefilter_evidence_decoy_ = res_d.evidence;
+        for (auto& e : prefilter_evidence_decoy_)
+        {
+          const auto it = id_of_alias.find(e.compound_id);
+          if (it != id_of_alias.end()) { e.compound_id = it->second; }
+        }
+      }
 
       // Set once the learned model has produced a selection, so the boolean rule below is skipped
       // WHOLESALE rather than conditionally -- a model that trained but selected no decoys must not
@@ -5420,11 +5455,6 @@ protected:
       const std::string pf_out = getStringOption_("prefilter_out");
       if (!pf_out.empty())
       {
-        std::set<std::string> dec;
-        for (const auto& t : transition_exp.getTransitions())
-        {
-          if (t.getDecoy()) { dec.insert(t.getPeptideRef()); }
-        }
         std::ofstream os(pf_out);
         if (!os) { OPENMS_LOG_ERROR << "OpenDIAlyzer: cannot write " << pf_out << std::endl; return CANNOT_WRITE_OUTPUT_FILE; }
         std::set<std::string> survived;
@@ -5438,16 +5468,26 @@ protected:
         // it -- MS1 corroboration adds 22 true peptides at 4.6x the budget. The signals that should
         // discriminate are intensity agreement and RT, and neither could be tested without these.
         // library_rt is joined here because the evidence struct has no notion of predicted RT.
-        std::unordered_map<std::string, double> lib_rt;
-        lib_rt.reserve(transition_exp.getCompounds().size());
-        for (const auto& c : transition_exp.getCompounds()) { lib_rt[c.id] = c.rt; }
+        // Captured BEFORE the prefilter rebuilt the experiment (see prefilter_lib_rt_). Joining
+        // against transition_exp here would give every discarded candidate -1, which is precisely
+        // the population a recovery analysis needs an RT for.
+        const auto& lib_rt = prefilter_lib_rt_;
         os << "id\tsequence\tdecoy\tsurvived\tsupported_ms2\tms2_best_fragment_hits"
               "\tms2_hit_count\tms2_qualifying_spectra\tms1_hit_count\tms1_max_intensity"
               "\tprecursor_mz\tms1_sum_intensity\tms1_best_rt\tms2_max_intensity"
               "\tms2_sum_intensity\tms2_best_rt\tlibrary_rt\n";
-        for (const auto& e : prefilter_evidence_)
+        // BOTH arms. A target-only dump cannot answer "does this score put targets above decoys
+        // at the operating point", which is the one gate that does not depend on a reference list
+        // being correct.
+        // Label by ARM. `dec` is built from the ALREADY-FILTERED transition list, so a decoy that
+        // did not survive is absent from it and would be written out as decoy=0 -- silently
+        // poisoning the very target/decoy comparison this arm exists to enable.
+        const std::vector<std::pair<const std::vector<TransitionListEvidenceFilter::PrecursorEvidence>*, int>>
+          arms = {{&prefilter_evidence_, 0}, {&prefilter_evidence_decoy_, 1}};
+        for (const auto& arm : arms)
+        for (const auto& e : *arm.first)
         {
-          os << e.compound_id << '\t' << e.sequence << '\t' << (dec.count(e.compound_id) ? 1 : 0)
+          os << e.compound_id << '\t' << e.sequence << '\t' << arm.second
              << '\t' << (survived.count(e.compound_id) ? 1 : 0)
              << '\t' << (e.supported_ms2 ? 1 : 0)
              << '\t' << e.ms2_best_fragment_hits
@@ -5464,10 +5504,12 @@ protected:
              << '\t' << [&]{ const auto it = lib_rt.find(e.compound_id);
                               return it == lib_rt.end() ? -1.0 : it->second; }() << '\n';
         }
-        OPENMS_LOG_INFO << "OpenDIAlyzer: wrote evidence for " << prefilter_evidence_.size()
-                        << " candidates (" << transition_exp.getCompounds().size()
-                        << " survived) to " << pf_out << " (-prefilter_out set, exiting before "
-                        << "extraction)." << std::endl;
+        OPENMS_LOG_INFO << "OpenDIAlyzer: wrote evidence for "
+                        << (prefilter_evidence_.size() + prefilter_evidence_decoy_.size())
+                        << " candidates (" << prefilter_evidence_.size() << " target + "
+                        << prefilter_evidence_decoy_.size() << " decoy; "
+                        << transition_exp.getCompounds().size() << " survived) to " << pf_out
+                        << " (-prefilter_out set, exiting before extraction)." << std::endl;
         return EXECUTION_OK;
       }
     }
