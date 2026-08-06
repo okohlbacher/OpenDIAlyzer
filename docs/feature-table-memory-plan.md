@@ -65,11 +65,33 @@ Pass 2's features *are* written, so dropping the OpenMS objects there needs a wr
 `OpenSwathOSWParquetWriter` is 1,337 lines and takes `const FeatureMap&`; OpenMS may not be
 modified, so this is an ODIA-side build: 65 + 44 + 5 columns through Arrow builders, plus the
 `clearSignBit()` id convention (`OpenSwathOSWParquetWriter.cpp:603`) that the join depends on
-— we already shipped a bug where our writer used a different one and the join silently
-produced zero matches.
+— we already shipped a bug where our writer used a different one and **exactly half** the rows
+joined. (An earlier version of this document said "zero matches". That was wrong: the zero
+belongs to a *refuted* diagnostic hypothesis — I had tested adding 2^64, where the correct
+transform is clearing the sign bit, i.e. 2^63. `UniqueIdGenerator` is effectively random, so
+half the ids have the high bit set and came out negative in one table and positive in the
+other. Commit `2649767`, the postmortem at `opendialyzer.cpp:2430` and backlog §13 all say 50%.
+The correction matters: a half-silent loss is much harder to notice than a total one, and it
+did real damage — entrapment validation mapped only 2,328 of 4,588 identifications back to a
+precursor.)
 
-Acceptance: the emitted bundle must be **byte-identical** to the current writer's on the same
-run, or differ only in ways enumerated and justified.
+The writer also does more than emit three tables: it writes the assay library, builds the
+`compound_to_precursor` and `transition_to_id` maps, validates each table against
+`ArrowSchemaRegistry`, appends `runs.parquet` rejecting duplicate `run_id`, zips the directory
+with a sidecar index, and cleans up the partial `run_id=` directory on any exception. A
+replacement must reproduce all of that, not just the columns.
+
+Acceptance: **table-level Arrow equality**, checked with the same
+`ArrowSchemaValidation::validate` the current writer uses, against the same run. Byte-identity
+was the original criterion and is not reachable — `write()` emits its tables via `std::async`
+and zips afterwards, so ZIP entry order and embedded timestamps vary between runs of the
+*existing* writer too.
+
+The id convention is the real design constraint. It is currently established in three places
+that do not know about each other — OpenMS's `clearSignBit` (`SqliteConnector_impl.h:125`),
+ODIA's open-coded `& 0x7FFF...` at `opendialyzer.cpp:2444`, and `restoreRealIds_`. The 50%-join
+bug was two of them disagreeing. An ODIA-owned writer removes the OpenMS copy but adds a fourth
+unless the convention becomes a single named function first.
 
 ### Phase C — narrow the score columns (saves a further ~3.8 GB), measured not assumed
 

@@ -50,6 +50,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <cstdio>
 #include <exception>
 #include <string>
@@ -171,12 +172,21 @@ public:
         double im = std::numeric_limits<double>::quiet_NaN();
         double im_lo = std::numeric_limits<double>::quiet_NaN();
         double im_hi = std::numeric_limits<double>::quiet_NaN();
+        // Take the FIRST finite value of each field, and stop only once all three are known.
+        //
+        // The previous form broke out as soon as it saw an ion_mobility_value, so a writer that
+        // puts the midpoint on the first selected ion and the true limits on a later one lost the
+        // limits entirely -- and the frame then silently fell back to the midpoint split below,
+        // which is the 3.5%-average / 10.3%-worst misassignment this file documents. Reading all
+        // ions costs nothing (there are a handful) and cannot lose a bound that is present.
         for (const auto& si : p.selected_ions)
         {
-          if (si.ion_mobility_value) { im = *si.ion_mobility_value; }
-          if (si.ion_mobility_lower_limit) { im_lo = *si.ion_mobility_lower_limit; }
-          if (si.ion_mobility_upper_limit) { im_hi = *si.ion_mobility_upper_limit; }
-          if (si.ion_mobility_value || si.ion_mobility_lower_limit) { break; }
+          if (si.ion_mobility_value && !std::isfinite(im)) { im = *si.ion_mobility_value; }
+          if (si.ion_mobility_lower_limit && !std::isfinite(im_lo))
+          { im_lo = *si.ion_mobility_lower_limit; }
+          if (si.ion_mobility_upper_limit && !std::isfinite(im_hi))
+          { im_hi = *si.ion_mobility_upper_limit; }
+          if (std::isfinite(im) && std::isfinite(im_lo) && std::isfinite(im_hi)) { break; }
         }
         wins.push_back({centre, centre - lo, centre + up, im, im_lo, im_hi});
       }
@@ -188,9 +198,15 @@ public:
       // analysis.tdf on S08, 3.5% of the mobility axis on average and 10.3% at worst lands in
       // a window that never fragmented it. The vendor scan->mobility calibration is also
       // non-linear, so averaging in mobility space is wrong even for equal-width windows.
-      const bool have_bounds = std::all_of(wins.begin(), wins.end(), [](const Win& w) {
+      //
+      // PER WINDOW, not per frame. `all_of` meant one window missing bounds demoted EVERY sibling
+      // -- including the ones carrying perfectly good vendor bounds -- to the midpoint split. The
+      // frame-wide flag survives only for the warning and for choosing the fallback, which
+      // genuinely needs the neighbours' midpoints and so is inherently frame-level.
+      auto hasBounds = [](const Win& w) {
         return std::isfinite(w.im_lo) && std::isfinite(w.im_hi) && w.im_lo < w.im_hi;
-      });
+      };
+      const bool have_bounds = std::all_of(wins.begin(), wins.end(), hasBounds);
       const bool have_im = std::all_of(wins.begin(), wins.end(),
                                        [](const Win& w) { return std::isfinite(w.im); });
       std::vector<std::size_t> order(wins.size());
@@ -227,34 +243,68 @@ public:
         }
       }
 
+      // Resolve every window's band BEFORE inserting any of them, so the partition can be checked
+      // as a whole and so the band can take part in the group key.
+      const double kInf = std::numeric_limits<double>::infinity();
+      std::vector<std::pair<double, double>> bands(wins.size(), {-kInf, kInf});
       for (std::size_t k = 0; k < order.size(); ++k)
       {
         const Win& w = wins[order[k]];
-        const long wkey = std::lround(w.centre * 1000.0);
+        double blo = -kInf, bhi = kInf;
+        if (hasBounds(w)) { blo = w.im_lo; bhi = w.im_hi; }
+        else if (have_im && order.size() > 1)
+        {
+          if (k > 0) { blo = 0.5 * (wins[order[k - 1]].im + w.im); }
+          if (k + 1 < order.size()) { bhi = 0.5 * (w.im + wins[order[k + 1]].im); }
+        }
+        bands[order[k]] = {blo, bhi};
+      }
+
+      // EXACT-ONCE CHECK. Sibling bands must tile the mobility axis: each band's lower edge is the
+      // previous one's upper edge. Nothing checked this before -- an overlap silently emits a peak
+      // into TWO windows (double-counted) and a gap silently drops it from ALL of them. Warned
+      // rather than fatal, so existing files still process; the half-open [lo, hi) convention only
+      // protects a SHARED boundary and does nothing when the boundaries disagree.
+      if (order.size() > 1 && !im_tile_warned_)
+      {
+        for (std::size_t k = 1; k < order.size(); ++k)
+        {
+          const double prev_hi = bands[order[k - 1]].second, cur_lo = bands[order[k]].first;
+          if (!std::isfinite(prev_hi) || !std::isfinite(cur_lo)) { continue; }
+          const double slack = 1e-6 * std::max(1.0, std::fabs(prev_hi));
+          if (std::fabs(cur_lo - prev_hi) <= slack) { continue; }          // tiles exactly
+          im_tile_warned_ = true;
+          std::fprintf(stderr,
+                       "OpenDIAlyzer/mzPeak: sibling isolation windows do not tile the ion-mobility "
+                       "axis (%s at %.4f/%.4f 1/K0). %s\n",
+                       cur_lo < prev_hi ? "OVERLAP" : "GAP", prev_hi, cur_lo,
+                       cur_lo < prev_hi ? "Peaks in the overlap are counted in BOTH windows."
+                                        : "Peaks in the gap are dropped from EVERY window.");
+          break;
+        }
+      }
+
+      for (std::size_t k = 0; k < order.size(); ++k)
+      {
+        const Win& w = wins[order[k]];
+        const double blo = bands[order[k]].first, bhi = bands[order[k]].second;
+        const long wkey = windowKey_(w.centre, blo);
         auto& grp = by_window[wkey][std::lround(rt * 10000.0)];
         grp.rt = rt;
         grp.slices.push_back(i);
-        if (have_bounds)
-        {
-          grp.im_lo = w.im_lo; grp.im_hi = w.im_hi;
-        }
-        else if (have_im && order.size() > 1)
-        {
-          if (k > 0) { grp.im_lo = 0.5 * (wins[order[k - 1]].im + w.im); }
-          if (k + 1 < order.size()) { grp.im_hi = 0.5 * (w.im + wins[order[k + 1]].im); }
-        }
+        grp.im_lo = blo; grp.im_hi = bhi;
         if (windows_.find(wkey) == windows_.end()) { windows_[wkey] = {w.centre, w.lower, w.upper}; }
         // SwathMap mobility limits. OpenSWATH assigns transitions with STRICT
         // imLower < precursorIM < imUpper, so these must be the window's real span. Seeding
         // from a default-constructed pair would give [0, midpoint] and reject the upper half
         // of every window, so track the range explicitly.
-        if (have_bounds)
+        if (std::isfinite(blo) && std::isfinite(bhi))
         {
-          auto [it, fresh] = im_range_.try_emplace(wkey, w.im_lo, w.im_hi);
+          auto [it, fresh] = im_range_.try_emplace(wkey, blo, bhi);
           if (!fresh)
           {
-            it->second.first = std::min(it->second.first, w.im_lo);
-            it->second.second = std::max(it->second.second, w.im_hi);
+            it->second.first = std::min(it->second.first, blo);
+            it->second.second = std::max(it->second.second, bhi);
           }
         }
       }
@@ -269,9 +319,46 @@ public:
       for (auto& g : w.second) { v.push_back(std::move(g.second)); }
       std::sort(v.begin(), v.end(), [](const MzPeakGroup& a, const MzPeakGroup& b) { return a.rt < b.rt; });
     }
+    // Report windows per isolation CENTRE, because the key now carries the mobility band too.
+    // More windows than centres is the intended diaPASEF case (one centre revisited at several
+    // mobilities). A count far above the method's window count would mean the band quantisation is
+    // shattering one window across frames -- the failure mode band-keying could introduce -- and
+    // this is where it becomes visible rather than showing up as missing peptides.
+    {
+      std::set<long> centres;
+      for (const auto& w : windows_)
+      { if (w.first != kMs1Key) { centres.insert(std::lround(w.second.centre * 1000.0)); } }
+      if (!centres.empty() && windows_.size() > centres.size())
+      {
+        std::fprintf(stderr, "OpenDIAlyzer/mzPeak: %zu SWATH windows over %zu isolation centres "
+                             "(centres revisited at several mobility bands).\n",
+                     windows_.size(), centres.size());
+      }
+    }
   }
 
   static constexpr long kMs1Key = -1;
+
+  /// A SWATH window's identity: isolation centre AND mobility band.
+  ///
+  /// The band belongs in the key because two precursors in ONE frame can share an isolation centre
+  /// and differ only in mobility -- and those are genuinely different SWATH maps, since OpenSWATH
+  /// assigns a transition by `imLower < precursorIM < imUpper`. Keyed on the centre alone they
+  /// collapsed into one group: the frame index was appended TWICE, the second band overwrote the
+  /// first, and the survivor's peaks were then emitted twice while the other band's were lost
+  /// outright. Silently -- the counts all still added up.
+  ///
+  /// The band is quantised to 0.001 1/K0 (vs the instrument's ~0.01 resolution) so that per-frame
+  /// floating-point jitter in a nominally fixed band cannot shatter one window into thousands.
+  /// Conventional diaPASEF puts distinct m/z windows on distinct bands, so their centres already
+  /// differ and this changes nothing for them.
+  static long windowKey_(double centre, double im_lo)
+  {
+    const long c = std::lround(centre * 1000.0);                  // 0.001 Th
+    if (!std::isfinite(im_lo)) { return c << 20; }                // unbanded: centre alone
+    const long b = std::lround(im_lo * 1000.0) & 0xFFFFFL;        // 0.001 1/K0, 20 bits
+    return (c << 20) | b;
+  }
 
   struct Window { double centre, lower, upper; };
 
@@ -782,6 +869,7 @@ private:
   uint64_t n_spectra_total_ = 0;
   bool im_split_warned_ = false;
   bool im_tie_warned_ = false;
+  bool im_tile_warned_ = false;   ///< sibling bands overlap or leave a gap
   // (io_mutex_ removed: decoding is per-thread, so there is nothing left to serialise)
   /// Atomic: populate() reports from inside an OpenMP region, so the loud-once guard is written
   /// concurrently. A plain bool would be a data race and could print once per worker.

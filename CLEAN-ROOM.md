@@ -100,5 +100,28 @@ engineered.
 | mzPeak (C++) | see upstream | mzPeak reader/writer |
 | ONNX Runtime | MIT | Neural-network inference |
 
-Neither OpenMS nor DIA-NN is modified by this project, and this project never
-pushes to either repository.
+DIA-NN is not modified by this project, and this project never pushes to either
+repository.
+
+**OpenMS is modified, and it is worth stating precisely rather than loosely.** An
+earlier version of this section said "Neither OpenMS nor DIA-NN is modified",
+which was not accurate: `vendored-patches/OpenMS/opendialyzer-openswath.patch`
+carries a delta over 11 files under `ANALYSIS/OPENSWATH`, `FORMAT` and
+`openswathalgo` — including `TransitionListEvidenceFilter.{h,cpp}`
+(`ms2_min_qualifying_spectra`) and `ParquetFile.{h,cpp}` (`ChunkedColumn`).
+`ext/OpenMS` is gitignored, so an undocumented edit there leaves no trace in this
+repository; that is exactly how a set of ad-hoc modifications once accumulated
+undetected.
+
+The rule that actually holds, and the one to enforce:
+
+- **The patch file IS the delta.** Every OpenMS change must be represented in
+  `vendored-patches/OpenMS/*.patch` and listed in `vendored-patches/README.md`.
+  Regenerate with `scripts/openms/regen-patch.sh`; never edit `ext/` and leave it
+  undocumented.
+- **ODIA's own features live in ODIA.** New functionality belongs in `src/odia_*`,
+  not in the OpenMS core. The patch exists for changes that cannot live outside
+  it — a scoring correction, a schema type, a parameter upstream does not expose.
+- The installed OpenMS and its source tree are `chmod a-w` after a build
+  (`scripts/openms/setup_clean_tree.sh`), so modifying the core is a deliberate
+  act rather than an accident.
