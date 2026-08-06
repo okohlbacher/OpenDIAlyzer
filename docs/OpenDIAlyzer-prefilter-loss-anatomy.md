@@ -114,13 +114,47 @@ Two further confounds, raised in the same review and not yet controlled:
   taking the max gives groups with more enumerated forms more chances, and presence of *some* form
   does not show the reference peptidoform was present.
 
-## 6. What cannot be measured yet
+## 6. Target/decoy enrichment by depth — reference-free, and the number to beat
 
-**The evidence dump contains zero decoy rows** — only the target scan is dumped
-(`prefilter_evidence_ = res.evidence` takes the target result). So target/decoy enrichment *at a
-given depth* is not measurable, and neither is "target fraction in the top-2N", which was the
-intended **reference-free** quality gate — the one that does not depend on DIA-NN being right.
-Adding decoy rows to `-prefilter_out` is a prerequisite for evaluating any new score honestly.
+The dump now carries both arms (`prefilter_evidence_decoy_`) at `min_fragments=3`, so the
+enrichment can be computed **without any reference list**. That matters: our DIA-NN reference is
+positive-unlabelled — it omits real IDs, contains non-IDs, and ODIA finds many precursors DIA-NN
+does not — so every recall number here is suspect. Decoys are shuffled by construction, so target
+excess at a given score IS the discriminating power, and it is the ratio the FDR is computed from.
+
+7,149,966 candidates: 3,603,425 target + 3,546,541 decoy.
+
+| depth | targets | decoys | T/D | target frac |
+|---:|---:|---:|---:|---:|
+| ≤3 (bulk) | 2,568,237 | 2,544,186 | 1.009 | 50.2% |
+| 3 | 914,675 | 893,071 | 1.024 | 50.6% |
+| 4 | 107,686 | 103,449 | **1.041** | 51.0% |
+| 5 | 8,059 | 5,662 | 1.423 | 58.7% |
+| 6 | 4,768 | **173** | **27.561** | **96.5%** |
+
+Cumulative, which is how the rule actually operates:
+
+| cut | targets | decoys | T/D | target frac | excess (T−D) |
+|---|---:|---:|---:|---:|---:|
+| depth ≥ 3 | 1,035,188 | 1,002,355 | 1.033 | 50.8% | 32,833 |
+| **depth ≥ 4** (today) | 120,513 | 109,284 | **1.103** | **52.4%** | 11,229 |
+| depth ≥ 5 | 12,827 | 5,835 | 2.198 | 68.7% | 6,992 |
+| depth ≥ 6 | 4,768 | 173 | 27.561 | 96.5% | 4,595 |
+
+Three things follow, and they reframe the design question:
+
+1. **At the operating point the criterion is barely better than a coin flip** — 52.4% target. This
+   corroborates, from a completely independent direction, the 212,292/210,787 = 1.007 ratio of the
+   retained set.
+2. **The discrimination is concentrated almost entirely at depth 6.** Depth 3 (1.024) and depth 4
+   (1.041) are noise; the *marginal* admissions the rule makes at depth exactly 4 are 51.0%
+   target / 49.0% decoy.
+3. **Yield per slot is wildly uneven.** The rule spends 120,513 target slots for an excess of
+   11,229 — 9%. Depth 6 alone returns 4,595 excess from 4,768 candidates — 96%. So 41% of all the
+   discriminating signal sits in 4% of the admitted candidates.
+
+**52.4% is the number any new score must beat at the same budget.** It is measurable offline from
+this dump, before any extraction run, and it does not depend on DIA-NN being right about anything.
 
 ## 7. What this does and does not license
 
