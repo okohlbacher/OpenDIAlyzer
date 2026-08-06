@@ -166,3 +166,48 @@ candidates for 766 reference precursors), 86.5% of searchable misses are scoring
 detection-side, and 46.8% of target rank-1 features already lie inside the decoy interquartile
 range. Recovering a precursor into the search space is necessary, not sufficient — it still has to
 survive a classifier that is itself the binding constraint.
+
+## 8. The oracle bound — what prefilter work can possibly be worth
+
+Both adversarial reviewers, independently, said to measure this before building any ranker: admit
+the deleted reference precursors outright and see how many actually reach q<0.01. That is the
+ceiling on **any** prefilter improvement, however clever, because no ranker can do better than
+knowing the answer.
+
+`-prefilter_force_ids` admits them into the target keep-set; the normal pair-union then attaches
+each one's decoy partner, so the selection stays label-symmetric. 1,682 target compounds from
+1,430 keys (several modified forms per key), **none supported by the filter on its own**. Budget
+cost +0.34%, against the +67% and +363% that killed the learned prefilter — so this is not
+confounded by the mechanism that sank that attempt.
+
+Astral benchmark, `-classifier gbt`, idle 224-core node, both arms identical but for the admission:
+
+| | precursors q<0.01 | peptides | proteins | wall | peak RSS |
+|---|---:|---:|---:|---:|---:|
+| A0 baseline | 7,008 | 6,129 | **601** | 22:33 | 82.4 GB |
+| A1 oracle | 7,223 | 6,336 | **556** | 23:46 | 82.4 GB |
+| **net** | **+215** | **+207** | **−45** | | |
+
+**Conversion is 15.0%** — 215 identifications from 1,430 admitted precursors. On the LDA default
+the same experiment gave +126 from a 4,374 base (8.8%), so the GBT path converts better, but the
+ceiling is the same order.
+
+**Proteins go DOWN by 45.** Admitting 1,682 targets and their decoys changes the protein-level
+null (picked target-decoy competition, per-accession), and the extra precursors do not organise
+into new accessions faster than they harden that null. So even the oracle is not a clean win: it
+buys +3.4% peptides at the cost of −7.5% proteins.
+
+### What this licenses
+
+Nothing ambitious. The ceiling for all prefilter work is **+215 precursors / +207 peptides
+(+3.1% / +3.4%)**, obtained with *perfect* knowledge of which candidates to admit; any real
+ranker sits strictly below it, and §6 shows the evidence available at depth 3–4 is a coin flip
+(T/D 1.024 and 1.041), so "strictly below" is likely to mean "a fraction of".
+
+Against that: 86.5% of searchable misses are scoring-side, 46.8% of target rank-1 features
+already lie inside the decoy interquartile range, and the reviewers put the scoring-side headroom
+near 2,000 IDs. The measurement agrees with their recommendation — **the classifier is the
+binding constraint, not the candidate set.**
+
+One prediction worth recording: Kimi estimated +100–230 at the ceiling with 15–30% conversion;
+the measured values are +215 and 15.0%. Codex estimated 0–50 net and thought negative plausible.
