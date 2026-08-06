@@ -1968,7 +1968,16 @@ protected:
       for (std::size_t j = 0; j < vkeys.size(); ++j)
       {
         // Same missing-value convention as the FeatureMap path: absent / empty / non-finite all
-        // become NaN, which the classifiers treat as missing rather than as zero.
+        // become NaN.
+        //
+        // NOT "which the classifiers treat as missing" -- an earlier version of this comment said
+        // that and it is false. odia_lda.h:409 standardises with
+        // `std::isfinite(x) ? (x - mean)/sd : 0.0`, and the GBT is fitted on that standardised
+        // matrix, so every NaN reaches the learner as 0.0 -- i.e. IMPUTED AT THE COLUMN MEAN. The
+        // GBT's dedicated missing-value bin (odia_gbt.h:140) therefore cannot fire in production;
+        // it is only reachable from its own unit test. Whether mean-imputation or a missing
+        // category scores better here is unmeasured, but the code does the former and the comment
+        // claimed the latter.
         x[j] = std::numeric_limits<double>::quiet_NaN();
         if (!f.metaValueExists(vkeys[j])) { continue; }
         const DataValue& dv = f.getMetaValue(vkeys[j]);
