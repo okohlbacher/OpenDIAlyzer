@@ -26,7 +26,3 @@ ext/diann-cc-by/
 # Regenerate by dumping FEATURE_MS2's VAR_ columns with the group id and decoy label; the format is
 # "nrows ncols" then one "group label f0..fN" line per row.
 testdata/lda_fixture.txt
-
-# Obsidian per-user UI state; the vault content and its config are tracked.
-vault/.obsidian/workspace.json
-vault/.obsidian/workspace-mobile.json
