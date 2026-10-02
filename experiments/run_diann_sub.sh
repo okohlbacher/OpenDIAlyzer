@@ -1,15 +1,15 @@
 #!/bin/bash
 # DIA-NN arm on the SAME protein subset OpenDIALibGen used, so both tools face an
-# identical search space. Digest/mod params copied from the agxt predicted-library
+# identical search space. Digest/mod params copied from the in-house predicted-library
 # gen log (cuts K*,R*, MC1, len 7-30, m/z 300-1200, z2-4, Cam fixed, 1 var Ox(M));
 # search tolerances copied from run-odia.sh so this matches the existing arms.
 set -uo pipefail
 FASTA=${1:-/scratch/kohlbach/opendialyzer/tmp/sub1000.fasta}
-OUT=${2:-/scratch/kohlbach/opendialyzer/bench/agxt_sub1000/diann}
+OUT=${2:-/scratch/kohlbach/opendialyzer/bench/inhouse_sub1000/diann}
 D=/home/kohlbach/diann
 mkdir -p "$OUT"
 ARGS=()
-for f in /scratch/agxt/raw/FKL4341-S08-*.d /scratch/agxt/raw/FKL4341-S23-*.d /scratch/agxt/raw/FKL4341-S30-*.d; do
+for f in /scratch/inhouse/raw/IH1.d /scratch/inhouse/raw/IH3.d /scratch/inhouse/raw/IH2.d; do
   ARGS+=(--f "$f")
 done
 cd "$D"

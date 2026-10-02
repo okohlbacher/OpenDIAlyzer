@@ -66,7 +66,7 @@ RT_WIN=${RT_WIN:-2064}
 # for non-IM data such as PXD034539. For diaPASEF it must be set, or the IM
 # dimension -- the main reason diaPASEF separates interference at all -- is
 # thrown away. Use the width DIA-NN measured on the same runs (it logs
-# "IM window set to ..." in 1/K0); 0.047 for the agxt S08/S23/S30 set.
+# "IM window set to ..." in 1/K0); 0.047 for the in-house IH1/IH3/IH2 set.
 IM_WIN=${IM_WIN:--1}
 
 # -force below is required because this acquisition's isolation windows abut

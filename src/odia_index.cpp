@@ -2,7 +2,7 @@
 //
 // Builds the per-(isolation window x RT block) index the extractor needs,
 // without ever holding the run in memory. OpenSWATH materialises chromatograms
-// and peaked at 60-83 GB on the agxt diaPASEF runs; this keeps only a binned
+// and peaked at 60-83 GB on the in-house diaPASEF runs; this keeps only a binned
 // representation whose size is set by the acquisition scheme, not by the number
 // of peaks.
 //

@@ -1,13 +1,13 @@
 #!/bin/bash
 # Fully-open arm: OpenSWATH searching an OpenDIALibGen predicted library.
-# Waits for the library-gen PID, runs S08 as a fail-fast probe (RT calibration
-# on the PeptDeep 0-1 scale is the one real risk), then S23+S30 concurrently.
+# Waits for the library-gen PID, runs IH1 as a fail-fast probe (RT calibration
+# on the PeptDeep 0-1 scale is the one real risk), then IH3+IH2 concurrently.
 # Usage: run_odia_arm.sh <libgen_pid>
 set -u
 LGPID=$1
-O=/scratch/kohlbach/opendialyzer/bench/agxt_arms
+O=/scratch/kohlbach/opendialyzer/bench/inhouse_arms
 LIB=$O/odia_lib/library.tsv
-RAW=/scratch/agxt/raw
+RAW=/scratch/inhouse/raw
 RUNSH=/scratch/kohlbach/opendialyzer/OpenDIAlyzer/experiments/run_openswath.sh
 export OPENMS=/home/kohlbach/openms3
 export LD_LIBRARY_PATH=$OPENMS/lib
@@ -15,9 +15,9 @@ export PATH=/scratch/kohlbach/mamba/envs/odia/bin:$PATH
 mkdir -p $O/osw_predlib
 
 declare -A RAWF=(
-  [S08]=FKL4341-S08-A-3_K30454-19-3_QKL29021A9_Slot1-12_1_1305.d
-  [S23]=FKL4341-S23-A-8_K253-09-2_QKL29026AF_Slot1-17_1_1320.d
-  [S30]=FKL4341-S30-A-10_K25423-16-1_QKL29028AV_Slot1-19_1_1326.d )
+  [IH1]=IH1.d
+  [IH3]=IH3.d
+  [IH2]=IH2.d )
 
 count_ids () { # <features.osw> -> "total target" at q<0.01
   python3 - "$1" <<'PY'
@@ -45,18 +45,18 @@ echo "[$(date +%T)] libgen finished."
 [ -s "$LIB" ] || { echo "FATAL: library missing/empty: $LIB"; exit 1; }
 echo "library: $(wc -l < "$LIB") lines, $(du -h "$LIB" | cut -f1)"
 
-echo "[$(date +%T)] S08 probe ..."
-run_one S08
-read TOT TGT < <(count_ids "$O/osw_predlib/S08/features.osw")
-echo "[$(date +%T)] S08: total=$TOT target=$TGT peakgroups at q<0.01"
+echo "[$(date +%T)] IH1 probe ..."
+run_one IH1
+read TOT TGT < <(count_ids "$O/osw_predlib/IH1/features.osw")
+echo "[$(date +%T)] IH1: total=$TOT target=$TGT peakgroups at q<0.01"
 if [ "${TGT:-0}" -lt 8000 ] && [ "${TOT:-0}" -lt 8000 ]; then
-  echo "[$(date +%T)] S08 LOW -> RT/IM calibration likely off. Stopping before S23/S30."
+  echo "[$(date +%T)] IH1 LOW -> RT/IM calibration likely off. Stopping before IH3/IH2."
   exit 3
 fi
 
-echo "[$(date +%T)] S08 sane -> S23 + S30 concurrently ..."
-run_one S23 & run_one S30 & wait
-for t in S23 S30; do
+echo "[$(date +%T)] IH1 sane -> IH3 + IH2 concurrently ..."
+run_one IH3 & run_one IH2 & wait
+for t in IH3 IH2; do
   read TOT TGT < <(count_ids "$O/osw_predlib/$t/features.osw")
   echo "[$(date +%T)] $t: total=$TOT target=$TGT peakgroups at q<0.01"
 done
